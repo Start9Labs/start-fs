@@ -3,4 +3,35 @@ name = "backup-fs"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["cli"]
+cli = ["clap", "env_logger"]
+
+[lib]
+name = "backupfs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mount_backup-fs"
+path = "src/main.rs"
+required-features = ["cli"]
+
 [dependencies]
+bincode = "1"
+chacha20 = { version = "0.9.1", features = ["zeroize"] }
+fd-lock-rs = "0.1.4"
+fuser = { version = "0.14", features = ["abi-7-31"] }
+generic-array = { version = "1", features = ["serde"] }
+itertools = "0.13"
+libc = "0.2"
+log = "0.4"
+pbkdf2 = "0.12"
+rand = "0.8"
+serde = { version = "*", features = ["derive"] }
+sha2 = "0.10.8"
+smallvec = "1"
+typenum = "1"
+zeroize = { version = "1.8.1", features = ["serde"] }
+
+clap = { version = "=4.5.7", optional = true, features = ["derive"] }
+env_logger = { version = "0.11", optional = true }

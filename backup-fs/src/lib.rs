@@ -36,11 +36,9 @@ use crate::ctrl::Controller;
 use crate::directory::DirectoryContents;
 use crate::error::to_libc_err;
 use crate::handle::Handler;
-use crate::inode::DirectoryDescriptor;
-use crate::inode::FileKind;
-use crate::inode::Inode;
-use crate::inode::InodeAttributes;
 use crate::inode::BLOCK_SIZE;
+use crate::inode::{Attributes, FileData};
+use crate::inode::{Inode, InodeAttributes};
 use crate::serde::load;
 use crate::serde::save;
 use crate::util::Never;
@@ -88,12 +86,14 @@ const CHACHA_IV_SIZE: usize = <<ChaCha20 as IvSizeUser>::IvSize as ToInt<usize>>
 pub struct CryptInfo {
     pub key: Zeroizing<[u8; CHACHA_KEY_SIZE]>,
     pub inode_iv: [u8; CHACHA_IV_SIZE],
+    pub contents_iv: [u8; CHACHA_IV_SIZE],
 }
 impl CryptInfo {
     pub fn new() -> Self {
         Self {
             key: Zeroizing::new(rand::random()),
             inode_iv: rand::random(),
+            contents_iv: rand::random(),
         }
     }
     pub fn load(path: &Path, password: &str) -> io::Result<Self> {
@@ -126,58 +126,25 @@ impl BackupFS {
             cryptinfo
         };
         let key = Key::clone_from_slice(&*cryptinfo.key);
-        let iv = Iv::<ChaCha20>::clone_from_slice(&cryptinfo.inode_iv);
-        let ctrl = Controller::new(config, key, iv);
+        let inode_iv = Iv::<ChaCha20>::clone_from_slice(&cryptinfo.inode_iv);
+        let contents_iv = Iv::<ChaCha20>::clone_from_slice(&cryptinfo.inode_iv);
+        let ctrl = Controller::new(config, key, inode_iv, contents_iv);
 
-        if !ctrl.exists::<InodeAttributes>(FUSE_ROOT_ID) {
+        if !ctrl.exists::<InodeAttributes>(Inode(FUSE_ROOT_ID)) {
             // Initialize with empty filesystem
-            let root = InodeAttributes::new(FUSE_ROOT_ID, FileKind::Directory);
-            let dir = DirectoryContents::new(FUSE_ROOT_ID);
-            ctrl.save(&dir)?;
+            let root = InodeAttributes::new(
+                Inode(FUSE_ROOT_ID),
+                None,
+                FileData::Directory(DirectoryContents::new()),
+            );
             ctrl.save(&root)?;
         } else {
-            ctrl.load::<InodeAttributes>(FUSE_ROOT_ID)?;
-            ctrl.load::<DirectoryContents>(FUSE_ROOT_ID)?;
+            ctrl.load::<InodeAttributes>(Inode(FUSE_ROOT_ID))?;
         }
         Ok(BackupFS {
             lock,
             handler: Handler::new(ctrl),
         })
-    }
-
-    fn insert_link(
-        &self,
-        req: &Request,
-        parent: u64,
-        name: &OsStr,
-        inode: u64,
-        kind: FileKind,
-    ) -> Result<(), c_int> {
-        if self.lookup_name(parent, name).is_ok() {
-            return Err(libc::EEXIST);
-        }
-
-        let mut parent_attrs = self.get_inode(parent)?;
-
-        if !check_access(
-            parent_attrs.uid,
-            parent_attrs.gid,
-            parent_attrs.mode,
-            req.uid(),
-            req.gid(),
-            libc::W_OK,
-        ) {
-            return Err(libc::EACCES);
-        }
-        parent_attrs.last_modified = time_now();
-        parent_attrs.last_metadata_changed = time_now();
-        self.write_inode(&parent_attrs);
-
-        let mut entries = self.get_directory_content(parent).unwrap();
-        entries.insert(name.as_bytes().to_vec(), (inode, kind));
-        self.write_directory_content(parent, entries);
-
-        Ok(())
     }
 }
 
@@ -199,7 +166,7 @@ impl Filesystem for BackupFS {
     }
 
     fn lookup(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        match self.handler.lookup(req, parent, name) {
+        match self.handler.lookup(req, Inode(parent), name) {
             Ok(attr) => reply.entry(&ENTRY_TTL, &attr.into(), 0),
             Err(e) => reply.error(error::to_libc_err(&e)),
         }
@@ -208,7 +175,7 @@ impl Filesystem for BackupFS {
     fn forget(&mut self, _req: &Request, _ino: u64, _nlookup: u64) {}
 
     fn getattr(&mut self, _req: &Request, inode: u64, reply: ReplyAttr) {
-        match self.handler.ctrl().load::<InodeAttributes>(inode) {
+        match self.handler.ctrl().load::<InodeAttributes>(Inode(inode)) {
             Ok(attr) => reply.attr(&ENTRY_TTL, &attr.into()),
             Err(e) => reply.error(error::to_libc_err(&e)),
         }
@@ -233,7 +200,19 @@ impl Filesystem for BackupFS {
         reply: ReplyAttr,
     ) {
         match self.handler.setattr(
-            req, inode, mode, uid, gid, size, atime, mtime, ctime, fh, crtime, chgtime, bkuptime,
+            req,
+            Inode(inode),
+            mode,
+            uid,
+            gid,
+            size,
+            atime,
+            mtime,
+            ctime,
+            fh,
+            crtime,
+            chgtime,
+            bkuptime,
             flags,
         ) {
             Ok(attr) => reply.attr(&ENTRY_TTL, &attr.into()),
@@ -242,7 +221,7 @@ impl Filesystem for BackupFS {
     }
 
     fn readlink(&mut self, req: &Request, inode: u64, reply: ReplyData) {
-        match self.handler.readlink(req, inode) {
+        match self.handler.readlink(req, Inode(inode)) {
             Ok(path) => reply.data(path.as_os_str().as_bytes()),
             Err(e) => reply.error(to_libc_err(&e)),
         }
@@ -258,10 +237,15 @@ impl Filesystem for BackupFS {
         rdev: u32,
         reply: ReplyEntry,
     ) {
-        match self
-            .handler
-            .mknod(req, parent, name, mode, umask, rdev, None::<Never>)
-        {
+        match self.handler.mknod(
+            req,
+            Inode(parent),
+            name,
+            mode,
+            umask,
+            rdev,
+            None::<fn(Inode) -> FileData>,
+        ) {
             Ok(attrs) => reply.entry(&ENTRY_TTL, &attrs.into(), 0),
             Err(e) => reply.error(to_libc_err(&e)),
         }
@@ -281,7 +265,8 @@ impl Filesystem for BackupFS {
     }
 
     fn unlink(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        match self.handler.unlink(req, parent, name) {
+        debug!("unlink() called with {:?} {:?}", parent, name);
+        match self.handler.unlink(req, Inode(parent), name) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(to_libc_err(&e)),
         }
@@ -289,63 +274,10 @@ impl Filesystem for BackupFS {
 
     fn rmdir(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         debug!("rmdir() called with {:?} {:?}", parent, name);
-        let mut attrs = match self.lookup_name(parent, name) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
-
-        let mut parent_attrs = match self.get_inode(parent) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
-
-        // Directories always have a self and parent link
-        if self.get_directory_content(attrs.inode).unwrap().len() > 2 {
-            reply.error(libc::ENOTEMPTY);
-            return;
+        match self.handler.unlink(req, Inode(parent), name) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(to_libc_err(&e)),
         }
-        if !check_access(
-            parent_attrs.uid,
-            parent_attrs.gid,
-            parent_attrs.mode,
-            req.uid(),
-            req.gid(),
-            libc::W_OK,
-        ) {
-            reply.error(libc::EACCES);
-            return;
-        }
-
-        // "Sticky bit" handling
-        if parent_attrs.mode & libc::S_ISVTX as u16 != 0
-            && req.uid() != 0
-            && req.uid() != parent_attrs.uid
-            && req.uid() != attrs.uid
-        {
-            reply.error(libc::EACCES);
-            return;
-        }
-
-        parent_attrs.last_metadata_changed = time_now();
-        parent_attrs.last_modified = time_now();
-        self.write_inode(&parent_attrs);
-
-        attrs.hardlinks = 0;
-        attrs.last_metadata_changed = time_now();
-        self.write_inode(&attrs);
-        self.gc_inode(&attrs);
-
-        let mut entries = self.get_directory_content(parent).unwrap();
-        entries.remove(name.as_bytes());
-        self.write_directory_content(parent, entries);
-
-        reply.ok();
     }
 
     fn symlink(
@@ -360,62 +292,18 @@ impl Filesystem for BackupFS {
             "symlink() called with {:?} {:?} {:?}",
             parent, link_name, target
         );
-        let mut parent_attrs = match self.get_inode(parent) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
-
-        if !check_access(
-            parent_attrs.uid,
-            parent_attrs.gid,
-            parent_attrs.mode,
-            req.uid(),
-            req.gid(),
-            libc::W_OK,
+        match self.handler.mknod(
+            req,
+            Inode(parent),
+            link_name,
+            0o777,
+            0o777,
+            0,
+            Some(|_| FileData::Symlink(target.to_owned())),
         ) {
-            reply.error(libc::EACCES);
-            return;
+            Ok(attrs) => reply.entry(&ENTRY_TTL, &attrs.into(), 0),
+            Err(e) => reply.error(to_libc_err(&e)),
         }
-        parent_attrs.last_modified = time_now();
-        parent_attrs.last_metadata_changed = time_now();
-        self.write_inode(&parent_attrs);
-
-        let inode = self.allocate_next_inode();
-        let attrs = InodeAttributes {
-            inode,
-            open_file_handles: 0,
-            size: target.as_os_str().as_bytes().len() as u64,
-            last_accessed: time_now(),
-            last_modified: time_now(),
-            last_metadata_changed: time_now(),
-            kind: FileKind::Symlink,
-            mode: 0o777,
-            hardlinks: 1,
-            uid: req.uid(),
-            gid: parent_attrs.creation_gid(req.gid()),
-            xattrs: Default::default(),
-        };
-
-        if let Err(error_code) = self.insert_link(req, parent, link_name, inode, FileKind::Symlink)
-        {
-            reply.error(error_code);
-            return;
-        }
-        self.write_inode(&attrs);
-
-        let path = self.content_path(inode);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)
-            .unwrap();
-        file.write_all(target.as_os_str().as_bytes()).unwrap();
-
-        reply.entry(&Duration::new(0, 0), &attrs.into(), 0);
     }
 
     fn rename(
@@ -428,201 +316,13 @@ impl Filesystem for BackupFS {
         flags: u32,
         reply: ReplyEmpty,
     ) {
-        let mut inode_attrs = match self.lookup_name(parent, name) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
-
-        let mut parent_attrs = match self.get_inode(parent) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
-
-        if !check_access(
-            parent_attrs.uid,
-            parent_attrs.gid,
-            parent_attrs.mode,
-            req.uid(),
-            req.gid(),
-            libc::W_OK,
-        ) {
-            reply.error(libc::EACCES);
-            return;
-        }
-
-        // "Sticky bit" handling
-        if parent_attrs.mode & libc::S_ISVTX as u16 != 0
-            && req.uid() != 0
-            && req.uid() != parent_attrs.uid
-            && req.uid() != inode_attrs.uid
+        match self
+            .handler
+            .rename(req, parent, name, new_parent, new_name, flags)
         {
-            reply.error(libc::EACCES);
-            return;
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(to_libc_err(&e)),
         }
-
-        let mut new_parent_attrs = match self.get_inode(new_parent) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
-
-        if !check_access(
-            new_parent_attrs.uid,
-            new_parent_attrs.gid,
-            new_parent_attrs.mode,
-            req.uid(),
-            req.gid(),
-            libc::W_OK,
-        ) {
-            reply.error(libc::EACCES);
-            return;
-        }
-
-        // "Sticky bit" handling in new_parent
-        if new_parent_attrs.mode & libc::S_ISVTX as u16 != 0 {
-            if let Ok(existing_attrs) = self.lookup_name(new_parent, new_name) {
-                if req.uid() != 0
-                    && req.uid() != new_parent_attrs.uid
-                    && req.uid() != existing_attrs.uid
-                {
-                    reply.error(libc::EACCES);
-                    return;
-                }
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        if flags & libc::RENAME_EXCHANGE as u32 != 0 {
-            let mut new_inode_attrs = match self.lookup_name(new_parent, new_name) {
-                Ok(attrs) => attrs,
-                Err(error_code) => {
-                    reply.error(error_code);
-                    return;
-                }
-            };
-
-            let mut entries = self.get_directory_content(new_parent).unwrap();
-            entries.insert(
-                new_name.as_bytes().to_vec(),
-                (inode_attrs.inode, inode_attrs.kind),
-            );
-            self.write_directory_content(new_parent, entries);
-
-            let mut entries = self.get_directory_content(parent).unwrap();
-            entries.insert(
-                name.as_bytes().to_vec(),
-                (new_inode_attrs.inode, new_inode_attrs.kind),
-            );
-            self.write_directory_content(parent, entries);
-
-            parent_attrs.last_metadata_changed = time_now();
-            parent_attrs.last_modified = time_now();
-            self.write_inode(&parent_attrs);
-            new_parent_attrs.last_metadata_changed = time_now();
-            new_parent_attrs.last_modified = time_now();
-            self.write_inode(&new_parent_attrs);
-            inode_attrs.last_metadata_changed = time_now();
-            self.write_inode(&inode_attrs);
-            new_inode_attrs.last_metadata_changed = time_now();
-            self.write_inode(&new_inode_attrs);
-
-            if inode_attrs.kind == FileKind::Directory {
-                let mut entries = self.get_directory_content(inode_attrs.inode).unwrap();
-                entries.insert(b"..".to_vec(), (new_parent, FileKind::Directory));
-                self.write_directory_content(inode_attrs.inode, entries);
-            }
-            if new_inode_attrs.kind == FileKind::Directory {
-                let mut entries = self.get_directory_content(new_inode_attrs.inode).unwrap();
-                entries.insert(b"..".to_vec(), (parent, FileKind::Directory));
-                self.write_directory_content(new_inode_attrs.inode, entries);
-            }
-
-            reply.ok();
-            return;
-        }
-
-        // Only overwrite an existing directory if it's empty
-        if let Ok(new_name_attrs) = self.lookup_name(new_parent, new_name) {
-            if new_name_attrs.kind == FileKind::Directory
-                && self
-                    .get_directory_content(new_name_attrs.inode)
-                    .unwrap()
-                    .len()
-                    > 2
-            {
-                reply.error(libc::ENOTEMPTY);
-                return;
-            }
-        }
-
-        // Only move an existing directory to a new parent, if we have write access to it,
-        // because that will change the ".." link in it
-        if inode_attrs.kind == FileKind::Directory
-            && parent != new_parent
-            && !check_access(
-                inode_attrs.uid,
-                inode_attrs.gid,
-                inode_attrs.mode,
-                req.uid(),
-                req.gid(),
-                libc::W_OK,
-            )
-        {
-            reply.error(libc::EACCES);
-            return;
-        }
-
-        // If target already exists decrement its hardlink count
-        if let Ok(mut existing_inode_attrs) = self.lookup_name(new_parent, new_name) {
-            let mut entries = self.get_directory_content(new_parent).unwrap();
-            entries.remove(new_name.as_bytes());
-            self.write_directory_content(new_parent, entries);
-
-            if existing_inode_attrs.kind == FileKind::Directory {
-                existing_inode_attrs.hardlinks = 0;
-            } else {
-                existing_inode_attrs.hardlinks -= 1;
-            }
-            existing_inode_attrs.last_metadata_changed = time_now();
-            self.write_inode(&existing_inode_attrs);
-            self.gc_inode(&existing_inode_attrs);
-        }
-
-        let mut entries = self.get_directory_content(parent).unwrap();
-        entries.remove(name.as_bytes());
-        self.write_directory_content(parent, entries);
-
-        let mut entries = self.get_directory_content(new_parent).unwrap();
-        entries.insert(
-            new_name.as_bytes().to_vec(),
-            (inode_attrs.inode, inode_attrs.kind),
-        );
-        self.write_directory_content(new_parent, entries);
-
-        parent_attrs.last_metadata_changed = time_now();
-        parent_attrs.last_modified = time_now();
-        self.write_inode(&parent_attrs);
-        new_parent_attrs.last_metadata_changed = time_now();
-        new_parent_attrs.last_modified = time_now();
-        self.write_inode(&new_parent_attrs);
-        inode_attrs.last_metadata_changed = time_now();
-        self.write_inode(&inode_attrs);
-
-        if inode_attrs.kind == FileKind::Directory {
-            let mut entries = self.get_directory_content(inode_attrs.inode).unwrap();
-            entries.insert(b"..".to_vec(), (new_parent, FileKind::Directory));
-            self.write_directory_content(inode_attrs.inode, entries);
-        }
-
-        reply.ok();
     }
 
     fn link(
@@ -637,20 +337,12 @@ impl Filesystem for BackupFS {
             "link() called for {}, {}, {:?}",
             inode, new_parent, new_name
         );
-        let mut attrs = match self.get_inode(inode) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
-        if let Err(error_code) = self.insert_link(req, new_parent, new_name, inode, attrs.kind) {
-            reply.error(error_code);
-        } else {
-            attrs.hardlinks += 1;
-            attrs.last_metadata_changed = time_now();
-            self.write_inode(&attrs);
-            reply.entry(&Duration::new(0, 0), &attrs.into(), 0);
+        match self
+            .handler
+            .link(req, Inode(inode), Inode(new_parent), new_name)
+        {
+            Ok(attrs) => reply.entry(&ENTRY_TTL, &attrs.into(), 0),
+            Err(e) => reply.error(to_libc_err(&e)),
         }
     }
 
@@ -1082,7 +774,7 @@ impl Filesystem for BackupFS {
         }
 
         let inode = self.allocate_next_inode();
-        let attrs = InodeAttributes {
+        let attrs = Attributes {
             inode,
             open_file_handles: 1,
             size: 0,

@@ -1,13 +1,14 @@
-use std::collections::BTreeMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::os::raw::c_int;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chacha20::cipher::Iv;
 use chacha20::ChaCha20;
-use fuser::{Request, TimeOrNow};
+use fuser::{Request, TimeOrNow, FUSE_ROOT_ID};
+use imbl::{OrdMap, OrdSet};
 use log::debug;
 use serde::{Deserialize, Serialize};
 
@@ -23,26 +24,46 @@ pub const BLOCK_SIZE: u64 = 512;
 
 pub struct EncryptedInode {
     iv: Iv<ChaCha20>,
-    attr: InodeAttributes,
+    attr: Attributes,
 }
 
-pub type Inode = u64;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+pub struct Inode(pub u64);
 
-pub type DirectoryDescriptor = BTreeMap<Vec<u8>, (Inode, FileKind)>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+pub struct ContentId(pub u64);
 
-#[derive(Serialize, Deserialize, Copy, Clone, PartialEq)]
-pub enum FileKind {
-    File,
-    Directory,
-    Symlink,
+impl From<Inode> for ContentId {
+    fn from(value: Inode) -> Self {
+        Self(value.0)
+    }
 }
 
-impl From<FileKind> for fuser::FileType {
-    fn from(kind: FileKind) -> Self {
+#[derive(Serialize, Deserialize, Clone)]
+pub enum FileData {
+    File(ContentId),
+    Directory(DirectoryContents),
+    Symlink(PathBuf),
+}
+impl FileData {
+    fn nlink(&self) -> usize {
+        if let Self::Directory(c) = self {
+            c.nlink()
+        } else {
+            0
+        }
+    }
+    pub fn is_dir(&self) -> bool {
+        matches!(self, Self::Directory(_))
+    }
+}
+
+impl From<&FileData> for fuser::FileType {
+    fn from(kind: &FileData) -> Self {
         match kind {
-            FileKind::File => fuser::FileType::RegularFile,
-            FileKind::Directory => fuser::FileType::Directory,
-            FileKind::Symlink => fuser::FileType::Symlink,
+            FileData::File(_) => fuser::FileType::RegularFile,
+            FileData::Directory(_) => fuser::FileType::Directory,
+            FileData::Symlink(_) => fuser::FileType::Symlink,
         }
     }
 }
@@ -56,20 +77,71 @@ enum XattrNamespace {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct InodeAttributes {
-    pub inode: Inode,
+pub struct Attributes {
     pub size: u64,
     pub crtime: (i64, u32),
     pub atime: (i64, u32),
     pub mtime: (i64, u32),
     pub ctime: (i64, u32),
-    pub kind: FileKind,
+    pub contents: FileData,
     // Permissions and special mode bits
     pub mode: u16,
-    pub hardlinks: u32,
+    pub parents: OrdSet<(Inode, OsString)>,
     pub uid: u32,
     pub gid: u32,
-    pub xattrs: BTreeMap<Vec<u8>, Vec<u8>>,
+    pub xattrs: OrdMap<Vec<u8>, Vec<u8>>,
+}
+
+#[derive(Clone)]
+pub struct InodeAttributes {
+    pub inode: Inode,
+    pub attrs: Attributes,
+}
+
+impl InodeAttributes {
+    pub fn new(inode: Inode, parent: Option<(Inode, OsString)>, contents: FileData) -> Self {
+        let now = time_now();
+        Self {
+            inode,
+            attrs: Attributes {
+                size: 0,
+                crtime: now,
+                atime: now,
+                mtime: now,
+                ctime: now,
+                contents,
+                mode: 0o777,
+                parents: parent.into_iter().collect(),
+                uid: 0,
+                gid: 0,
+                xattrs: Default::default(),
+            },
+        }
+    }
+
+    pub fn lookup(&self, name: &OsStr) -> io::Result<Inode> {
+        let FileData::Directory(dir) = &self.attrs.contents else {
+            return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+        };
+
+        if name == OsStr::new(".") {
+            return Ok(self.inode);
+        } else if name == OsStr::new("..") {
+            return Ok(self
+                .attrs
+                .parents
+                .get_min()
+                .map(|(p, _)| *p)
+                .unwrap_or(self.inode));
+        }
+
+        let inode = dir
+            .get(name)
+            .ok_or(libc::ENOENT)
+            .map_err(io::Error::from_raw_os_error)?
+            .inode;
+        Ok(inode)
+    }
 }
 
 fn system_time_from_time(secs: i64, nsecs: u32) -> SystemTime {
@@ -96,18 +168,22 @@ pub fn time_from_system_time(system_time: &SystemTime) -> (i64, u32) {
 }
 
 impl From<InodeAttributes> for fuser::FileAttr {
-    fn from(attrs: InodeAttributes) -> Self {
+    fn from(InodeAttributes { inode, attrs }: InodeAttributes) -> Self {
         fuser::FileAttr {
-            ino: attrs.inode,
+            ino: inode.0,
             size: attrs.size,
             blocks: (attrs.size + BLOCK_SIZE - 1) / BLOCK_SIZE,
             atime: system_time_from_time(attrs.atime.0, attrs.atime.1),
             mtime: system_time_from_time(attrs.mtime.0, attrs.mtime.1),
             ctime: system_time_from_time(attrs.ctime.0, attrs.ctime.1),
             crtime: system_time_from_time(attrs.crtime.0, attrs.crtime.1),
-            kind: attrs.kind.into(),
+            kind: (&attrs.contents).into(),
             perm: attrs.mode,
-            nlink: attrs.hardlinks,
+            nlink: if inode.0 == FUSE_ROOT_ID {
+                2
+            } else {
+                (attrs.parents.len() + attrs.contents.nlink()) as u32
+            },
             uid: attrs.uid,
             gid: attrs.gid,
             rdev: 0,
@@ -156,7 +232,7 @@ fn parse_xattr_namespace(key: &[u8]) -> Result<XattrNamespace, c_int> {
 impl<'a> Save for &'a InodeAttributes {
     fn save(self, ctrl: &Controller) -> io::Result<()> {
         save(
-            self,
+            &self.attrs,
             EncryptedFile::create(AtomicFile::create(ctrl.inode_path(self.inode))?, ctrl.key())?,
         )
     }
@@ -165,10 +241,13 @@ impl<'a> Save for &'a InodeAttributes {
 impl Load for InodeAttributes {
     type Args<'a> = Inode;
     fn load(ctrl: &Controller, args: Self::Args<'_>) -> io::Result<Self> {
-        load(EncryptedFile::open(
-            File::open(&ctrl.inode_path(args))?,
-            ctrl.key(),
-        )?)
+        Ok(InodeAttributes {
+            inode: args,
+            attrs: load(EncryptedFile::open(
+                File::open(&ctrl.inode_path(args))?,
+                ctrl.key(),
+            )?)?,
+        })
     }
 }
 
@@ -178,29 +257,12 @@ impl Exists for InodeAttributes {
     }
 }
 
-impl InodeAttributes {
-    pub fn new(inode: Inode, kind: FileKind) -> Self {
-        let now = time_now();
-        Self {
-            inode,
-            size: 0,
-            crtime: now,
-            atime: now,
-            mtime: now,
-            ctime: now,
-            kind,
-            mode: 0o777,
-            hardlinks: 1,
-            uid: 0,
-            gid: 0,
-            xattrs: Default::default(),
-        }
-    }
+impl Attributes {
     pub fn setattr(
         &mut self,
         handler: &mut Handler,
         req: &Request,
-        inode: u64,
+        inode: Inode,
         mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
@@ -360,20 +422,6 @@ impl InodeAttributes {
         }
 
         Ok(changed)
-    }
-
-    pub fn lookup(&self, ctrl: &Controller, name: &OsStr) -> io::Result<Inode> {
-        if self.kind != FileKind::Directory {
-            return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
-        }
-
-        let contents = ctrl.load::<DirectoryContents>(self.inode)?;
-
-        let (inode, _) = contents
-            .get(name)
-            .ok_or(libc::ENOENT)
-            .map_err(io::Error::from_raw_os_error)?;
-        Ok(inode)
     }
 
     pub fn check_access(&self, uid: u32, gid: u32, mut access_mask: i32) -> io::Result<()> {

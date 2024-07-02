@@ -12,7 +12,7 @@ use rand::Rng;
 
 use crate::atomic_file::AtomicFile;
 use crate::contents::EncryptedFile;
-use crate::inode::Inode;
+use crate::inode::{ContentId, Inode};
 use crate::serde::{load, save};
 use crate::BackupFSOptions;
 
@@ -22,16 +22,36 @@ pub struct Controller(Rc<ControllerData>);
 pub struct ControllerData {
     config: BackupFSOptions,
     key: Key,
-    cipher: RefCell<ChaCha20>,
+    inode_cipher: RefCell<ChaCha20>,
+    contents_cipher: RefCell<ChaCha20>,
     inode_dir: PathBuf,
     contents_dir: PathBuf,
     inode_ctr: PathBuf,
 }
 
+fn encrypted_u64(cipher: &RefCell<ChaCha20>, num: u64) -> [u16; 4] {
+    let mut inode_buf = u64::to_be_bytes(num);
+    let mut cipher = cipher.borrow_mut();
+    cipher.seek(num * std::mem::size_of::<u64>() as u64);
+    cipher.apply_keystream(&mut inode_buf);
+    [
+        u16::from_be_bytes([inode_buf[0], inode_buf[1]]),
+        u16::from_be_bytes([inode_buf[2], inode_buf[3]]),
+        u16::from_be_bytes([inode_buf[4], inode_buf[5]]),
+        u16::from_be_bytes([inode_buf[6], inode_buf[7]]),
+    ]
+}
+
 impl Controller {
-    pub fn new(config: BackupFSOptions, key: Key, iv: Iv<ChaCha20>) -> Self {
+    pub fn new(
+        config: BackupFSOptions,
+        key: Key,
+        inode_iv: Iv<ChaCha20>,
+        contents_iv: Iv<ChaCha20>,
+    ) -> Self {
         Self(Rc::new(ControllerData {
-            cipher: RefCell::new(ChaCha20::new(&key, &iv)),
+            inode_cipher: RefCell::new(ChaCha20::new(&key, &inode_iv)),
+            contents_cipher: RefCell::new(ChaCha20::new(&key, &contents_iv)),
             key,
             inode_dir: config.data_dir.join("inodes"),
             contents_dir: config.data_dir.join("contents"),
@@ -39,28 +59,17 @@ impl Controller {
             config,
         }))
     }
-    fn encrypted_inode(&self, inode: Inode) -> [u16; 4] {
-        let mut inode_buf = u64::to_be_bytes(inode);
-        let mut cipher = self.0.cipher.borrow_mut();
-        cipher.seek(inode * std::mem::size_of::<u64>() as u64);
-        cipher.apply_keystream(&mut inode_buf);
-        [
-            u16::from_be_bytes([inode_buf[0], inode_buf[1]]),
-            u16::from_be_bytes([inode_buf[2], inode_buf[3]]),
-            u16::from_be_bytes([inode_buf[4], inode_buf[5]]),
-            u16::from_be_bytes([inode_buf[6], inode_buf[7]]),
-        ]
-    }
+
     pub fn inode_path(&self, inode: Inode) -> PathBuf {
-        let inode = self.encrypted_inode(inode);
+        let inode = encrypted_u64(&self.0.inode_cipher, inode.0);
         self.0.inode_dir.join(inode.into_iter().join("/"))
     }
-    pub fn contents_path(&self, inode: Inode) -> PathBuf {
-        let inode = self.encrypted_inode(inode);
-        self.0.contents_dir.join(inode.into_iter().join("/"))
+    pub fn contents_path(&self, contents: ContentId) -> PathBuf {
+        let contents = encrypted_u64(&self.0.contents_cipher, contents.0);
+        self.0.contents_dir.join(contents.into_iter().join("/"))
     }
     pub fn next_inode(&self) -> io::Result<Inode> {
-        let res: Inode = if self.0.inode_ctr.exists() {
+        let res: u64 = if self.0.inode_ctr.exists() {
             load(EncryptedFile::open(
                 File::open(&self.0.inode_ctr)?,
                 self.key(),
@@ -72,7 +81,7 @@ impl Controller {
             &(res + 1),
             EncryptedFile::create(AtomicFile::create(self.0.inode_ctr.clone())?, self.key())?,
         )?;
-        Ok(res)
+        Ok(Inode(res))
     }
     pub fn file_pad(&self, size: u64) -> u64 {
         size + (self

@@ -1,4 +1,6 @@
+use std::borrow::BorrowMut;
 use std::io::{self, Read, Write};
+use std::ops::{Deref, DerefMut};
 
 use rand::{CryptoRng, RngCore};
 use sha2::digest::Output;
@@ -57,15 +59,24 @@ impl<D: Digest, T: Read> Read for HashIO<D, T> {
     }
 }
 
-pub enum Never {}
-
-impl Save for Never {
-    fn save(self, _ctrl: &crate::ctrl::Controller) -> io::Result<()> {
-        match self {}
+pub enum OrMut<T, U: BorrowMut<T>> {
+    Owned(T),
+    Mut(U),
+}
+impl<T, U: BorrowMut<T>> Deref for OrMut<T, U> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(a) => &a,
+            Self::Mut(a) => a.borrow(),
+        }
     }
 }
-impl<'a> Save for &'a Never {
-    fn save(self, _ctrl: &crate::ctrl::Controller) -> io::Result<()> {
-        match *self {}
+impl<T, U: BorrowMut<T>> DerefMut for OrMut<T, U> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Owned(ref mut a) => a,
+            Self::Mut(a) => a.borrow_mut(),
+        }
     }
 }

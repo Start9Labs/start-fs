@@ -17,7 +17,8 @@ use smallvec::SmallVec;
 
 use crate::atomic_file::AtomicFile;
 use crate::ctrl::Controller;
-use crate::inode::{time_now, Inode, InodeAttributes};
+use crate::handle::Handler;
+use crate::inode::{time_now, ContentId, FileData, Inode, InodeAttributes};
 use crate::util::RandReader;
 
 pub struct EncryptedFile<F: Read + Write + Seek + FileExt = File> {
@@ -297,14 +298,22 @@ impl MergedFile {
 
 pub struct Contents {
     pub inode: InodeAttributes,
+    content_id: ContentId,
     changed: bool,
     file: Option<Result<MergedFile, EncryptedFile>>,
     ctrl: Controller,
 }
 impl Contents {
     pub fn open(ctrl: Controller, inode: Inode) -> io::Result<Self> {
+        let inode: InodeAttributes = ctrl.load(inode)?;
+        let content_id = match &inode.attrs.contents {
+            FileData::File(a) => *a,
+            FileData::Directory(_) => return Err(io::Error::from_raw_os_error(libc::EISDIR)),
+            FileData::Symlink(_) => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
+        };
         Ok(Self {
-            inode: ctrl.load(inode)?,
+            inode,
+            content_id,
             changed: false,
             file: None,
             ctrl,
@@ -312,8 +321,12 @@ impl Contents {
     }
     pub fn readable(&mut self) -> io::Result<&mut Self> {
         if self.file.is_none() {
+            let path = self.ctrl.contents_path(self.content_id);
+            if !path.exists() {
+                File::create(&path)?;
+            }
             self.file = Some(Err(EncryptedFile::open(
-                File::open(&self.ctrl.contents_path(self.inode.inode))?,
+                File::open(&path)?,
                 self.ctrl.key(),
             )?));
         }
@@ -323,7 +336,7 @@ impl Contents {
         if let Some(Err(file)) = std::mem::take(&mut self.readable()?.file) {
             self.file = Some(Ok(MergedFile::new(
                 file,
-                self.ctrl.contents_path(self.inode.inode),
+                self.ctrl.contents_path(self.content_id),
                 self.ctrl.key(),
             )?));
             Ok(self)
@@ -332,7 +345,7 @@ impl Contents {
         }
     }
     pub fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-        if offset + buf.len() as u64 > self.inode.size {
+        if offset + buf.len() as u64 > self.inode.attrs.size {
             return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
         }
         match self
@@ -344,7 +357,7 @@ impl Contents {
             Err(file) => file.read_exact_at(buf, offset)?,
             Ok(file) => file.read_exact_at(buf, offset)?,
         }
-        self.inode.atime = time_now();
+        self.inode.attrs.atime = time_now();
         self.changed = true;
         Ok(())
     }
@@ -358,9 +371,9 @@ impl Contents {
             .unwrap_or_else(|_| unreachable!("file is readonly"));
         file.write_all_at(buf, offset)?;
         let end = offset + buf.len() as u64;
-        this.inode.modified();
-        if end > this.inode.size {
-            this.inode.size = end;
+        this.inode.attrs.modified();
+        if end > this.inode.attrs.size {
+            this.inode.attrs.size = end;
         }
         self.changed = true;
         Ok(())
@@ -369,7 +382,7 @@ impl Contents {
         if datasync {
             if let Some(Ok(f)) = std::mem::take(&mut self.file) {
                 let size = self.ctrl.file_pad(min(
-                    self.inode.size,
+                    self.inode.attrs.size,
                     max(
                         f.src.file.metadata()?.len(),
                         f.written.last_key_value().map_or(0, |(p, l)| *p + *l),
@@ -384,10 +397,11 @@ impl Contents {
         Ok(())
     }
     pub fn truncate(&mut self, size: u64) {
-        self.inode.size = size;
+        self.inode.attrs.size = size;
     }
-    pub fn close(mut self) -> io::Result<()> {
+    pub fn close(mut self, handler: &mut Handler) -> io::Result<()> {
         self.fsync(true)?;
+        handler.gc_inode(&self.inode)?;
         Ok(())
     }
 }

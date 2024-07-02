@@ -10,11 +10,10 @@ use std::time::SystemTime;
 use fuser::{Request, TimeOrNow};
 use log::{debug, warn};
 
-use crate::contents::{Contents, EncryptedFile};
+use crate::contents::{self, Contents};
 use crate::ctrl::{Controller, Save};
-use crate::directory::DirectoryContents;
-use crate::inode::{FileKind, Inode, InodeAttributes};
-use crate::serde::load;
+use crate::directory::{DirectoryContents, DirectoryEntry};
+use crate::inode::{Attributes, FileData, Inode, InodeAttributes};
 use crate::{as_file_kind, MAX_NAME_LENGTH};
 
 pub struct Handler {
@@ -66,7 +65,7 @@ impl Handler {
                 format!("file handle {fh} is not open"),
             ));
         };
-        handle.close()?;
+        handle.close(self)?;
         Ok(())
     }
 
@@ -75,6 +74,27 @@ impl Handler {
             (mode & !(libc::S_ISUID | libc::S_ISGID) as u32) as u16
         } else {
             mode as u16
+        }
+    }
+
+    fn mutate_inode<F: FnOnce(&mut Self, &mut InodeAttributes) -> io::Result<T>, T>(
+        &mut self,
+        inode: Inode,
+        f: F,
+    ) -> io::Result<T> {
+        if let Some(contents) = self.inodes.get(&inode).and_then(Weak::upgrade) {
+            let mut contents = contents.borrow_mut();
+            let res = f(self, &mut contents.inode);
+            let new_inode = contents.inode.inode;
+            drop(contents);
+            if new_inode != inode {
+                if let Some(inode) = self.inodes.remove(&inode) {
+                    self.inodes.insert(new_inode, inode);
+                }
+            }
+            res
+        } else {
+            f(self, &mut self.ctrl().load::<InodeAttributes>(inode)?)
         }
     }
 }
@@ -87,9 +107,9 @@ pub struct FileHandle {
     pub contents: Rc<RefCell<Contents>>,
 }
 impl FileHandle {
-    pub fn close(self) -> io::Result<()> {
+    pub fn close(self, handler: &mut Handler) -> io::Result<()> {
         if let Ok(contents) = Rc::try_unwrap(self.contents) {
-            contents.into_inner().close()?;
+            contents.into_inner().close(handler)?;
         }
         Ok(())
     }
@@ -100,7 +120,7 @@ impl Handler {
         std::mem::take(&mut self.inodes);
         let mut errs = Vec::new();
         for (_, handle) in std::mem::take(&mut self.open) {
-            if let Err(e) = handle.close() {
+            if let Err(e) = handle.close(self) {
                 errs.push(e);
             }
         }
@@ -118,23 +138,25 @@ impl Handler {
     pub fn lookup(
         &mut self,
         req: &Request,
-        parent: u64,
+        parent: Inode,
         name: &OsStr,
     ) -> io::Result<InodeAttributes> {
         if name.len() > MAX_NAME_LENGTH as usize {
             return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
         }
-        let parent_attrs = self.ctrl().load::<InodeAttributes>(parent)?;
-        parent_attrs.check_access(req.uid(), req.gid(), libc::X_OK)?;
+        let parent = self.ctrl().load::<InodeAttributes>(parent)?;
+        parent
+            .attrs
+            .check_access(req.uid(), req.gid(), libc::X_OK)?;
 
-        let inode = parent_attrs.lookup(self.ctrl(), name)?;
+        let inode = parent.lookup(name)?;
         self.ctrl().load(inode)
     }
 
     pub fn setattr(
         &mut self,
         req: &Request,
-        inode: u64,
+        inode: Inode,
         mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
@@ -148,50 +170,51 @@ impl Handler {
         bkuptime: Option<SystemTime>,
         flags: Option<u32>,
     ) -> io::Result<InodeAttributes> {
-        let mut attrs;
-        let changed;
-        if let Some(contents) = self.inodes.get(&inode).and_then(Weak::upgrade) {
-            let mut contents = contents.borrow_mut();
-            changed = contents.inode.setattr(
-                self, req, inode, mode, uid, gid, size, atime, mtime, ctime, fh, crtime, chgtime,
-                bkuptime, flags,
+        let (inode, changed) = self.mutate_inode(inode, |handler, inode| {
+            let changed = inode.attrs.setattr(
+                handler,
+                req,
+                inode.inode,
+                mode,
+                uid,
+                gid,
+                size,
+                atime,
+                mtime,
+                ctime,
+                fh,
+                crtime,
+                chgtime,
+                bkuptime,
+                flags,
             )?;
-            attrs = contents.inode.clone();
-        } else {
-            attrs = self.ctrl().load::<InodeAttributes>(inode)?;
-            changed = attrs.setattr(
-                self, req, inode, mode, uid, gid, size, atime, mtime, ctime, fh, crtime, chgtime,
-                bkuptime, flags,
-            )?;
-        }
+            Ok((inode.clone(), changed))
+        })?;
         if changed {
-            self.ctrl().save(&attrs)?;
+            self.ctrl().save(&inode)?;
         }
-        Ok(attrs)
+        Ok(inode)
     }
 
     pub fn readlink(&mut self, req: &Request, inode: Inode) -> io::Result<PathBuf> {
         debug!("readlink() called on {:?}", inode);
         let inode = self.ctrl().load::<InodeAttributes>(inode)?;
-        inode.check_access(req.uid(), req.gid(), libc::R_OK)?;
-        if inode.kind != FileKind::Symlink {
+        inode.attrs.check_access(req.uid(), req.gid(), libc::R_OK)?;
+        let FileData::Symlink(p) = inode.attrs.contents else {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
-        }
-        load(EncryptedFile::open(
-            File::open(self.ctrl().contents_path(inode.inode))?,
-            self.ctrl().key(),
-        )?)
+        };
+        Ok(p)
     }
 
-    pub fn mknod<C: Save>(
+    pub fn mknod<F: FnOnce(Inode) -> FileData>(
         &mut self,
         req: &Request,
-        parent: u64,
+        parent: Inode,
         name: &OsStr,
         mut mode: u32,
         umask: u32,
         _rdev: u32,
-        contents: Option<C>,
+        contents: Option<F>,
     ) -> io::Result<InodeAttributes> {
         let file_type = mode & libc::S_IFMT as u32;
 
@@ -204,17 +227,19 @@ impl Handler {
             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
         }
 
-        let parent = self.ctrl().load::<InodeAttributes>(parent)?;
+        let mut parent = self.ctrl().load::<InodeAttributes>(parent)?;
 
-        if parent.kind != FileKind::Directory {
+        parent
+            .attrs
+            .check_access(req.uid(), req.gid(), libc::W_OK)?;
+
+        let gid = parent.attrs.creation_gid(req.gid());
+
+        let FileData::Directory(dir) = &mut parent.attrs.contents else {
             return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
-        }
+        };
 
-        parent.check_access(req.uid(), req.gid(), libc::W_OK)?;
-
-        let mut parent_contents = self.ctrl().load::<DirectoryContents>(parent.inode)?;
-
-        if parent_contents.get(name).is_some() {
+        if dir.get(name).is_some() {
             return Err(io::Error::from_raw_os_error(libc::EEXIST));
         }
 
@@ -222,25 +247,36 @@ impl Handler {
             mode &= !(libc::S_ISUID | libc::S_ISGID) as u32;
         }
 
-        let mut new = InodeAttributes::new(self.ctrl().next_inode()?, as_file_kind(mode));
-        new.uid = req.uid();
-        new.gid = parent.creation_gid(req.gid());
-        new.mode = self.creation_mode(mode & umask);
+        let inode = self.ctrl().next_inode()?;
 
-        parent_contents.insert(name.to_owned(), &new);
-
-        if let Some(c) = contents {
-            self.ctrl().save(c)?;
+        let contents = if let Some(contents) = contents {
+            contents(inode)
         } else {
-            if as_file_kind(mode) == FileKind::Directory {
-                let mut entries = DirectoryContents::new(new.inode, Some(parent.inode));
-                entries.insert(".".into(), &new);
-                entries.insert("..".into(), &parent);
-                self.ctrl().save(&entries)?;
+            let mode = mode & libc::S_IFMT as u32;
+
+            if mode == libc::S_IFREG as u32 {
+                FileData::File(inode.into())
+            } else if mode == libc::S_IFLNK as u32 {
+                FileData::Symlink(PathBuf::new())
+            } else if mode == libc::S_IFDIR as u32 {
+                FileData::Directory(DirectoryContents::new())
             } else {
-                File::create(self.ctrl().contents_path(new.inode))?;
+                return Err(io::Error::from_raw_os_error(libc::ENOSYS));
             }
-        }
+        };
+
+        let mut new = InodeAttributes::new(inode, Some((parent.inode, name.to_owned())), contents);
+        new.attrs.uid = req.uid();
+        new.attrs.gid = gid;
+        new.attrs.mode = self.creation_mode(mode & umask);
+
+        dir.insert(
+            name.to_owned(),
+            DirectoryEntry {
+                inode: new.inode,
+                is_dir: new.attrs.contents.is_dir(),
+            },
+        );
 
         self.ctrl().save(&new)?;
 
@@ -250,7 +286,7 @@ impl Handler {
     }
 
     pub fn gc_inode(&mut self, inode: &InodeAttributes) -> io::Result<bool> {
-        if inode.hardlinks > 0 {
+        if !inode.attrs.parents.is_empty() {
             return Ok(false);
         }
         if self
@@ -265,47 +301,297 @@ impl Handler {
         self.inodes.remove(&inode.inode);
 
         std::fs::remove_file(self.ctrl().inode_path(inode.inode))?;
-        std::fs::remove_file(self.ctrl().contents_path(inode.inode))?;
+        if let FileData::File(contents) = inode.attrs.contents {
+            let path = self.ctrl().contents_path(contents);
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
+        }
 
         Ok(true)
     }
 
-    pub fn unlink(&mut self, req: &Request, parent: u64, name: &OsStr) -> io::Result<()> {
-        debug!("unlink() called with {:?} {:?}", parent, name);
-        let parent = self.ctrl().load::<InodeAttributes>(parent)?;
-        parent.check_access(req.uid(), req.gid(), libc::W_OK)?;
+    pub fn unlink(&mut self, req: &Request, parent: Inode, name: &OsStr) -> io::Result<()> {
+        let mut parent = self.ctrl().load::<InodeAttributes>(parent)?;
+        parent
+            .attrs
+            .check_access(req.uid(), req.gid(), libc::W_OK)?;
 
-        let mut parent_contents = self.ctrl().load::<DirectoryContents>(parent.inode)?;
+        let FileData::Directory(dir) = &mut parent.attrs.contents else {
+            return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+        };
 
-        let (inode, _) = parent_contents
+        let entry = dir
             .remove(name)
             .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
 
-        let mut attrs = self.ctrl().load::<InodeAttributes>(inode)?;
+        self.mutate_inode(entry.inode, |handler, inode| {
+            if let FileData::Directory(dir) = &inode.attrs.contents {
+                if inode.attrs.parents.len() <= 1 && !dir.is_empty() {
+                    return Err(io::Error::from_raw_os_error(libc::ENOTEMPTY));
+                }
+            }
 
-        if attrs.kind == FileKind::Directory {
-            let contents = self.ctrl().load::<DirectoryContents>(inode)?;
-            if !contents.is_empty() {
-                return Err(io::Error::from_raw_os_error(libc::ENOTEMPTY));
+            let uid = req.uid();
+            // "Sticky bit" handling
+            if parent.attrs.mode & libc::S_ISVTX as u16 != 0
+                && uid != 0
+                && uid != parent.attrs.uid
+                && uid != inode.attrs.uid
+            {
+                return Err(io::Error::from_raw_os_error(libc::EACCES));
+            }
+
+            inode.attrs.parents.remove(&(parent.inode, name.to_owned()));
+
+            handler.ctrl().save(&parent)?;
+            handler.ctrl().save(&*inode)?;
+            handler.gc_inode(&*inode)?;
+
+            Ok(())
+        })
+    }
+
+    pub fn link(
+        &mut self,
+        req: &Request,
+        inode: Inode,
+        new_parent: Inode,
+        new_name: &OsStr,
+    ) -> io::Result<InodeAttributes> {
+        self.mutate_inode(inode, |handler, inode| {
+            let mut new_parent = handler.ctrl().load::<InodeAttributes>(new_parent)?;
+
+            new_parent
+                .attrs
+                .check_access(req.uid(), req.gid(), libc::W_OK)?;
+
+            let FileData::Directory(dir) = &mut new_parent.attrs.contents else {
+                return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+            };
+
+            inode
+                .attrs
+                .parents
+                .insert((new_parent.inode, new_name.to_owned()));
+
+            dir.insert(
+                new_name.to_owned(),
+                DirectoryEntry {
+                    inode: inode.inode,
+                    is_dir: inode.attrs.contents.is_dir(),
+                },
+            );
+
+            handler.ctrl().save(&*inode)?;
+            handler.ctrl().save(&new_parent)?;
+
+            Ok(inode.clone())
+        })
+    }
+
+    pub fn rename(
+        &mut self,
+        req: &Request,
+        parent: u64,
+        name: &OsStr,
+        new_parent: u64,
+        new_name: &OsStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        let mut inode_attrs = match self.lookup_name(parent, name) {
+            Ok(attrs) => attrs,
+            Err(error_code) => {
+                reply.error(error_code);
+                return;
+            }
+        };
+
+        let mut parent_attrs = match self.get_inode(parent) {
+            Ok(attrs) => attrs,
+            Err(error_code) => {
+                reply.error(error_code);
+                return;
+            }
+        };
+
+        if !check_access(
+            parent_attrs.uid,
+            parent_attrs.gid,
+            parent_attrs.mode,
+            req.uid(),
+            req.gid(),
+            libc::W_OK,
+        ) {
+            reply.error(libc::EACCES);
+            return;
+        }
+
+        // "Sticky bit" handling
+        if parent_attrs.mode & libc::S_ISVTX as u16 != 0
+            && req.uid() != 0
+            && req.uid() != parent_attrs.uid
+            && req.uid() != inode_attrs.uid
+        {
+            reply.error(libc::EACCES);
+            return;
+        }
+
+        let mut new_parent_attrs = match self.get_inode(new_parent) {
+            Ok(attrs) => attrs,
+            Err(error_code) => {
+                reply.error(error_code);
+                return;
+            }
+        };
+
+        if !check_access(
+            new_parent_attrs.uid,
+            new_parent_attrs.gid,
+            new_parent_attrs.mode,
+            req.uid(),
+            req.gid(),
+            libc::W_OK,
+        ) {
+            reply.error(libc::EACCES);
+            return;
+        }
+
+        // "Sticky bit" handling in new_parent
+        if new_parent_attrs.mode & libc::S_ISVTX as u16 != 0 {
+            if let Ok(existing_attrs) = self.lookup_name(new_parent, new_name) {
+                if req.uid() != 0
+                    && req.uid() != new_parent_attrs.uid
+                    && req.uid() != existing_attrs.uid
+                {
+                    reply.error(libc::EACCES);
+                    return;
+                }
             }
         }
 
-        let uid = req.uid();
-        // "Sticky bit" handling
-        if parent.mode & libc::S_ISVTX as u16 != 0
-            && uid != 0
-            && uid != parent.uid
-            && uid != attrs.uid
-        {
-            return Err(io::Error::from_raw_os_error(libc::EACCES));
+        #[cfg(target_os = "linux")]
+        if flags & libc::RENAME_EXCHANGE as u32 != 0 {
+            let mut new_inode_attrs = match self.lookup_name(new_parent, new_name) {
+                Ok(attrs) => attrs,
+                Err(error_code) => {
+                    reply.error(error_code);
+                    return;
+                }
+            };
+
+            let mut entries = self.get_directory_content(new_parent).unwrap();
+            entries.insert(
+                new_name.as_bytes().to_vec(),
+                (inode_attrs.inode, inode_attrs.kind),
+            );
+            self.write_directory_content(new_parent, entries);
+
+            let mut entries = self.get_directory_content(parent).unwrap();
+            entries.insert(
+                name.as_bytes().to_vec(),
+                (new_inode_attrs.inode, new_inode_attrs.kind),
+            );
+            self.write_directory_content(parent, entries);
+
+            parent_attrs.last_metadata_changed = time_now();
+            parent_attrs.last_modified = time_now();
+            self.write_inode(&parent_attrs);
+            new_parent_attrs.last_metadata_changed = time_now();
+            new_parent_attrs.last_modified = time_now();
+            self.write_inode(&new_parent_attrs);
+            inode_attrs.last_metadata_changed = time_now();
+            self.write_inode(&inode_attrs);
+            new_inode_attrs.last_metadata_changed = time_now();
+            self.write_inode(&new_inode_attrs);
+
+            if inode_attrs.kind == FileKind::Directory {
+                let mut entries = self.get_directory_content(inode_attrs.inode).unwrap();
+                entries.insert(b"..".to_vec(), (new_parent, FileKind::Directory));
+                self.write_directory_content(inode_attrs.inode, entries);
+            }
+            if new_inode_attrs.kind == FileKind::Directory {
+                let mut entries = self.get_directory_content(new_inode_attrs.inode).unwrap();
+                entries.insert(b"..".to_vec(), (parent, FileKind::Directory));
+                self.write_directory_content(new_inode_attrs.inode, entries);
+            }
+
+            reply.ok();
+            return;
         }
 
-        attrs.hardlinks -= 1;
+        // Only overwrite an existing directory if it's empty
+        if let Ok(new_name_attrs) = self.lookup_name(new_parent, new_name) {
+            if new_name_attrs.kind == FileKind::Directory
+                && self
+                    .get_directory_content(new_name_attrs.inode)
+                    .unwrap()
+                    .len()
+                    > 2
+            {
+                reply.error(libc::ENOTEMPTY);
+                return;
+            }
+        }
 
-        self.ctrl().save(&parent_contents)?;
-        self.ctrl().save(&parent)?;
+        // Only move an existing directory to a new parent, if we have write access to it,
+        // because that will change the ".." link in it
+        if inode_attrs.kind == FileKind::Directory
+            && parent != new_parent
+            && !check_access(
+                inode_attrs.uid,
+                inode_attrs.gid,
+                inode_attrs.mode,
+                req.uid(),
+                req.gid(),
+                libc::W_OK,
+            )
+        {
+            reply.error(libc::EACCES);
+            return;
+        }
 
-        self.gc_inode(&attrs)?;
+        // If target already exists decrement its hardlink count
+        if let Ok(mut existing_inode_attrs) = self.lookup_name(new_parent, new_name) {
+            let mut entries = self.get_directory_content(new_parent).unwrap();
+            entries.remove(new_name.as_bytes());
+            self.write_directory_content(new_parent, entries);
+
+            if existing_inode_attrs.kind == FileKind::Directory {
+                existing_inode_attrs.hardlinks = 0;
+            } else {
+                existing_inode_attrs.hardlinks -= 1;
+            }
+            existing_inode_attrs.last_metadata_changed = time_now();
+            self.write_inode(&existing_inode_attrs);
+            self.gc_inode(&existing_inode_attrs);
+        }
+
+        let mut entries = self.get_directory_content(parent).unwrap();
+        entries.remove(name.as_bytes());
+        self.write_directory_content(parent, entries);
+
+        let mut entries = self.get_directory_content(new_parent).unwrap();
+        entries.insert(
+            new_name.as_bytes().to_vec(),
+            (inode_attrs.inode, inode_attrs.kind),
+        );
+        self.write_directory_content(new_parent, entries);
+
+        parent_attrs.last_metadata_changed = time_now();
+        parent_attrs.last_modified = time_now();
+        self.write_inode(&parent_attrs);
+        new_parent_attrs.last_metadata_changed = time_now();
+        new_parent_attrs.last_modified = time_now();
+        self.write_inode(&new_parent_attrs);
+        inode_attrs.last_metadata_changed = time_now();
+        self.write_inode(&inode_attrs);
+
+        if inode_attrs.kind == FileKind::Directory {
+            let mut entries = self.get_directory_content(inode_attrs.inode).unwrap();
+            entries.insert(b"..".to_vec(), (new_parent, FileKind::Directory));
+            self.write_directory_content(inode_attrs.inode, entries);
+        }
 
         Ok(())
     }

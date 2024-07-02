@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 use std::os::raw::c_int;
@@ -12,7 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::atomic_file::AtomicFile;
 use crate::contents::EncryptedFile;
-use crate::ctrl::{Controller, Exists, Load, Save};
+use crate::ctrl::{self, Controller, Exists, Load, Save};
+use crate::directory::DirectoryContents;
 use crate::get_groups;
 use crate::handle::Handler;
 use crate::serde::{load, save};
@@ -280,18 +282,21 @@ impl InodeAttributes {
                 // This is important as it preserves the semantic that a file handle opened
                 // with W_OK will never fail to truncate, even if the file has been subsequently
                 // chmod'ed
-                let handle = handler
+                if !handler
                     .handle(fh)
                     .ok_or(libc::EACCES)
-                    .map_err(io::Error::from_raw_os_error)?;
-                if handle.write {
-                    handle.truncate(size, 0, 0)?;
-                } else {
+                    .map_err(io::Error::from_raw_os_error)?
+                    .write
+                {
                     return Err(io::Error::from_raw_os_error(libc::EACCES));
                 }
             } else {
-                handler.truncate(inode, size, req.uid(), req.gid())?;
+                if !self.check_access(req.uid(), req.gid(), libc::W_OK) {
+                    return Err(io::Error::from_raw_os_error(libc::EACCES));
+                }
             }
+            self.size = size;
+            changed = true;
         }
 
         if let Some(atime) = atime {
@@ -307,10 +312,11 @@ impl InodeAttributes {
 
             self.atime = match atime {
                 TimeOrNow::SpecificTime(time) => time_from_system_time(&time),
-                Now => lazy_now(),
+                TimeOrNow::Now => lazy_now(),
             };
             changed = true;
         }
+
         if let Some(mtime) = mtime {
             debug!("utimens() called with {:?}, mtime={:?}", inode, mtime);
 
@@ -324,16 +330,51 @@ impl InodeAttributes {
 
             self.mtime = match mtime {
                 TimeOrNow::SpecificTime(time) => time_from_system_time(&time),
-                Now => lazy_now(),
+                TimeOrNow::Now => lazy_now(),
             };
             changed = true;
         }
 
-        if changed {
+        if let Some(ctime) = ctime {
+            debug!("utimens() called with {:?}, ctime={:?}", inode, ctime);
+
+            if self.uid != req.uid() && req.uid() != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EPERM));
+            }
+
+            self.ctime = time_from_system_time(&ctime);
+            changed = true;
+        }
+
+        if let Some(crtime) = crtime {
+            debug!("utimens() called with {:?}, crtime={:?}", inode, crtime);
+
+            if self.uid != req.uid() && req.uid() != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EPERM));
+            }
+
+            self.crtime = time_from_system_time(&crtime);
+            changed = true;
+        }
+
+        if changed && ctime.is_none() {
             self.ctime = lazy_now();
         }
 
         Ok(changed)
+    }
+
+    pub fn lookup(&self, ctrl: &Controller, name: &OsStr) -> io::Result<Inode> {
+        if self.kind != FileKind::Directory {
+            return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+        }
+
+        let contents = ctrl.load::<DirectoryContents>(self.inode)?;
+        let (inode, _) = contents
+            .get(name)
+            .ok_or(libc::ENOENT)
+            .map_err(io::Error::from_raw_os_error)?;
+        Ok(inode)
     }
 
     pub fn check_access(&self, uid: u32, gid: u32, mut access_mask: i32) -> bool {

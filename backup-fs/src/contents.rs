@@ -368,13 +368,23 @@ impl Contents {
     pub fn fsync(&mut self, datasync: bool) -> io::Result<()> {
         if datasync {
             if let Some(Ok(f)) = std::mem::take(&mut self.file) {
-                f.save(self.ctrl.file_pad(self.inode.size))?;
+                let size = self.ctrl.file_pad(min(
+                    self.inode.size,
+                    max(
+                        f.src.file.metadata()?.len(),
+                        f.written.last_key_value().map_or(0, |(p, l)| *p + *l),
+                    ),
+                ));
+                f.save(size)?;
             }
         }
         if self.changed {
             self.ctrl.save(&self.inode)?;
         }
         Ok(())
+    }
+    pub fn truncate(&mut self, size: u64) {
+        self.inode.size = size;
     }
     pub fn close(mut self) -> io::Result<()> {
         self.fsync(true)?;

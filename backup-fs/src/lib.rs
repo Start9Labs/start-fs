@@ -34,6 +34,7 @@ use crate::atomic_file::AtomicFile;
 use crate::contents::EncryptedFile;
 use crate::ctrl::Controller;
 use crate::directory::DirectoryContents;
+use crate::error::to_libc_err;
 use crate::handle::Handler;
 use crate::inode::DirectoryDescriptor;
 use crate::inode::FileKind;
@@ -141,14 +142,6 @@ impl BackupFS {
             lock,
             handler: Handler::new(ctrl),
         })
-    }
-
-    fn creation_mode(&self, mode: u32) -> u16 {
-        if !self.handler.ctrl().config().setuid_support {
-            (mode & !(libc::S_ISUID | libc::S_ISGID) as u32) as u16
-        } else {
-            mode as u16
-        }
     }
 
     // Check whether a file should be removed from storage. Should be called after decrementing
@@ -295,16 +288,10 @@ impl Filesystem for BackupFS {
         }
     }
 
-    fn readlink(&mut self, _req: &Request, inode: u64, reply: ReplyData) {
-        debug!("readlink() called on {:?}", inode);
-        let path = self.content_path(inode);
-        if let Ok(mut file) = File::open(path) {
-            let file_size = file.metadata().unwrap().len();
-            let mut buffer = vec![0; file_size as usize];
-            file.read_exact(&mut buffer).unwrap();
-            reply.data(&buffer);
-        } else {
-            reply.error(libc::ENOENT);
+    fn readlink(&mut self, req: &Request, inode: u64, reply: ReplyData) {
+        match self.handler.readlink(req, inode) {
+            Ok(path) => reply.data(path.as_os_str().as_bytes()),
+            Err(e) => reply.error(to_libc_err(&e)),
         }
     }
 
@@ -313,86 +300,15 @@ impl Filesystem for BackupFS {
         req: &Request,
         parent: u64,
         name: &OsStr,
-        mut mode: u32,
-        _umask: u32,
-        _rdev: u32,
+        mode: u32,
+        umask: u32,
+        rdev: u32,
         reply: ReplyEntry,
     ) {
-        let file_type = mode & libc::S_IFMT as u32;
-
-        if file_type != libc::S_IFREG as u32
-            && file_type != libc::S_IFLNK as u32
-            && file_type != libc::S_IFDIR as u32
-        {
-            // TODO
-            warn!("mknod() implementation is incomplete. Only supports regular files, symlinks, and directories. Got {:o}", mode);
-            reply.error(libc::ENOSYS);
-            return;
+        match self.handler.mknod(req, parent, name, mode, umask, rdev) {
+            Ok(attrs) => reply.entry(&ENTRY_TTL, &attrs.into(), 0),
+            Err(e) => reply.error(to_libc_err(&e)),
         }
-
-        if self.lookup_name(parent, name).is_ok() {
-            reply.error(libc::EEXIST);
-            return;
-        }
-
-        let mut parent_attrs = match self.get_inode(parent) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
-
-        if !check_access(
-            parent_attrs.uid,
-            parent_attrs.gid,
-            parent_attrs.mode,
-            req.uid(),
-            req.gid(),
-            libc::W_OK,
-        ) {
-            reply.error(libc::EACCES);
-            return;
-        }
-        parent_attrs.last_modified = time_now();
-        parent_attrs.last_metadata_changed = time_now();
-        self.write_inode(&parent_attrs);
-
-        if req.uid() != 0 {
-            mode &= !(libc::S_ISUID | libc::S_ISGID) as u32;
-        }
-
-        let inode = self.allocate_next_inode();
-        let attrs = InodeAttributes {
-            inode,
-            open_file_handles: 0,
-            size: 0,
-            last_accessed: time_now(),
-            last_modified: time_now(),
-            last_metadata_changed: time_now(),
-            kind: as_file_kind(mode),
-            mode: self.creation_mode(mode),
-            hardlinks: 1,
-            uid: req.uid(),
-            gid: parent_attrs.creation_gid(req.gid()),
-            xattrs: Default::default(),
-        };
-        self.write_inode(&attrs);
-        File::create(self.content_path(inode)).unwrap();
-
-        if as_file_kind(mode) == FileKind::Directory {
-            let mut entries = BTreeMap::new();
-            entries.insert(b".".to_vec(), (inode, FileKind::Directory));
-            entries.insert(b"..".to_vec(), (parent, FileKind::Directory));
-            self.write_directory_content(inode, entries);
-        }
-
-        let mut entries = self.get_directory_content(parent).unwrap();
-        entries.insert(name.as_bytes().to_vec(), (inode, attrs.kind));
-        self.write_directory_content(parent, entries);
-
-        // TODO: implement flags
-        reply.entry(&Duration::new(0, 0), &attrs.into(), 0);
     }
 
     fn mkdir(

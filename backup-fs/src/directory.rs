@@ -5,7 +5,7 @@ use std::fs::File;
 use crate::atomic_file::AtomicFile;
 use crate::contents::EncryptedFile;
 use crate::ctrl::{Controller, Exists, Load, Save};
-use crate::inode::{FileKind, Inode};
+use crate::inode::{FileKind, Inode, InodeAttributes};
 use crate::serde::{load, save};
 
 pub struct DirectoryContents {
@@ -20,6 +20,9 @@ impl DirectoryContents {
     }
     pub fn get(&self, name: &OsStr) -> Option<(Inode, FileKind)> {
         self.contents.get(name).copied()
+    }
+    pub fn insert(&mut self, name: OsString, inode: &InodeAttributes) {
+        self.contents.insert(name, (inode.inode, inode.kind));
     }
 }
 impl<'a> Save for &'a DirectoryContents {

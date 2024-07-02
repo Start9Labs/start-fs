@@ -43,6 +43,7 @@ use crate::inode::InodeAttributes;
 use crate::inode::BLOCK_SIZE;
 use crate::serde::load;
 use crate::serde::save;
+use crate::util::Never;
 
 mod atomic_file;
 mod contents;
@@ -142,54 +143,6 @@ impl BackupFS {
             lock,
             handler: Handler::new(ctrl),
         })
-    }
-
-    // Check whether a file should be removed from storage. Should be called after decrementing
-    // the link count, or closing a file handle
-    fn gc_inode(&self, inode: &InodeAttributes) -> bool {
-        if inode.hardlinks == 0 && inode.open_file_handles == 0 {
-            let inode_path = self.inode_dir.join(inode.inode.to_string());
-            fs::remove_file(inode_path).unwrap();
-            let content_path = self.inode_dir.join(inode.inode.to_string());
-            fs::remove_file(content_path).unwrap();
-
-            return true;
-        }
-
-        return false;
-    }
-
-    fn truncate(
-        &self,
-        inode: Inode,
-        new_length: u64,
-        uid: u32,
-        gid: u32,
-    ) -> Result<InodeAttributes, c_int> {
-        if new_length > MAX_FILE_SIZE {
-            return Err(libc::EFBIG);
-        }
-
-        let mut attrs = self.get_inode(inode)?;
-
-        if !check_access(attrs.uid, attrs.gid, attrs.mode, uid, gid, libc::W_OK) {
-            return Err(libc::EACCES);
-        }
-
-        let path = self.content_path(inode);
-        let file = OpenOptions::new().write(true).open(path).unwrap();
-        file.set_len(new_length).unwrap();
-
-        attrs.size = new_length;
-        attrs.last_metadata_changed = time_now();
-        attrs.last_modified = time_now();
-
-        // Clear SETUID & SETGID on truncate
-        attrs.clear_suid_sgid();
-
-        self.write_inode(&attrs);
-
-        Ok(attrs)
     }
 
     fn insert_link(
@@ -305,7 +258,10 @@ impl Filesystem for BackupFS {
         rdev: u32,
         reply: ReplyEntry,
     ) {
-        match self.handler.mknod(req, parent, name, mode, umask, rdev) {
+        match self
+            .handler
+            .mknod(req, parent, name, mode, umask, rdev, None::<Never>)
+        {
             Ok(attrs) => reply.entry(&ENTRY_TTL, &attrs.into(), 0),
             Err(e) => reply.error(to_libc_err(&e)),
         }
@@ -316,130 +272,19 @@ impl Filesystem for BackupFS {
         req: &Request,
         parent: u64,
         name: &OsStr,
-        mut mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         reply: ReplyEntry,
     ) {
         debug!("mkdir() called with {:?} {:?} {:o}", parent, name, mode);
-        if self.lookup_name(parent, name).is_ok() {
-            reply.error(libc::EEXIST);
-            return;
-        }
-
-        let mut parent_attrs = match self.get_inode(parent) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
-
-        if !check_access(
-            parent_attrs.uid,
-            parent_attrs.gid,
-            parent_attrs.mode,
-            req.uid(),
-            req.gid(),
-            libc::W_OK,
-        ) {
-            reply.error(libc::EACCES);
-            return;
-        }
-        parent_attrs.last_modified = time_now();
-        parent_attrs.last_metadata_changed = time_now();
-        self.write_inode(&parent_attrs);
-
-        if req.uid() != 0 {
-            mode &= !(libc::S_ISUID | libc::S_ISGID) as u32;
-        }
-        if parent_attrs.mode & libc::S_ISGID as u16 != 0 {
-            mode |= libc::S_ISGID as u32;
-        }
-
-        let inode = self.allocate_next_inode();
-        let attrs = InodeAttributes {
-            inode,
-            open_file_handles: 0,
-            size: BLOCK_SIZE,
-            last_accessed: time_now(),
-            last_modified: time_now(),
-            last_metadata_changed: time_now(),
-            kind: FileKind::Directory,
-            mode: self.creation_mode(mode),
-            hardlinks: 2, // Directories start with link count of 2, since they have a self link
-            uid: req.uid(),
-            gid: parent_attrs.creation_gid(req.gid()),
-            xattrs: Default::default(),
-        };
-        self.write_inode(&attrs);
-
-        let mut entries = BTreeMap::new();
-        entries.insert(b".".to_vec(), (inode, FileKind::Directory));
-        entries.insert(b"..".to_vec(), (parent, FileKind::Directory));
-        self.write_directory_content(inode, entries);
-
-        let mut entries = self.get_directory_content(parent).unwrap();
-        entries.insert(name.as_bytes().to_vec(), (inode, FileKind::Directory));
-        self.write_directory_content(parent, entries);
-
-        reply.entry(&Duration::new(0, 0), &attrs.into(), 0);
+        self.mknod(req, parent, name, mode & libc::S_IFDIR, umask, 0, reply)
     }
 
     fn unlink(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        debug!("unlink() called with {:?} {:?}", parent, name);
-        let mut attrs = match self.lookup_name(parent, name) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
-
-        let mut parent_attrs = match self.get_inode(parent) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
-
-        if !check_access(
-            parent_attrs.uid,
-            parent_attrs.gid,
-            parent_attrs.mode,
-            req.uid(),
-            req.gid(),
-            libc::W_OK,
-        ) {
-            reply.error(libc::EACCES);
-            return;
+        match self.handler.unlink(req, parent, name) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(to_libc_err(&e)),
         }
-
-        let uid = req.uid();
-        // "Sticky bit" handling
-        if parent_attrs.mode & libc::S_ISVTX as u16 != 0
-            && uid != 0
-            && uid != parent_attrs.uid
-            && uid != attrs.uid
-        {
-            reply.error(libc::EACCES);
-            return;
-        }
-
-        parent_attrs.last_metadata_changed = time_now();
-        parent_attrs.last_modified = time_now();
-        self.write_inode(&parent_attrs);
-
-        attrs.hardlinks -= 1;
-        attrs.last_metadata_changed = time_now();
-        self.write_inode(&attrs);
-        self.gc_inode(&attrs);
-
-        let mut entries = self.get_directory_content(parent).unwrap();
-        entries.remove(name.as_bytes());
-        self.write_directory_content(parent, entries);
-
-        reply.ok();
     }
 
     fn rmdir(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::atomic_file::AtomicFile;
 use crate::contents::EncryptedFile;
-use crate::ctrl::{self, Controller, Exists, Load, Save};
+use crate::ctrl::{Controller, Exists, Load, Save};
 use crate::directory::DirectoryContents;
 use crate::get_groups;
 use crate::handle::Handler;
@@ -190,7 +190,7 @@ impl InodeAttributes {
             ctime: now,
             kind,
             mode: 0o777,
-            hardlinks: if kind == FileKind::Directory { 2 } else { 1 },
+            hardlinks: 1,
             uid: 0,
             gid: 0,
             xattrs: Default::default(),
@@ -291,9 +291,7 @@ impl InodeAttributes {
                     return Err(io::Error::from_raw_os_error(libc::EACCES));
                 }
             } else {
-                if !self.check_access(req.uid(), req.gid(), libc::W_OK) {
-                    return Err(io::Error::from_raw_os_error(libc::EACCES));
-                }
+                self.check_access(req.uid(), req.gid(), libc::W_OK)?;
             }
             self.size = size;
             changed = true;
@@ -306,8 +304,8 @@ impl InodeAttributes {
                 return Err(io::Error::from_raw_os_error(libc::EPERM));
             }
 
-            if self.uid != req.uid() && !self.check_access(req.uid(), req.gid(), libc::W_OK) {
-                return Err(io::Error::from_raw_os_error(libc::EACCES));
+            if self.uid != req.uid() {
+                self.check_access(req.uid(), req.gid(), libc::W_OK)?;
             }
 
             self.atime = match atime {
@@ -324,8 +322,8 @@ impl InodeAttributes {
                 return Err(io::Error::from_raw_os_error(libc::EPERM));
             }
 
-            if self.uid != req.uid() && !self.check_access(req.uid(), req.gid(), libc::W_OK) {
-                return Err(io::Error::from_raw_os_error(libc::EACCES));
+            if self.uid != req.uid() {
+                self.check_access(req.uid(), req.gid(), libc::W_OK)?;
             }
 
             self.mtime = match mtime {
@@ -370,6 +368,7 @@ impl InodeAttributes {
         }
 
         let contents = ctrl.load::<DirectoryContents>(self.inode)?;
+
         let (inode, _) = contents
             .get(name)
             .ok_or(libc::ENOENT)
@@ -377,10 +376,10 @@ impl InodeAttributes {
         Ok(inode)
     }
 
-    pub fn check_access(&self, uid: u32, gid: u32, mut access_mask: i32) -> bool {
+    pub fn check_access(&self, uid: u32, gid: u32, mut access_mask: i32) -> io::Result<()> {
         // F_OK tests for existence of file
         if access_mask == libc::F_OK {
-            return true;
+            return Ok(());
         }
         let file_mode = i32::from(self.mode);
 
@@ -391,7 +390,11 @@ impl InodeAttributes {
             access_mask -= access_mask & (file_mode >> 6);
             access_mask -= access_mask & (file_mode >> 3);
             access_mask -= access_mask & file_mode;
-            return access_mask == 0;
+            return if access_mask == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(libc::EACCES))
+            };
         }
 
         if uid == self.uid {
@@ -402,7 +405,11 @@ impl InodeAttributes {
             access_mask -= access_mask & file_mode;
         }
 
-        return access_mask == 0;
+        if access_mask == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(libc::EACCES))
+        }
     }
 
     pub fn clear_suid_sgid(&mut self) {
@@ -440,17 +447,15 @@ impl InodeAttributes {
             }
             XattrNamespace::System => {
                 if key.eq(b"system.posix_acl_access") {
-                    if !self.check_access(request.uid(), request.gid(), access_mask) {
-                        return Err(libc::EPERM);
-                    }
+                    self.check_access(request.uid(), request.gid(), access_mask)
+                        .map_err(|_| libc::EPERM)?;
                 } else if request.uid() != 0 {
                     return Err(libc::EPERM);
                 }
             }
             XattrNamespace::User => {
-                if !self.check_access(request.uid(), request.gid(), access_mask) {
-                    return Err(libc::EPERM);
-                }
+                self.check_access(request.uid(), request.gid(), access_mask)
+                    .map_err(|_| libc::EPERM)?;
             }
         }
 

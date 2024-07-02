@@ -4,6 +4,8 @@ use rand::{CryptoRng, RngCore};
 use sha2::digest::Output;
 use sha2::Digest;
 
+use crate::ctrl::Save;
+
 pub struct RandReader<R: RngCore>(R);
 impl<R: RngCore> RandReader<R> {
     pub fn new(rng: R) -> Self {
@@ -52,5 +54,18 @@ impl<D: Digest, T: Read> Read for HashIO<D, T> {
         let n = self.io.read(buf)?;
         self.hasher.update(&buf[..n]);
         Ok(n)
+    }
+}
+
+pub enum Never {}
+
+impl Save for Never {
+    fn save(self, _ctrl: &crate::ctrl::Controller) -> io::Result<()> {
+        match self {}
+    }
+}
+impl<'a> Save for &'a Never {
+    fn save(self, _ctrl: &crate::ctrl::Controller) -> io::Result<()> {
+        match *self {}
     }
 }

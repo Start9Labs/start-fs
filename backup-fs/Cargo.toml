@@ -20,7 +20,7 @@ required-features = ["cli"]
 bincode = "1"
 chacha20 = { version = "0.9.1", features = ["zeroize"] }
 fd-lock-rs = "0.1.4"
-fuser = { version = "0.14", features = ["abi-7-31"] }
+fuser = { version = "0.14", features = ["abi-7-31", "serializable"] }
 generic-array = { version = "1", features = ["serde"] }
 imbl = { version = "3", features = ["serde"] }
 itertools = "0.13"

@@ -17,7 +17,7 @@ use crate::contents::EncryptedFile;
 use crate::ctrl::{Controller, Exists, Load, Save};
 use crate::directory::DirectoryContents;
 use crate::get_groups;
-use crate::handle::Handler;
+use crate::handle::{FileHandleId, Handler};
 use crate::serde::{load, save};
 
 pub const BLOCK_SIZE: u64 = 512;
@@ -55,6 +55,9 @@ impl FileData {
     }
     pub fn is_dir(&self) -> bool {
         matches!(self, Self::Directory(_))
+    }
+    pub fn is_file(&self) -> bool {
+        matches!(self, Self::File(_))
     }
 }
 
@@ -167,8 +170,8 @@ pub fn time_from_system_time(system_time: &SystemTime) -> (i64, u32) {
     }
 }
 
-impl From<InodeAttributes> for fuser::FileAttr {
-    fn from(InodeAttributes { inode, attrs }: InodeAttributes) -> Self {
+impl From<&InodeAttributes> for fuser::FileAttr {
+    fn from(InodeAttributes { inode, attrs }: &InodeAttributes) -> Self {
         fuser::FileAttr {
             ino: inode.0,
             size: attrs.size,
@@ -270,7 +273,7 @@ impl Attributes {
         atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
         ctime: Option<SystemTime>,
-        fh: Option<u64>,
+        fh: Option<FileHandleId>,
         crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
@@ -457,6 +460,15 @@ impl Attributes {
             Ok(())
         } else {
             Err(io::Error::from_raw_os_error(libc::EACCES))
+        }
+    }
+
+    pub fn check_sticky(&self, child: &Self, uid: u32) -> io::Result<()> {
+        if self.mode & libc::S_ISVTX as u16 != 0 && uid != 0 && uid != self.uid && uid != child.uid
+        {
+            Err(io::Error::from_raw_os_error(libc::EACCES))
+        } else {
+            Ok(())
         }
     }
 

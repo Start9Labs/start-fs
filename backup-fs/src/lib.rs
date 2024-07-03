@@ -11,8 +11,9 @@ use fuser::consts::FUSE_HANDLE_KILLPRIV;
 use fuser::consts::FUSE_WRITE_KILL_PRIV;
 use fuser::TimeOrNow::Now;
 use fuser::{
-    Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, FUSE_ROOT_ID,
+    Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
+    Request, TimeOrNow, FUSE_ROOT_ID,
 };
 use log::{debug, error, warn};
 use std::cmp::min;
@@ -35,13 +36,12 @@ use crate::contents::EncryptedFile;
 use crate::ctrl::Controller;
 use crate::directory::DirectoryContents;
 use crate::error::to_libc_err;
-use crate::handle::Handler;
+use crate::handle::{FileHandleId, Handler};
 use crate::inode::BLOCK_SIZE;
 use crate::inode::{Attributes, FileData};
 use crate::inode::{Inode, InodeAttributes};
 use crate::serde::load;
 use crate::serde::save;
-use crate::util::Never;
 
 mod atomic_file;
 mod contents;
@@ -167,16 +167,19 @@ impl Filesystem for BackupFS {
 
     fn lookup(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         match self.handler.lookup(req, Inode(parent), name) {
-            Ok(attr) => reply.entry(&ENTRY_TTL, &attr.into(), 0),
+            Ok(inode) => reply.entry(&ENTRY_TTL, &(&inode).into(), 0),
             Err(e) => reply.error(error::to_libc_err(&e)),
         }
     }
 
-    fn forget(&mut self, _req: &Request, _ino: u64, _nlookup: u64) {}
+    fn forget(&mut self, _req: &Request, _inode: u64, _nlookup: u64) {}
 
     fn getattr(&mut self, _req: &Request, inode: u64, reply: ReplyAttr) {
-        match self.handler.ctrl().load::<InodeAttributes>(Inode(inode)) {
-            Ok(attr) => reply.attr(&ENTRY_TTL, &attr.into()),
+        match self
+            .handler
+            .mutate_inode(Inode(inode), |_, inode| Ok((&*inode).into()))
+        {
+            Ok(attr) => reply.attr(&ENTRY_TTL, &attr),
             Err(e) => reply.error(error::to_libc_err(&e)),
         }
     }
@@ -209,13 +212,13 @@ impl Filesystem for BackupFS {
             atime,
             mtime,
             ctime,
-            fh,
+            fh.map(FileHandleId),
             crtime,
             chgtime,
             bkuptime,
             flags,
         ) {
-            Ok(attr) => reply.attr(&ENTRY_TTL, &attr.into()),
+            Ok(inode) => reply.attr(&ENTRY_TTL, &(&inode).into()),
             Err(e) => reply.error(error::to_libc_err(&e)),
         }
     }
@@ -246,7 +249,7 @@ impl Filesystem for BackupFS {
             rdev,
             None::<fn(Inode) -> FileData>,
         ) {
-            Ok(attrs) => reply.entry(&ENTRY_TTL, &attrs.into(), 0),
+            Ok(inode) => reply.entry(&ENTRY_TTL, &(&inode).into(), 0),
             Err(e) => reply.error(to_libc_err(&e)),
         }
     }
@@ -301,7 +304,7 @@ impl Filesystem for BackupFS {
             0,
             Some(|_| FileData::Symlink(target.to_owned())),
         ) {
-            Ok(attrs) => reply.entry(&ENTRY_TTL, &attrs.into(), 0),
+            Ok(inode) => reply.entry(&ENTRY_TTL, &(&inode).into(), 0),
             Err(e) => reply.error(to_libc_err(&e)),
         }
     }
@@ -316,10 +319,14 @@ impl Filesystem for BackupFS {
         flags: u32,
         reply: ReplyEmpty,
     ) {
-        match self
-            .handler
-            .rename(req, parent, name, new_parent, new_name, flags)
-        {
+        match self.handler.rename(
+            req,
+            Inode(parent),
+            name,
+            Inode(new_parent),
+            new_name,
+            flags & libc::RENAME_EXCHANGE != 0,
+        ) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(to_libc_err(&e)),
         }
@@ -339,254 +346,226 @@ impl Filesystem for BackupFS {
         );
         match self
             .handler
-            .link(req, Inode(inode), Inode(new_parent), new_name)
+            .link(req, Inode(inode), Inode(new_parent), new_name, None)
         {
-            Ok(attrs) => reply.entry(&ENTRY_TTL, &attrs.into(), 0),
+            Ok(inode) => reply.entry(&ENTRY_TTL, &(&inode).into(), 0),
             Err(e) => reply.error(to_libc_err(&e)),
         }
     }
 
     fn open(&mut self, req: &Request, inode: u64, flags: i32, reply: ReplyOpen) {
         debug!("open() called for {:?}", inode);
-        let (access_mask, read, write) = match flags & libc::O_ACCMODE {
-            libc::O_RDONLY => {
-                // Behavior is undefined, but most filesystems return EACCES
-                if flags & libc::O_TRUNC != 0 {
-                    reply.error(libc::EACCES);
-                    return;
-                }
-                if flags & FMODE_EXEC != 0 {
-                    // Open is from internal exec syscall
-                    (libc::X_OK, true, false)
-                } else {
-                    (libc::R_OK, true, false)
-                }
-            }
-            libc::O_WRONLY => (libc::W_OK, false, true),
-            libc::O_RDWR => (libc::R_OK | libc::W_OK, true, true),
-            // Exactly one access mode flag must be specified
-            _ => {
-                reply.error(libc::EINVAL);
-                return;
-            }
-        };
-
-        match self.get_inode(inode) {
-            Ok(mut attr) => {
-                if check_access(
-                    attr.uid,
-                    attr.gid,
-                    attr.mode,
-                    req.uid(),
-                    req.gid(),
-                    access_mask,
-                ) {
-                    attr.open_file_handles += 1;
-                    self.write_inode(&attr);
-                    let open_flags = if self.config.direct_io {
-                        FOPEN_DIRECT_IO
-                    } else {
-                        0
-                    };
-                    reply.opened(self.allocate_next_file_handle(read, write), open_flags);
-                } else {
-                    reply.error(libc::EACCES);
-                }
-                return;
-            }
-            Err(error_code) => reply.error(error_code),
+        match self.handler.open(req, Inode(inode), flags) {
+            Ok(FileHandleId(fh)) => reply.opened(fh, 0),
+            Err(e) => reply.error(to_libc_err(&e)),
         }
     }
 
     fn read(
         &mut self,
-        _req: &Request,
+        req: &Request,
         inode: u64,
         fh: u64,
         offset: i64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        flags: i32,
+        lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
         debug!(
             "read() called on {:?} offset={:?} size={:?}",
             inode, offset, size
         );
-        assert!(offset >= 0);
-        if !self.check_file_handle_read(fh) {
-            reply.error(libc::EACCES);
+        if offset < 0 {
+            reply.error(libc::EINVAL);
             return;
         }
-
-        let path = self.content_path(inode);
-        if let Ok(file) = File::open(path) {
-            let file_size = file.metadata().unwrap().len();
-            // Could underflow if file length is less than local_start
-            let read_size = min(size, file_size.saturating_sub(offset as u64) as u32);
-
-            let mut buffer = vec![0; read_size as usize];
-            file.read_exact_at(&mut buffer, offset as u64).unwrap();
-            reply.data(&buffer);
-        } else {
-            reply.error(libc::ENOENT);
+        match self.handler.read(
+            req,
+            Inode(inode),
+            FileHandleId(fh),
+            offset as u64,
+            size as usize,
+            flags,
+            lock_owner,
+        ) {
+            Ok(buf) => reply.data(&buf),
+            Err(e) => reply.error(to_libc_err(&e)),
         }
     }
 
     fn write(
         &mut self,
-        _req: &Request,
+        req: &Request,
         inode: u64,
         fh: u64,
         offset: i64,
         data: &[u8],
-        _write_flags: u32,
-        #[allow(unused_variables)] flags: i32,
-        _lock_owner: Option<u64>,
+        write_flags: u32,
+        flags: i32,
+        lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
         debug!("write() called with {:?} size={:?}", inode, data.len());
-        assert!(offset >= 0);
-        if !self.check_file_handle_write(fh) {
-            reply.error(libc::EACCES);
+        if offset < 0 {
+            reply.error(libc::EINVAL);
             return;
         }
+        match self.handler.write(
+            req,
+            Inode(inode),
+            FileHandleId(fh),
+            offset as u64,
+            data,
+            write_flags,
+            flags,
+            lock_owner,
+        ) {
+            Ok(n) => reply.written(n as u32),
+            Err(e) => reply.error(to_libc_err(&e)),
+        }
+    }
 
-        let path = self.content_path(inode);
-        if let Ok(mut file) = OpenOptions::new().write(true).open(path) {
-            file.seek(SeekFrom::Start(offset as u64)).unwrap();
-            file.write_all(data).unwrap();
-
-            let mut attrs = self.get_inode(inode).unwrap();
-            attrs.last_metadata_changed = time_now();
-            attrs.last_modified = time_now();
-            if data.len() + offset as usize > attrs.size as usize {
-                attrs.size = (data.len() + offset as usize) as u64;
-            }
-            if flags & FUSE_WRITE_KILL_PRIV as i32 != 0 {
-                attrs.clear_suid_sgid();
-            }
-            // XXX: In theory we should only need to do this when WRITE_KILL_PRIV is set for 7.31+
-            // However, xfstests fail in that case
-            attrs.clear_suid_sgid();
-            self.write_inode(&attrs);
-
-            reply.written(data.len() as u32);
-        } else {
-            reply.error(libc::EBADF);
+    fn flush(&mut self, req: &Request, inode: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+        match self
+            .handler
+            .fsync(req, Inode(inode), FileHandleId(fh), true)
+        {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(to_libc_err(&e)),
         }
     }
 
     fn release(
         &mut self,
-        _req: &Request<'_>,
-        inode: u64,
-        _fh: u64,
+        _req: &Request,
+        _inode: u64,
+        fh: u64,
         _flags: i32,
         _lock_owner: Option<u64>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        if let Ok(mut attrs) = self.get_inode(inode) {
-            attrs.open_file_handles -= 1;
+        match self.handler.fclose(FileHandleId(fh)) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(to_libc_err(&e)),
         }
-        reply.ok();
+    }
+
+    fn fsync(&mut self, req: &Request, inode: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
+        match self
+            .handler
+            .fsync(req, Inode(inode), FileHandleId(fh), datasync)
+        {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(to_libc_err(&e)),
+        }
     }
 
     fn opendir(&mut self, req: &Request, inode: u64, flags: i32, reply: ReplyOpen) {
         debug!("opendir() called on {:?}", inode);
-        let (access_mask, read, write) = match flags & libc::O_ACCMODE {
-            libc::O_RDONLY => {
-                // Behavior is undefined, but most filesystems return EACCES
-                if flags & libc::O_TRUNC != 0 {
-                    reply.error(libc::EACCES);
-                    return;
-                }
-                (libc::R_OK, true, false)
-            }
-            libc::O_WRONLY => (libc::W_OK, false, true),
-            libc::O_RDWR => (libc::R_OK | libc::W_OK, true, true),
-            // Exactly one access mode flag must be specified
-            _ => {
-                reply.error(libc::EINVAL);
-                return;
-            }
-        };
-
-        match self.get_inode(inode) {
-            Ok(mut attr) => {
-                if check_access(
-                    attr.uid,
-                    attr.gid,
-                    attr.mode,
-                    req.uid(),
-                    req.gid(),
-                    access_mask,
-                ) {
-                    attr.open_file_handles += 1;
-                    self.write_inode(&attr);
-                    let open_flags = if self.config.direct_io {
-                        FOPEN_DIRECT_IO
-                    } else {
-                        0
-                    };
-                    reply.opened(self.allocate_next_file_handle(read, write), open_flags);
-                } else {
-                    reply.error(libc::EACCES);
-                }
-                return;
-            }
-            Err(error_code) => reply.error(error_code),
+        match self.handler.opendir(req, Inode(inode), flags) {
+            Ok(FileHandleId(fh)) => reply.opened(fh, 0),
+            Err(e) => reply.error(to_libc_err(&e)),
         }
     }
 
     fn readdir(
         &mut self,
-        _req: &Request,
+        req: &Request,
         inode: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
         debug!("readdir() called with {:?}", inode);
-        assert!(offset >= 0);
-        let entries = match self.get_directory_content(inode) {
-            Ok(entries) => entries,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
-
-        for (index, entry) in entries.iter().skip(offset as usize).enumerate() {
-            let (name, (inode, file_type)) = entry;
-
-            let buffer_full: bool = reply.add(
-                *inode,
-                offset + index as i64 + 1,
-                (*file_type).into(),
-                OsStr::from_bytes(name),
-            );
-
-            if buffer_full {
-                break;
-            }
+        if offset < 0 {
+            reply.error(libc::EINVAL);
+            return;
         }
+        match self.handler.readdir(
+            req,
+            Inode(inode),
+            FileHandleId(fh),
+            offset,
+            |_, name, entry, offset| Ok(reply.add(entry.inode.0, offset, entry.ty, name)),
+        ) {
+            Ok(done) => {
+                if done {
+                    // todo!();
+                }
+                reply.ok()
+            }
+            Err(e) => reply.error(to_libc_err(&e)),
+        }
+    }
 
-        reply.ok();
+    fn readdirplus(
+        &mut self,
+        req: &Request<'_>,
+        inode: u64,
+        fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectoryPlus,
+    ) {
+        debug!("readdirplus() called with {:?}", inode);
+        if offset < 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+        match self.handler.readdir(
+            req,
+            Inode(inode),
+            FileHandleId(fh),
+            offset,
+            |handler, name, entry, offset| {
+                handler.mutate_inode(entry.inode, |_, inode| {
+                    Ok(reply.add(
+                        inode.inode.0,
+                        offset,
+                        name,
+                        &ENTRY_TTL,
+                        &(&*inode).into(),
+                        0,
+                    ))
+                })
+            },
+        ) {
+            Ok(done) => {
+                if done {
+                    // todo!();
+                }
+                reply.ok()
+            }
+            Err(e) => reply.error(to_libc_err(&e)),
+        }
     }
 
     fn releasedir(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         inode: u64,
-        _fh: u64,
-        _flags: i32,
+        fh: u64,
+        flags: i32,
         reply: ReplyEmpty,
     ) {
-        if let Ok(mut attrs) = self.get_inode(inode) {
-            attrs.open_file_handles -= 1;
+        match self
+            .handler
+            .releasedir(req, Inode(inode), FileHandleId(fh), flags)
+        {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(to_libc_err(&e)),
         }
+    }
+
+    fn fsyncdir(
+        &mut self,
+        _req: &Request,
+        _inode: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
         reply.ok();
     }
 

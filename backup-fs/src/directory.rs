@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::ops::{Deref, DerefMut};
 
+use fuser::FileType;
 use imbl::OrdMap;
 use serde::{Deserialize, Serialize};
 
@@ -14,7 +15,7 @@ pub struct DirectoryContents {
 #[derive(Clone, Deserialize, Serialize)]
 pub struct DirectoryEntry {
     pub inode: Inode,
-    pub is_dir: bool,
+    pub ty: FileType,
 }
 
 impl DirectoryContents {
@@ -23,7 +24,11 @@ impl DirectoryContents {
         Self { contents }
     }
     pub fn nlink(&self) -> usize {
-        1 + self.contents.values().filter(|e| e.is_dir).count()
+        1 + self
+            .contents
+            .values()
+            .filter(|e| e.ty == FileType::Directory)
+            .count()
     }
 }
 impl Deref for DirectoryContents {

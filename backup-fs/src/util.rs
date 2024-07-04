@@ -1,6 +1,5 @@
-use std::borrow::BorrowMut;
 use std::io::{self, Read, Write};
-use std::ops::{Deref, DerefMut, RangeInclusive};
+use std::ops::RangeInclusive;
 
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -19,7 +18,7 @@ impl<R: RngCore + CryptoRng> RandReader<R> {
     }
 }
 impl<R: RngCore> Read for RandReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.fill_bytes(buf);
         Ok(buf.len())
     }
@@ -55,28 +54,6 @@ impl<D: Digest, T: Read> Read for HashIO<D, T> {
         let n = self.io.read(buf)?;
         self.hasher.update(&buf[..n]);
         Ok(n)
-    }
-}
-
-pub enum OrMut<T, U: BorrowMut<T>> {
-    Owned(T),
-    Mut(U),
-}
-impl<T, U: BorrowMut<T>> Deref for OrMut<T, U> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Owned(a) => &a,
-            Self::Mut(a) => a.borrow(),
-        }
-    }
-}
-impl<T, U: BorrowMut<T>> DerefMut for OrMut<T, U> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        match self {
-            Self::Owned(ref mut a) => a,
-            Self::Mut(a) => a.borrow_mut(),
-        }
     }
 }
 

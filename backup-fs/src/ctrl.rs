@@ -8,13 +8,13 @@ use std::rc::Rc;
 use chacha20::cipher::{Iv, KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20::{ChaCha20, Key};
 use fuser::{FileType, FUSE_ROOT_ID};
-use itertools::Itertools;
 use log::error;
 use rand::Rng;
 
 use crate::atomic_file::AtomicFile;
 use crate::contents::EncryptedFile;
 use crate::directory::{DirectoryContents, DirectoryEntry};
+use crate::error::{IoError, IoResult};
 use crate::inode::{ContentId, FileData, Inode, InodeAttributes};
 use crate::serde::{load, save};
 use crate::util::IdPool;
@@ -73,9 +73,10 @@ impl Controller {
         }))
     }
 
-    pub fn load_inode_pool(&self) -> io::Result<()> {
+    pub fn load_inode_pool(&self) -> IoResult<()> {
         if self.0.inode_pool_path.exists() {
             match File::open(&self.0.inode_pool_path)
+                .map_err(IoError::from)
                 .and_then(|f| EncryptedFile::open(f, &self.key()))
                 .and_then(load)
             {
@@ -93,7 +94,7 @@ impl Controller {
         Ok(())
     }
 
-    pub fn fsck(&self, find_orphans: bool) -> io::Result<()> {
+    pub fn fsck(&self, find_orphans: bool) -> IoResult<()> {
         self.0.inode_pool.replace(IdPool::new());
         self.fsck_inode(Inode(FUSE_ROOT_ID), None)?;
         if find_orphans {
@@ -106,7 +107,7 @@ impl Controller {
         &self,
         inode: Inode,
         parent: Option<(&(Inode, OsString), &DirectoryEntry)>,
-    ) -> io::Result<bool> {
+    ) -> IoResult<bool> {
         let mut prune = false;
         let mut changed = false;
         self.0.inode_pool.borrow_mut().remove(inode.0);
@@ -134,7 +135,11 @@ impl Controller {
                             FileType::Directory => FileData::Directory(DirectoryContents::new()),
                             FileType::Symlink => FileData::Symlink(PathBuf::new()),
                             FileType::RegularFile => FileData::File(ContentId(inode.0)),
-                            _ => return Err(io::Error::other("unsupported filetype in directory")),
+                            _ => {
+                                return Err(
+                                    io::Error::other("unsupported filetype in directory").into()
+                                )
+                            }
                         },
                     )
                 } else {
@@ -162,7 +167,7 @@ impl Controller {
         Ok(prune)
     }
 
-    fn find_orphans(&self) -> io::Result<()> {
+    fn find_orphans(&self) -> IoResult<()> {
         // TODO
         Ok(())
     }
@@ -181,7 +186,7 @@ impl Controller {
             .join(format!("{a:04x}/{b:04x}/{c:04x}/{d:04x}/{e:02x}"))
     }
 
-    pub fn next_inode(&self) -> io::Result<Inode> {
+    pub fn next_inode(&self) -> IoResult<Inode> {
         let mut pool = self.0.inode_pool.borrow_mut();
         let res: u64 = pool
             .next()
@@ -216,11 +221,11 @@ impl Controller {
         &self.0.config
     }
 
-    pub fn save<T: Save>(&self, item: T) -> io::Result<()> {
+    pub fn save<T: Save>(&self, item: T) -> IoResult<()> {
         item.save(self)
     }
 
-    pub fn load<T: Load>(&self, args: T::Args<'_>) -> io::Result<T> {
+    pub fn load<T: Load>(&self, args: T::Args<'_>) -> IoResult<T> {
         T::load(self, args)
     }
 
@@ -230,12 +235,12 @@ impl Controller {
 }
 
 pub trait Save {
-    fn save(self, ctrl: &Controller) -> io::Result<()>;
+    fn save(self, ctrl: &Controller) -> IoResult<()>;
 }
 
 pub trait Load: Sized {
     type Args<'a>;
-    fn load(ctrl: &Controller, args: Self::Args<'_>) -> io::Result<Self>;
+    fn load(ctrl: &Controller, args: Self::Args<'_>) -> IoResult<Self>;
 }
 
 pub trait Exists: Load {

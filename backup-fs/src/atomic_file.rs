@@ -4,13 +4,20 @@ use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
+use crate::error::IoResult;
+
 pub struct AtomicFile {
     tmp_path: PathBuf,
     path: PathBuf,
     file: Option<File>,
 }
 impl AtomicFile {
-    pub fn new(path: PathBuf, opt: &OpenOptions) -> io::Result<Self> {
+    pub fn new(path: PathBuf, opt: &OpenOptions) -> IoResult<Self> {
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
         let tmp_path = path.with_extension("tmp");
         let file = opt.open(&tmp_path)?;
         Ok(Self {
@@ -20,20 +27,20 @@ impl AtomicFile {
         })
     }
 
-    pub fn create(path: PathBuf) -> io::Result<Self> {
+    pub fn create(path: PathBuf) -> IoResult<Self> {
         Self::new(
             path,
             &OpenOptions::new().write(true).truncate(true).create(true),
         )
     }
 
-    pub fn rollback(mut self) -> io::Result<()> {
+    pub fn rollback(mut self) -> IoResult<()> {
         drop(self.file.take());
         std::fs::remove_file(&self.tmp_path)?;
         Ok(())
     }
 
-    pub fn save(mut self) -> io::Result<()> {
+    pub fn save(mut self) -> IoResult<()> {
         if let Some(file) = self.file.as_mut() {
             file.flush()?;
             file.sync_all()?;
@@ -72,7 +79,7 @@ impl Read for AtomicFile {
     fn read_vectored(&mut self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
         self.deref_mut().read_vectored(bufs)
     }
-    // fn read_buf(&mut self, buf: io::BorrowedCursor<'_>) -> io::Result<()> {
+    // fn read_buf(&mut self, buf: io::BorrowedCursor<'_>) -> IoResult<()> {
     //     self.deref_mut().read_buf(buf)
     // }
     // fn is_read_vectored(&self) -> bool {

@@ -7,12 +7,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::inode::Inode;
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DirectoryContents {
     contents: OrdMap<OsString, DirectoryEntry>,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DirectoryEntry {
     pub inode: Inode,
     pub ty: FileType,

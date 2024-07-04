@@ -2,9 +2,10 @@
 #![allow(clippy::unnecessary_cast)] // libc::S_* are u16 or u32 depending on the platform
 
 use ::serde::{Deserialize, Serialize};
-use chacha20::cipher::{Iv, IvSizeUser, KeyIvInit, KeySizeUser};
+use chacha20::cipher::{Iv, IvSizeUser, KeySizeUser};
 use chacha20::ChaCha20;
 use chacha20::Key;
+use fd_lock_rs::{FdLock, LockType};
 use fuser::consts::FUSE_HANDLE_KILLPRIV;
 use fuser::{
     Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
@@ -13,8 +14,8 @@ use fuser::{
 };
 use log::{debug, error};
 use std::ffi::OsStr;
-use std::fs::{File};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
 use std::os::raw::c_int;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -26,10 +27,10 @@ use crate::atomic_file::AtomicFile;
 use crate::contents::EncryptedFile;
 use crate::ctrl::{Controller, StatFs};
 use crate::directory::DirectoryContents;
-use crate::error::to_libc_err;
+use crate::error::{to_libc_err, IoResult, IoResultExt};
 use crate::handle::{FileHandleId, Handler};
-use crate::inode::BLOCK_SIZE;
 use crate::inode::FileData;
+use crate::inode::BLOCK_SIZE;
 use crate::inode::{Inode, InodeAttributes};
 use crate::serde::load;
 use crate::serde::save;
@@ -64,7 +65,7 @@ pub struct BackupFSOptions {
 // Stores inode metadata data in "$data_dir/inodes" and file contents in "$data_dir/contents"
 // Directory data is stored in the file's contents, as a serialized DirectoryDescriptor
 pub struct BackupFS {
-    // lock: FdLock<File>,
+    lock: FdLock<File>,
     handler: Handler,
 }
 
@@ -85,27 +86,28 @@ impl CryptInfo {
             contents_iv: rand::random(),
         }
     }
-    pub fn load(path: &Path, password: &str) -> io::Result<Self> {
+    pub fn load(path: &Path, password: &str) -> IoResult<Self> {
         load(EncryptedFile::open_pbkdf2(File::open(path)?, password)?)
     }
-    pub fn save(&self, path: PathBuf, password: &str) -> io::Result<()> {
+    pub fn save(&self, path: PathBuf, password: &str) -> IoResult<()> {
         save(
             self,
-            EncryptedFile::open_pbkdf2(AtomicFile::create(path)?, password)?,
+            EncryptedFile::create_pbkdf2(AtomicFile::create(path)?, password)?,
         )
     }
 }
 
 impl BackupFS {
-    pub fn new(config: BackupFSOptions) -> io::Result<BackupFS> {
+    pub fn new(config: BackupFSOptions) -> IoResult<BackupFS> {
         let BackupFSOptions {
             data_dir, password, ..
         } = &config;
-        // let lock = fd_lock_rs::FdLock::lock(
-        //     File::create(data_dir.join(".lock"))?,
-        //     LockType::Exclusive,
-        //     false,
-        // )?;
+        let lock = fd_lock_rs::FdLock::lock(
+            File::create(data_dir.join(".lock"))?,
+            LockType::Exclusive,
+            false,
+        )
+        .map_err(io::Error::from)?;
         let cryptinfo_path = data_dir.join("cryptinfo");
         let cryptinfo = if cryptinfo_path.exists() {
             CryptInfo::load(&cryptinfo_path, password)?
@@ -134,7 +136,7 @@ impl BackupFS {
         ctrl.load_inode_pool()?;
 
         Ok(BackupFS {
-            // lock,
+            lock,
             handler: Handler::new(ctrl),
         })
     }
@@ -148,6 +150,8 @@ impl Filesystem for BackupFS {
     ) -> Result<(), c_int> {
         config.add_capabilities(FUSE_HANDLE_KILLPRIV).unwrap();
 
+        log::info!("filesystem initialized");
+
         Ok(())
     }
 
@@ -160,7 +164,7 @@ impl Filesystem for BackupFS {
     fn lookup(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         match self.handler.lookup(req, Inode(parent), name) {
             Ok(inode) => reply.entry(&ENTRY_TTL, &(&inode).into(), 0),
-            Err(e) => reply.error(error::to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
@@ -172,7 +176,7 @@ impl Filesystem for BackupFS {
             .mutate_inode(Inode(inode), |_, inode| Ok((&*inode).into()))
         {
             Ok(attr) => reply.attr(&ENTRY_TTL, &attr),
-            Err(e) => reply.error(error::to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
@@ -211,14 +215,14 @@ impl Filesystem for BackupFS {
             flags,
         ) {
             Ok(inode) => reply.attr(&ENTRY_TTL, &(&inode).into()),
-            Err(e) => reply.error(error::to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
     fn readlink(&mut self, req: &Request, inode: u64, reply: ReplyData) {
         match self.handler.readlink(req, Inode(inode)) {
             Ok(path) => reply.data(path.as_os_str().as_bytes()),
-            Err(e) => reply.error(to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
@@ -242,7 +246,7 @@ impl Filesystem for BackupFS {
             None::<fn(Inode) -> FileData>,
         ) {
             Ok(inode) => reply.entry(&ENTRY_TTL, &(&inode).into(), 0),
-            Err(e) => reply.error(to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
@@ -263,7 +267,7 @@ impl Filesystem for BackupFS {
         debug!("unlink() called with {:?} {:?}", parent, name);
         match self.handler.unlink(req, Inode(parent), name) {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
@@ -271,7 +275,7 @@ impl Filesystem for BackupFS {
         debug!("rmdir() called with {:?} {:?}", parent, name);
         match self.handler.unlink(req, Inode(parent), name) {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
@@ -297,7 +301,7 @@ impl Filesystem for BackupFS {
             Some(|_| FileData::Symlink(target.to_owned())),
         ) {
             Ok(inode) => reply.entry(&ENTRY_TTL, &(&inode).into(), 0),
-            Err(e) => reply.error(to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
@@ -320,7 +324,7 @@ impl Filesystem for BackupFS {
             flags & libc::RENAME_EXCHANGE != 0,
         ) {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
@@ -341,7 +345,7 @@ impl Filesystem for BackupFS {
             .link(req, Inode(inode), Inode(new_parent), new_name, None)
         {
             Ok(inode) => reply.entry(&ENTRY_TTL, &(&inode).into(), 0),
-            Err(e) => reply.error(to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
@@ -349,7 +353,7 @@ impl Filesystem for BackupFS {
         debug!("open() called for {:?}", inode);
         match self.handler.open(req, Inode(inode), flags) {
             Ok(FileHandleId(fh)) => reply.opened(fh, 0),
-            Err(e) => reply.error(to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
@@ -382,7 +386,7 @@ impl Filesystem for BackupFS {
             lock_owner,
         ) {
             Ok(buf) => reply.data(&buf),
-            Err(e) => reply.error(to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
@@ -398,7 +402,7 @@ impl Filesystem for BackupFS {
         lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        debug!("write() called with {:?} size={:?}", inode, data.len());
+        //debug!("write() called with {:?} size={:?}", inode, data.len());
         if offset < 0 {
             reply.error(libc::EINVAL);
             return;
@@ -414,18 +418,19 @@ impl Filesystem for BackupFS {
             lock_owner,
         ) {
             Ok(n) => reply.written(n as u32),
-            Err(e) => reply.error(to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
-    fn flush(&mut self, req: &Request, inode: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
-        match self
-            .handler
-            .fsync(req, Inode(inode), FileHandleId(fh), true)
-        {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(to_libc_err(&e)),
-        }
+    fn flush(
+        &mut self,
+        _req: &Request,
+        _inode: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok()
     }
 
     fn release(
@@ -440,7 +445,7 @@ impl Filesystem for BackupFS {
     ) {
         match self.handler.fclose(FileHandleId(fh)) {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
@@ -450,7 +455,7 @@ impl Filesystem for BackupFS {
             .fsync(req, Inode(inode), FileHandleId(fh), datasync)
         {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
@@ -458,7 +463,7 @@ impl Filesystem for BackupFS {
         debug!("opendir() called on {:?}", inode);
         match self.handler.opendir(req, Inode(inode), flags) {
             Ok(FileHandleId(fh)) => reply.opened(fh, 0),
-            Err(e) => reply.error(to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
@@ -488,7 +493,7 @@ impl Filesystem for BackupFS {
                 }
                 reply.ok()
             }
-            Err(e) => reply.error(to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
@@ -529,7 +534,7 @@ impl Filesystem for BackupFS {
                 }
                 reply.ok()
             }
-            Err(e) => reply.error(to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
@@ -546,7 +551,7 @@ impl Filesystem for BackupFS {
             .releasedir(req, Inode(inode), FileHandleId(fh), flags)
         {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
@@ -591,7 +596,7 @@ impl Filesystem for BackupFS {
             .setxattr(request, Inode(inode), key.as_bytes(), value)
         {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(error::to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
@@ -613,7 +618,7 @@ impl Filesystem for BackupFS {
                     reply.error(libc::ERANGE)
                 }
             }
-            Err(e) => reply.error(error::to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno()),
         }
     }
 
@@ -634,7 +639,7 @@ impl Filesystem for BackupFS {
                     reply.error(libc::ERANGE);
                 }
             }
-            Err(e) => reply.error(libc::EBADF),
+            Err(_) => reply.error(libc::EBADF),
         }
     }
 
@@ -644,7 +649,7 @@ impl Filesystem for BackupFS {
             .removexattr(request, Inode(inode), key.as_bytes())
         {
             Ok(_) => reply.ok(),
-            Err(e) => reply.error(error::to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
@@ -657,7 +662,7 @@ impl Filesystem for BackupFS {
             .and_then(|inode| inode.attrs.check_access(req.uid(), req.gid(), mask))
         {
             Ok(_) => reply.ok(),
-            Err(e) => reply.error(error::to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno()),
         }
     }
 
@@ -671,7 +676,10 @@ impl Filesystem for BackupFS {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        debug!("create() called with {:?} {:?}", parent, name);
+        debug!(
+            "create() called with {:?} {:?} mode={:?} umask={:?}",
+            parent, name, mode, umask
+        );
         match self
             .handler
             .create(req, Inode(parent), name, mode, umask, flags)
@@ -679,7 +687,7 @@ impl Filesystem for BackupFS {
             Ok((attrs, handle)) => {
                 reply.created(&Duration::new(0, 0), &(&attrs).into(), 0, handle.0, 0)
             }
-            Err(e) => reply.error(error::to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
@@ -708,7 +716,7 @@ impl Filesystem for BackupFS {
             mode,
         ) {
             Ok(_) => reply.ok(),
-            Err(e) => reply.error(to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 
@@ -741,7 +749,7 @@ impl Filesystem for BackupFS {
             flags,
         ) {
             Ok(len) => reply.written(len as u32),
-            Err(e) => reply.error(error::to_libc_err(&e)),
+            Err(e) => reply.error(e.to_errno_log()),
         }
     }
 }
@@ -782,7 +790,7 @@ pub fn get_groups(pid: u32) -> Vec<u32> {
     vec![]
 }
 
-pub fn fuse_allow_other_enabled() -> io::Result<bool> {
+pub fn fuse_allow_other_enabled() -> IoResult<bool> {
     let file = File::open("/etc/fuse.conf")?;
     for line in BufReader::new(file).lines() {
         if line?.trim_start().starts_with("user_allow_other") {

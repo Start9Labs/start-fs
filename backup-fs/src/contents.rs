@@ -18,6 +18,7 @@ use smallvec::SmallVec;
 
 use crate::atomic_file::AtomicFile;
 use crate::ctrl::Controller;
+use crate::error::{IoResult, IoResultExt};
 use crate::handle::Handler;
 use crate::inode::{time_now, ContentId, FileData, Inode, InodeAttributes};
 use crate::util::RandReader;
@@ -28,7 +29,7 @@ pub struct EncryptedFile<F: Read + Write + Seek + FileExt = File> {
     cipher: ChaCha20,
 }
 impl<F: Read + Write + Seek + FileExt> EncryptedFile<F> {
-    pub fn open(mut file: F, key: &Key) -> io::Result<Self> {
+    pub fn open(mut file: F, key: &Key) -> IoResult<Self> {
         let mut iv = Iv::<ChaCha20>::default();
         file.read_exact(iv.as_mut_slice())?;
         let cipher = ChaCha20::new(key, &iv);
@@ -38,7 +39,7 @@ impl<F: Read + Write + Seek + FileExt> EncryptedFile<F> {
             cipher,
         })
     }
-    pub fn create(mut file: F, key: &Key) -> io::Result<Self> {
+    pub fn create(mut file: F, key: &Key) -> IoResult<Self> {
         let mut iv = Iv::<ChaCha20>::default();
         rand::thread_rng().fill_bytes(iv.as_mut_slice());
         file.write_all(iv.as_slice())?;
@@ -49,7 +50,7 @@ impl<F: Read + Write + Seek + FileExt> EncryptedFile<F> {
             cipher,
         })
     }
-    pub fn open_pbkdf2(mut file: F, password: &str) -> io::Result<Self> {
+    pub fn open_pbkdf2(mut file: F, password: &str) -> IoResult<Self> {
         let mut iv = Iv::<ChaCha20>::default();
         file.read_exact(iv.as_mut_slice())?;
         let mut key = Key::default();
@@ -67,7 +68,7 @@ impl<F: Read + Write + Seek + FileExt> EncryptedFile<F> {
             cipher,
         })
     }
-    pub fn create_pbkdf2(mut file: F, password: &str) -> io::Result<Self> {
+    pub fn create_pbkdf2(mut file: F, password: &str) -> IoResult<Self> {
         let mut iv = Iv::<ChaCha20>::default();
         rand::thread_rng().fill_bytes(iv.as_mut_slice());
         let mut key = Key::default();
@@ -86,12 +87,12 @@ impl<F: Read + Write + Seek + FileExt> EncryptedFile<F> {
             cipher,
         })
     }
-    pub fn read_exact_at(&mut self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    pub fn read_exact_at(&mut self, mut buf: &mut [u8], mut offset: u64) -> IoResult<()> {
         while !buf.is_empty() {
             let len = match self.file.read_at(buf, offset + self.offset) {
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             };
             if len == 0 {
                 break;
@@ -107,7 +108,7 @@ impl<F: Read + Write + Seek + FileExt> EncryptedFile<F> {
 
         Ok(())
     }
-    pub fn write_all_at(&mut self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    pub fn write_all_at(&mut self, buf: &mut [u8], offset: u64) -> IoResult<()> {
         self.cipher.seek(offset);
         self.cipher.apply_keystream(buf);
         self.file.seek(SeekFrom::Start(offset + self.offset))?;
@@ -116,7 +117,7 @@ impl<F: Read + Write + Seek + FileExt> EncryptedFile<F> {
     }
 }
 impl EncryptedFile<AtomicFile> {
-    pub fn save(self) -> io::Result<()> {
+    pub fn save(self) -> IoResult<()> {
         self.file.save()
     }
 }
@@ -157,7 +158,7 @@ pub struct MergedFile {
     written: BTreeMap<u64, u64>, // position, len
 }
 impl MergedFile {
-    fn new(src: EncryptedFile, dst: PathBuf, key: &Key) -> io::Result<Self> {
+    fn new(src: EncryptedFile, dst: PathBuf, key: &Key) -> IoResult<Self> {
         let dst = EncryptedFile::create(
             AtomicFile::new(
                 dst,
@@ -219,16 +220,20 @@ impl MergedFile {
             .range(pos..end)
             .map(|(p, l)| (*p, *l))
             .collect_vec();
-        if let Some((p, l)) = self.written.range_mut(..pos).rev().next() {
+        if let Some((p, l)) = self
+            .written
+            .range_mut(..=pos)
+            .rev()
+            .next()
+            .filter(|(p, l)| **p + **l >= pos)
+        {
             let dst_end = *p + *l;
-            if dst_end > pos {
-                if dst_end > end {
-                    return;
-                } else {
-                    *l = end - *p;
-                    for (np, nl) in &to_remove {
-                        *l = max(*l, *np + *nl - p);
-                    }
+            if dst_end > end {
+                return;
+            } else {
+                *l = end - *p;
+                for (np, nl) in &to_remove {
+                    *l = max(*l, *np + *nl - p);
                 }
             }
         } else {
@@ -242,7 +247,7 @@ impl MergedFile {
             self.written.remove(&p);
         }
     }
-    fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> IoResult<()> {
         let (src, dst) = self.read_ranges(offset, buf.len() as u64);
         for range in src {
             let buf_range = ((range.start - offset) as usize)..((range.end - offset) as usize);
@@ -254,12 +259,12 @@ impl MergedFile {
         }
         Ok(())
     }
-    fn write_all_at(&mut self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    fn write_all_at(&mut self, buf: &mut [u8], offset: u64) -> IoResult<()> {
         self.dst.write_all_at(buf, offset)?;
         self.add_written(offset, buf.len() as u64);
         Ok(())
     }
-    fn save(mut self, size: u64) -> io::Result<()> {
+    fn save(mut self, size: u64) -> IoResult<()> {
         let mut remaining = size;
         let mut start = 0_u64;
         let mut len;
@@ -305,12 +310,12 @@ pub struct Contents {
     ctrl: Controller,
 }
 impl Contents {
-    pub fn open(ctrl: Controller, inode: Inode) -> io::Result<Self> {
+    pub fn open(ctrl: Controller, inode: Inode) -> IoResult<Self> {
         let inode: InodeAttributes = ctrl.load(inode)?;
         let content_id = match &inode.attrs.contents {
             FileData::File(a) => *a,
-            FileData::Directory(_) => return Err(io::Error::from_raw_os_error(libc::EISDIR)),
-            FileData::Symlink(_) => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
+            FileData::Directory(_) => return IoResult::errno(libc::EISDIR),
+            FileData::Symlink(_) => return IoResult::errno(libc::EINVAL),
         };
         Ok(Self {
             inode,
@@ -320,11 +325,16 @@ impl Contents {
             ctrl,
         })
     }
-    pub fn readable(&mut self) -> io::Result<&mut Self> {
+    pub fn readable(&mut self) -> IoResult<&mut Self> {
         if self.file.is_none() {
             let path = self.ctrl.contents_path(self.content_id);
             if !path.exists() {
-                File::create(&path)?;
+                if let Some(parent) = path.parent() {
+                    if !parent.exists() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                }
+                EncryptedFile::create(File::create(&path)?, self.ctrl.key())?;
             }
             self.file = Some(Err(EncryptedFile::open(
                 File::open(&path)?,
@@ -333,7 +343,10 @@ impl Contents {
         }
         Ok(self)
     }
-    pub fn writable(&mut self) -> io::Result<&mut Self> {
+    pub fn writable(&mut self) -> IoResult<&mut Self> {
+        if self.file.as_ref().map_or(false, |f| f.is_ok()) {
+            return Ok(self);
+        }
         if let Some(Err(file)) = std::mem::take(&mut self.readable()?.file) {
             self.file = Some(Ok(MergedFile::new(
                 file,
@@ -345,9 +358,9 @@ impl Contents {
             Ok(self)
         }
     }
-    pub fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    pub fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> IoResult<()> {
         if offset + buf.len() as u64 > self.inode.attrs.size {
-            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
         }
         match self
             .readable()?
@@ -362,7 +375,7 @@ impl Contents {
         self.changed = true;
         Ok(())
     }
-    pub fn write_all_at(&mut self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    pub fn write_all_at(&mut self, buf: &mut [u8], offset: u64) -> IoResult<()> {
         let this = self.writable()?;
         let file = this
             .file
@@ -385,7 +398,7 @@ impl Contents {
         length: u64,
         mode: i32,
         keep_size: bool,
-    ) -> io::Result<()> {
+    ) -> IoResult<()> {
         let this = self.writable()?;
         let file = this
             .file
@@ -396,7 +409,7 @@ impl Contents {
         let fd = file.dst.file.as_raw_fd();
         let res = unsafe { libc::fallocate64(fd, mode, offset as i64, length as i64) };
         if res != 0 {
-            return Err(io::Error::from_raw_os_error(res));
+            return Err(io::Error::from_raw_os_error(res).into());
         }
         if !keep_size {
             let end = offset + length;
@@ -408,7 +421,7 @@ impl Contents {
         }
         Ok(())
     }
-    pub fn fsync(&mut self, datasync: bool) -> io::Result<()> {
+    pub fn fsync(&mut self, datasync: bool) -> IoResult<()> {
         if datasync {
             if let Some(Ok(f)) = std::mem::take(&mut self.file) {
                 let size = self.ctrl.file_pad(min(
@@ -429,7 +442,7 @@ impl Contents {
     pub fn truncate(&mut self, size: u64) {
         self.inode.attrs.size = size;
     }
-    pub fn close(mut self, handler: &mut Handler) -> io::Result<()> {
+    pub fn close(mut self, handler: &mut Handler) -> IoResult<()> {
         self.fsync(true)?;
         handler.gc_inode(&self.inode)?;
         Ok(())

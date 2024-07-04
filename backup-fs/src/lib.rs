@@ -5,29 +5,20 @@ use ::serde::{Deserialize, Serialize};
 use chacha20::cipher::{Iv, IvSizeUser, KeyIvInit, KeySizeUser};
 use chacha20::ChaCha20;
 use chacha20::Key;
-use fd_lock_rs::{FdLock, LockType};
-use fuser::consts::FOPEN_DIRECT_IO;
 use fuser::consts::FUSE_HANDLE_KILLPRIV;
-use fuser::consts::FUSE_WRITE_KILL_PRIV;
-use fuser::TimeOrNow::Now;
 use fuser::{
     Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
     Request, TimeOrNow, FUSE_ROOT_ID,
 };
-use log::{debug, error, warn};
-use std::cmp::min;
-use std::collections::BTreeMap;
+use log::{debug, error};
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::fs::{File};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::raw::c_int;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::FileExt;
-#[cfg(target_os = "linux")]
-use std::os::unix::io::IntoRawFd;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 use typenum::ToInt;
 use zeroize::Zeroizing;
 
@@ -38,7 +29,7 @@ use crate::directory::DirectoryContents;
 use crate::error::to_libc_err;
 use crate::handle::{FileHandleId, Handler};
 use crate::inode::BLOCK_SIZE;
-use crate::inode::{Attributes, FileData};
+use crate::inode::FileData;
 use crate::inode::{Inode, InodeAttributes};
 use crate::serde::load;
 use crate::serde::save;

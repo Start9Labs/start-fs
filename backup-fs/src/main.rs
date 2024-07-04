@@ -1,6 +1,6 @@
-use backupfs::{fuse_allow_other_enabled, BackupFS, BackupFSOptions};
+use backupfs::{BackupFS, BackupFSOptions};
 use fuser::MountOption;
-use log::{error, info, LevelFilter};
+use log::{error, info};
 use std::io::ErrorKind;
 use std::path::PathBuf;
 

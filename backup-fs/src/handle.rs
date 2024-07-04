@@ -3,22 +3,21 @@ use std::cell::RefCell;
 use std::cmp::min;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
 use std::io;
-use std::ops::{Bound, RangeFrom, RangeFull};
+use std::ops::Bound;
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::time::SystemTime;
 
 use fuser::consts::FUSE_WRITE_KILL_PRIV;
-use fuser::{FileType, ReplyDirectory, Request, TimeOrNow};
+use fuser::{FileType, Request, TimeOrNow};
 use log::{debug, warn};
 
-use crate::contents::{self, Contents};
+use crate::contents::{Contents};
 use crate::ctrl::{Controller, Save};
 use crate::directory::{DirectoryContents, DirectoryEntry};
-use crate::inode::{Attributes, FileData, Inode, InodeAttributes};
-use crate::{handle, FMODE_EXEC, MAX_NAME_LENGTH};
+use crate::inode::{FileData, Inode, InodeAttributes};
+use crate::{FMODE_EXEC, MAX_NAME_LENGTH};
 
 pub struct Handler {
     ctrl: Controller,

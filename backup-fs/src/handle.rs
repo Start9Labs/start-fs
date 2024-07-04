@@ -18,7 +18,7 @@ use crate::contents::{self, Contents};
 use crate::ctrl::{Controller, Save};
 use crate::directory::{DirectoryContents, DirectoryEntry};
 use crate::inode::{Attributes, FileData, Inode, InodeAttributes};
-use crate::{as_file_kind, handle, FMODE_EXEC, MAX_NAME_LENGTH};
+use crate::{handle, FMODE_EXEC, MAX_NAME_LENGTH};
 
 pub struct Handler {
     ctrl: Controller,
@@ -126,8 +126,8 @@ pub struct DirHandle {
     pub cursors: BTreeMap<i64, OsString>,
 }
 
-struct OverwriteOptions {
-    gc: bool,
+pub struct OverwriteOptions {
+    pub gc: bool,
 }
 
 impl Handler {
@@ -711,6 +711,131 @@ impl Handler {
         };
         self.gc_inode(&self.ctrl().load(ent.inode)?)?;
 
+        Ok(())
+    }
+
+    pub fn setxattr(
+        &mut self,
+        req: &Request,
+        inode: Inode,
+        key: &[u8],
+        value: &[u8],
+    ) -> io::Result<()> {
+        let inode = self.mutate_inode(inode, |_, inode| {
+            let attrs = &mut inode.attrs;
+            attrs.xattr_access_check(key, libc::W_OK, req)?;
+            attrs.xattrs.insert(key.to_vec(), value.to_vec());
+            attrs.changed();
+            Ok(inode.clone())
+        })?;
+        self.ctrl().save(&inode)?;
+        Ok(())
+    }
+
+    pub fn getxattr(&self, req: &Request, inode: Inode, key: &[u8]) -> io::Result<Vec<u8>> {
+        let inode = self.ctrl().load::<InodeAttributes>(inode)?;
+        let attrs = inode.attrs;
+        attrs.xattr_access_check(key, libc::R_OK, req)?;
+        match attrs.xattrs.extract(key) {
+            Some((v, _)) => Ok(v),
+            #[cfg(target_os = "linux")]
+            None => Err(io::Error::from_raw_os_error(libc::ENODATA)),
+            #[cfg(not(target_os = "linux"))]
+            None => Err(io::Error::from_raw_os_error(libc::ENOATTR)),
+        }
+    }
+
+    pub fn listxattr<'r>(
+        &self,
+        req: &'r Request,
+        inode: Inode,
+    ) -> io::Result<impl Iterator<Item = (Vec<u8>, Vec<u8>)> + 'r> {
+        let inode = self.ctrl().load::<InodeAttributes>(inode)?;
+        let mut attrs = inode.attrs;
+        let xattrs = std::mem::replace(&mut attrs.xattrs, Default::default());
+        Ok(xattrs
+            .into_iter()
+            .filter(move |(key, _)| attrs.xattr_access_check(key, libc::R_OK, req).is_ok()))
+    }
+
+    pub fn removexattr(&mut self, req: &Request, inode: Inode, key: &[u8]) -> io::Result<Vec<u8>> {
+        let (inode, value) = self.mutate_inode(inode, |_, inode| {
+            let attrs = &mut inode.attrs;
+            attrs.xattr_access_check(key, libc::W_OK, req)?;
+            let value = attrs.xattrs.remove(key);
+            attrs.changed();
+            Ok((inode.clone(), value))
+        })?;
+        self.ctrl().save(&inode)?;
+        match value {
+            Some(v) => Ok(v),
+            #[cfg(target_os = "linux")]
+            None => Err(io::Error::from_raw_os_error(libc::ENODATA)),
+            #[cfg(not(target_os = "linux"))]
+            None => Err(io::Error::from_raw_os_error(libc::ENOATTR)),
+        }
+    }
+
+    pub fn create(
+        &mut self,
+        req: &Request,
+        parent: Inode,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+    ) -> io::Result<(InodeAttributes, FileHandleId)> {
+        let attrs = self.mknod(
+            req,
+            parent,
+            name,
+            mode,
+            umask,
+            0,
+            None::<fn(Inode) -> FileData>,
+        )?;
+        let handle = self.open(req, attrs.inode, flags)?;
+        Ok((attrs, handle))
+    }
+
+    pub fn copy_file_range(
+        &mut self,
+        req: &Request,
+        src_inode: Inode,
+        src_fh: FileHandleId,
+        src_offset: u64,
+        dest_inode: Inode,
+        dest_fh: FileHandleId,
+        dest_offset: u64,
+        size: usize,
+        flags: u32,
+    ) -> io::Result<usize> {
+        if flags != 0 {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let bytes = self.read(req, src_inode, src_fh, src_offset, size, 0, None)?;
+        self.write(req, dest_inode, dest_fh, dest_offset, &bytes, 0, 0, None)
+    }
+
+    pub fn fallocate(
+        &mut self,
+        _req: &Request,
+        _inode: Inode,
+        fh: FileHandleId,
+        offset: u64,
+        length: u64,
+        mode: i32,
+    ) -> io::Result<()> {
+        let fh = self
+            .handle(fh)
+            .ok_or(libc::EBADF)
+            .map_err(io::Error::from_raw_os_error)?;
+        if !fh.write {
+            return Err(io::Error::from_raw_os_error(libc::EACCES));
+        }
+
+        let mut contents = fh.contents.borrow_mut();
+        contents.fallocate(offset, length, mode, mode & libc::FALLOC_FL_KEEP_SIZE != 0)?;
         Ok(())
     }
 }

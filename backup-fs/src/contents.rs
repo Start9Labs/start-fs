@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::{DerefMut, Range};
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
@@ -376,6 +377,35 @@ impl Contents {
             this.inode.attrs.size = end;
         }
         self.changed = true;
+        Ok(())
+    }
+    pub fn fallocate(
+        &mut self,
+        offset: u64,
+        length: u64,
+        mode: i32,
+        keep_size: bool,
+    ) -> io::Result<()> {
+        let this = self.writable()?;
+        let file = this
+            .file
+            .as_mut()
+            .unwrap_or_else(|| unreachable!("file is uninitialized"))
+            .as_mut()
+            .unwrap_or_else(|_| unreachable!("file is readonly"));
+        let fd = file.dst.file.as_raw_fd();
+        let res = unsafe { libc::fallocate64(fd, mode, offset as i64, length as i64) };
+        if res != 0 {
+            return Err(io::Error::from_raw_os_error(res));
+        }
+        if !keep_size {
+            let end = offset + length;
+            this.inode.attrs.modified();
+            if end > this.inode.attrs.size {
+                this.inode.attrs.size = end;
+            }
+            self.changed = true;
+        }
         Ok(())
     }
     pub fn fsync(&mut self, datasync: bool) -> io::Result<()> {

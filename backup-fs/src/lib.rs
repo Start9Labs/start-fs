@@ -33,7 +33,7 @@ use zeroize::Zeroizing;
 
 use crate::atomic_file::AtomicFile;
 use crate::contents::EncryptedFile;
-use crate::ctrl::Controller;
+use crate::ctrl::{Controller, StatFs};
 use crate::directory::DirectoryContents;
 use crate::error::to_libc_err;
 use crate::handle::{FileHandleId, Handler};
@@ -63,8 +63,6 @@ const FMODE_EXEC: i32 = 0x20;
 pub struct BackupFSOptions {
     pub data_dir: PathBuf,
     #[cfg_attr(feature = "cli", arg(long))]
-    pub direct_io: bool,
-    #[cfg_attr(feature = "cli", arg(long))]
     pub setuid_support: bool,
     #[cfg_attr(feature = "cli", arg(long))]
     pub password: String,
@@ -75,7 +73,7 @@ pub struct BackupFSOptions {
 // Stores inode metadata data in "$data_dir/inodes" and file contents in "$data_dir/contents"
 // Directory data is stored in the file's contents, as a serialized DirectoryDescriptor
 pub struct BackupFS {
-    lock: FdLock<File>,
+    // lock: FdLock<File>,
     handler: Handler,
 }
 
@@ -112,11 +110,11 @@ impl BackupFS {
         let BackupFSOptions {
             data_dir, password, ..
         } = &config;
-        let lock = fd_lock_rs::FdLock::lock(
-            File::create(data_dir.join(".lock"))?,
-            LockType::Exclusive,
-            false,
-        )?;
+        // let lock = fd_lock_rs::FdLock::lock(
+        //     File::create(data_dir.join(".lock"))?,
+        //     LockType::Exclusive,
+        //     false,
+        // )?;
         let cryptinfo_path = data_dir.join("cryptinfo");
         let cryptinfo = if cryptinfo_path.exists() {
             CryptInfo::load(&cryptinfo_path, password)?
@@ -141,8 +139,11 @@ impl BackupFS {
         } else {
             ctrl.load::<InodeAttributes>(Inode(FUSE_ROOT_ID))?;
         }
+
+        ctrl.load_inode_pool()?;
+
         Ok(BackupFS {
-            lock,
+            // lock,
             handler: Handler::new(ctrl),
         })
     }
@@ -566,18 +567,18 @@ impl Filesystem for BackupFS {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        reply.ok(); // directories are synced on write
     }
 
     fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
-        warn!("statfs() implementation is a stub");
+        let StatFs { files, ffree } = self.handler.ctrl().statfs();
         // TODO: real implementation of this
         reply.statfs(
             10_000,
             10_000,
             10_000,
-            1,
-            10_000,
+            files,
+            ffree,
             BLOCK_SIZE as u32,
             MAX_NAME_LENGTH,
             BLOCK_SIZE as u32,
@@ -594,18 +595,12 @@ impl Filesystem for BackupFS {
         _position: u32,
         reply: ReplyEmpty,
     ) {
-        if let Ok(mut attrs) = self.get_inode(inode) {
-            if let Err(error) = attrs.xattr_access_check(key.as_bytes(), libc::W_OK, request) {
-                reply.error(error);
-                return;
-            }
-
-            attrs.xattrs.insert(key.as_bytes().to_vec(), value.to_vec());
-            attrs.last_metadata_changed = time_now();
-            self.write_inode(&attrs);
-            reply.ok();
-        } else {
-            reply.error(libc::EBADF);
+        match self
+            .handler
+            .setxattr(request, Inode(inode), key.as_bytes(), value)
+        {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(error::to_libc_err(&e)),
         }
     }
 
@@ -617,84 +612,61 @@ impl Filesystem for BackupFS {
         size: u32,
         reply: ReplyXattr,
     ) {
-        if let Ok(attrs) = self.get_inode(inode) {
-            if let Err(error) = attrs.xattr_access_check(key.as_bytes(), libc::R_OK, request) {
-                reply.error(error);
-                return;
-            }
-
-            if let Some(data) = attrs.xattrs.get(key.as_bytes()) {
+        match self.handler.getxattr(request, Inode(inode), key.as_bytes()) {
+            Ok(data) => {
                 if size == 0 {
                     reply.size(data.len() as u32);
                 } else if data.len() <= size as usize {
-                    reply.data(data);
+                    reply.data(&data);
                 } else {
-                    reply.error(libc::ERANGE);
+                    reply.error(libc::ERANGE)
                 }
-            } else {
-                #[cfg(target_os = "linux")]
-                reply.error(libc::ENODATA);
-                #[cfg(not(target_os = "linux"))]
-                reply.error(libc::ENOATTR);
             }
-        } else {
-            reply.error(libc::EBADF);
+            Err(e) => reply.error(error::to_libc_err(&e)),
         }
     }
 
-    fn listxattr(&mut self, _req: &Request<'_>, inode: u64, size: u32, reply: ReplyXattr) {
-        if let Ok(attrs) = self.get_inode(inode) {
-            let mut bytes = vec![];
-            // Convert to concatenated null-terminated strings
-            for key in attrs.xattrs.keys() {
-                bytes.extend(key);
-                bytes.push(0);
+    fn listxattr(&mut self, request: &Request<'_>, inode: u64, size: u32, reply: ReplyXattr) {
+        match self.handler.listxattr(request, Inode(inode)) {
+            Ok(attrs) => {
+                let mut bytes = vec![];
+                // Convert to concatenated null-terminated strings
+                for (key, _) in attrs {
+                    bytes.extend(key);
+                    bytes.push(0);
+                }
+                if size == 0 {
+                    reply.size(bytes.len() as u32);
+                } else if bytes.len() <= size as usize {
+                    reply.data(&bytes);
+                } else {
+                    reply.error(libc::ERANGE);
+                }
             }
-            if size == 0 {
-                reply.size(bytes.len() as u32);
-            } else if bytes.len() <= size as usize {
-                reply.data(&bytes);
-            } else {
-                reply.error(libc::ERANGE);
-            }
-        } else {
-            reply.error(libc::EBADF);
+            Err(e) => reply.error(libc::EBADF),
         }
     }
 
     fn removexattr(&mut self, request: &Request<'_>, inode: u64, key: &OsStr, reply: ReplyEmpty) {
-        if let Ok(mut attrs) = self.get_inode(inode) {
-            if let Err(error) = attrs.xattr_access_check(key.as_bytes(), libc::W_OK, request) {
-                reply.error(error);
-                return;
-            }
-
-            if attrs.xattrs.remove(key.as_bytes()).is_none() {
-                #[cfg(target_os = "linux")]
-                reply.error(libc::ENODATA);
-                #[cfg(not(target_os = "linux"))]
-                reply.error(libc::ENOATTR);
-                return;
-            }
-            attrs.last_metadata_changed = time_now();
-            self.write_inode(&attrs);
-            reply.ok();
-        } else {
-            reply.error(libc::EBADF);
+        match self
+            .handler
+            .removexattr(request, Inode(inode), key.as_bytes())
+        {
+            Ok(_) => reply.ok(),
+            Err(e) => reply.error(error::to_libc_err(&e)),
         }
     }
 
     fn access(&mut self, req: &Request, inode: u64, mask: i32, reply: ReplyEmpty) {
         debug!("access() called with {:?} {:?}", inode, mask);
-        match self.get_inode(inode) {
-            Ok(attr) => {
-                if check_access(attr.uid, attr.gid, attr.mode, req.uid(), req.gid(), mask) {
-                    reply.ok();
-                } else {
-                    reply.error(libc::EACCES);
-                }
-            }
-            Err(error_code) => reply.error(error_code),
+        match self
+            .handler
+            .ctrl()
+            .load::<InodeAttributes>(Inode(inode))
+            .and_then(|inode| inode.attrs.check_access(req.uid(), req.gid(), mask))
+        {
+            Ok(_) => reply.ok(),
+            Err(e) => reply.error(error::to_libc_err(&e)),
         }
     }
 
@@ -703,128 +675,55 @@ impl Filesystem for BackupFS {
         req: &Request,
         parent: u64,
         name: &OsStr,
-        mut mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         flags: i32,
         reply: ReplyCreate,
     ) {
         debug!("create() called with {:?} {:?}", parent, name);
-        if self.lookup_name(parent, name).is_ok() {
-            reply.error(libc::EEXIST);
-            return;
-        }
-
-        let (read, write) = match flags & libc::O_ACCMODE {
-            libc::O_RDONLY => (true, false),
-            libc::O_WRONLY => (false, true),
-            libc::O_RDWR => (true, true),
-            // Exactly one access mode flag must be specified
-            _ => {
-                reply.error(libc::EINVAL);
-                return;
+        match self
+            .handler
+            .create(req, Inode(parent), name, mode, umask, flags)
+        {
+            Ok((attrs, handle)) => {
+                reply.created(&Duration::new(0, 0), &(&attrs).into(), 0, handle.0, 0)
             }
-        };
-
-        let mut parent_attrs = match self.get_inode(parent) {
-            Ok(attrs) => attrs,
-            Err(error_code) => {
-                reply.error(error_code);
-                return;
-            }
-        };
-
-        if !check_access(
-            parent_attrs.uid,
-            parent_attrs.gid,
-            parent_attrs.mode,
-            req.uid(),
-            req.gid(),
-            libc::W_OK,
-        ) {
-            reply.error(libc::EACCES);
-            return;
+            Err(e) => reply.error(error::to_libc_err(&e)),
         }
-        parent_attrs.last_modified = time_now();
-        parent_attrs.last_metadata_changed = time_now();
-        self.write_inode(&parent_attrs);
-
-        if req.uid() != 0 {
-            mode &= !(libc::S_ISUID | libc::S_ISGID) as u32;
-        }
-
-        let inode = self.allocate_next_inode();
-        let attrs = Attributes {
-            inode,
-            open_file_handles: 1,
-            size: 0,
-            last_accessed: time_now(),
-            last_modified: time_now(),
-            last_metadata_changed: time_now(),
-            kind: as_file_kind(mode),
-            mode: self.creation_mode(mode),
-            hardlinks: 1,
-            uid: req.uid(),
-            gid: parent_attrs.creation_gid(req.gid()),
-            xattrs: Default::default(),
-        };
-        self.write_inode(&attrs);
-        File::create(self.content_path(inode)).unwrap();
-
-        if as_file_kind(mode) == FileKind::Directory {
-            let mut entries = BTreeMap::new();
-            entries.insert(b".".to_vec(), (inode, FileKind::Directory));
-            entries.insert(b"..".to_vec(), (parent, FileKind::Directory));
-            self.write_directory_content(inode, entries);
-        }
-
-        let mut entries = self.get_directory_content(parent).unwrap();
-        entries.insert(name.as_bytes().to_vec(), (inode, attrs.kind));
-        self.write_directory_content(parent, entries);
-
-        // TODO: implement flags
-        reply.created(
-            &Duration::new(0, 0),
-            &attrs.into(),
-            0,
-            self.allocate_next_file_handle(read, write),
-            0,
-        );
     }
 
     #[cfg(target_os = "linux")]
     fn fallocate(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         inode: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         length: i64,
         mode: i32,
         reply: ReplyEmpty,
     ) {
-        let path = self.content_path(inode);
-        if let Ok(file) = OpenOptions::new().write(true).open(path) {
-            unsafe {
-                libc::fallocate64(file.into_raw_fd(), mode, offset, length);
-            }
-            if mode & libc::FALLOC_FL_KEEP_SIZE == 0 {
-                let mut attrs = self.get_inode(inode).unwrap();
-                attrs.last_metadata_changed = time_now();
-                attrs.last_modified = time_now();
-                if (offset + length) as u64 > attrs.size {
-                    attrs.size = (offset + length) as u64;
-                }
-                self.write_inode(&attrs);
-            }
-            reply.ok();
-        } else {
-            reply.error(libc::ENOENT);
+        debug!("fallocate() called with {:?} length={:?}", inode, length);
+        if offset < 0 || length < 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+        match self.handler.fallocate(
+            req,
+            Inode(inode),
+            FileHandleId(fh),
+            offset as u64,
+            length as u64,
+            mode,
+        ) {
+            Ok(_) => reply.ok(),
+            Err(e) => reply.error(to_libc_err(&e)),
         }
     }
 
     fn copy_file_range(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         src_inode: u64,
         src_fh: u64,
         src_offset: i64,
@@ -832,54 +731,31 @@ impl Filesystem for BackupFS {
         dest_fh: u64,
         dest_offset: i64,
         size: u64,
-        _flags: u32,
+        flags: u32,
         reply: ReplyWrite,
     ) {
         debug!(
             "copy_file_range() called with src ({}, {}, {}) dest ({}, {}, {}) size={}",
             src_fh, src_inode, src_offset, dest_fh, dest_inode, dest_offset, size
         );
-        if !self.check_file_handle_read(src_fh) {
-            reply.error(libc::EACCES);
-            return;
-        }
-        if !self.check_file_handle_write(dest_fh) {
-            reply.error(libc::EACCES);
-            return;
-        }
-
-        let src_path = self.content_path(src_inode);
-        if let Ok(file) = File::open(src_path) {
-            let file_size = file.metadata().unwrap().len();
-            // Could underflow if file length is less than local_start
-            let read_size = min(size, file_size.saturating_sub(src_offset as u64));
-
-            let mut data = vec![0; read_size as usize];
-            file.read_exact_at(&mut data, src_offset as u64).unwrap();
-
-            let dest_path = self.content_path(dest_inode);
-            if let Ok(mut file) = OpenOptions::new().write(true).open(dest_path) {
-                file.seek(SeekFrom::Start(dest_offset as u64)).unwrap();
-                file.write_all(&data).unwrap();
-
-                let mut attrs = self.get_inode(dest_inode).unwrap();
-                attrs.last_metadata_changed = time_now();
-                attrs.last_modified = time_now();
-                if data.len() + dest_offset as usize > attrs.size as usize {
-                    attrs.size = (data.len() + dest_offset as usize) as u64;
-                }
-                self.write_inode(&attrs);
-
-                reply.written(data.len() as u32);
-            } else {
-                reply.error(libc::EBADF);
-            }
-        } else {
-            reply.error(libc::ENOENT);
+        match self.handler.copy_file_range(
+            req,
+            Inode(src_inode),
+            FileHandleId(src_fh),
+            src_offset as u64,
+            Inode(dest_inode),
+            FileHandleId(dest_fh),
+            dest_offset as u64,
+            size as usize,
+            flags,
+        ) {
+            Ok(len) => reply.written(len as u32),
+            Err(e) => reply.error(error::to_libc_err(&e)),
         }
     }
 }
 
+/*
 fn as_file_kind(mut mode: u32) -> FileKind {
     mode &= libc::S_IFMT as u32;
 
@@ -893,6 +769,7 @@ fn as_file_kind(mut mode: u32) -> FileKind {
         unimplemented!("{}", mode);
     }
 }
+*/
 
 pub fn get_groups(pid: u32) -> Vec<u32> {
     #[cfg(not(target_os = "macos"))]

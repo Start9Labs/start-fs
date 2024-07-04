@@ -1,7 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
-use std::os::raw::c_int;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -171,7 +170,7 @@ pub fn time_from_system_time(system_time: &SystemTime) -> (i64, u32) {
 }
 
 impl From<&InodeAttributes> for fuser::FileAttr {
-    fn from(InodeAttributes { inode, attrs }: &InodeAttributes) -> Self {
+    fn from(InodeAttributes { inode, attrs, .. }: &InodeAttributes) -> Self {
         fuser::FileAttr {
             ino: inode.0,
             size: attrs.size,
@@ -196,10 +195,10 @@ impl From<&InodeAttributes> for fuser::FileAttr {
     }
 }
 
-fn parse_xattr_namespace(key: &[u8]) -> Result<XattrNamespace, c_int> {
+fn parse_xattr_namespace(key: &[u8]) -> io::Result<XattrNamespace> {
     let user = b"user.";
     if key.len() < user.len() {
-        return Err(libc::ENOTSUP);
+        return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
     }
     if key[..user.len()].eq(user) {
         return Ok(XattrNamespace::User);
@@ -207,7 +206,7 @@ fn parse_xattr_namespace(key: &[u8]) -> Result<XattrNamespace, c_int> {
 
     let system = b"system.";
     if key.len() < system.len() {
-        return Err(libc::ENOTSUP);
+        return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
     }
     if key[..system.len()].eq(system) {
         return Ok(XattrNamespace::System);
@@ -215,7 +214,7 @@ fn parse_xattr_namespace(key: &[u8]) -> Result<XattrNamespace, c_int> {
 
     let trusted = b"trusted.";
     if key.len() < trusted.len() {
-        return Err(libc::ENOTSUP);
+        return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
     }
     if key[..trusted.len()].eq(trusted) {
         return Ok(XattrNamespace::Trusted);
@@ -223,13 +222,13 @@ fn parse_xattr_namespace(key: &[u8]) -> Result<XattrNamespace, c_int> {
 
     let security = b"security";
     if key.len() < security.len() {
-        return Err(libc::ENOTSUP);
+        return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
     }
     if key[..security.len()].eq(security) {
         return Ok(XattrNamespace::Security);
     }
 
-    return Err(libc::ENOTSUP);
+    return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
 }
 
 impl<'a> Save for &'a InodeAttributes {
@@ -243,11 +242,11 @@ impl<'a> Save for &'a InodeAttributes {
 
 impl Load for InodeAttributes {
     type Args<'a> = Inode;
-    fn load(ctrl: &Controller, args: Self::Args<'_>) -> io::Result<Self> {
+    fn load(ctrl: &Controller, inode: Self::Args<'_>) -> io::Result<Self> {
         Ok(InodeAttributes {
-            inode: args,
+            inode,
             attrs: load(EncryptedFile::open(
-                File::open(&ctrl.inode_path(args))?,
+                File::open(&ctrl.inode_path(inode))?,
                 ctrl.key(),
             )?)?,
         })
@@ -255,8 +254,8 @@ impl Load for InodeAttributes {
 }
 
 impl Exists for InodeAttributes {
-    fn exists(ctrl: &Controller, args: Self::Args<'_>) -> bool {
-        ctrl.inode_path(args).exists()
+    fn exists(ctrl: &Controller, inode: Self::Args<'_>) -> bool {
+        ctrl.inode_path(inode).exists()
     }
 }
 
@@ -493,29 +492,29 @@ impl Attributes {
         key: &[u8],
         access_mask: i32,
         request: &Request<'_>,
-    ) -> Result<(), c_int> {
+    ) -> io::Result<()> {
         match parse_xattr_namespace(key)? {
             XattrNamespace::Security => {
                 if access_mask != libc::R_OK && request.uid() != 0 {
-                    return Err(libc::EPERM);
+                    return Err(io::Error::from_raw_os_error(libc::EPERM));
                 }
             }
             XattrNamespace::Trusted => {
                 if request.uid() != 0 {
-                    return Err(libc::EPERM);
+                    return Err(io::Error::from_raw_os_error(libc::EPERM));
                 }
             }
             XattrNamespace::System => {
                 if key.eq(b"system.posix_acl_access") {
                     self.check_access(request.uid(), request.gid(), access_mask)
-                        .map_err(|_| libc::EPERM)?;
+                        .map_err(|_| io::Error::from_raw_os_error(libc::EPERM))?;
                 } else if request.uid() != 0 {
-                    return Err(libc::EPERM);
+                    return Err(io::Error::from_raw_os_error(libc::EPERM));
                 }
             }
             XattrNamespace::User => {
                 self.check_access(request.uid(), request.gid(), access_mask)
-                    .map_err(|_| libc::EPERM)?;
+                    .map_err(|_| io::Error::from_raw_os_error(libc::EPERM))?;
             }
         }
 

@@ -14,11 +14,11 @@ use rand::Rng;
 use crate::atomic_file::AtomicFile;
 use crate::contents::EncryptedFile;
 use crate::directory::{DirectoryContents, DirectoryEntry};
-use crate::error::{IoError, IoResult};
+use crate::error::{IoError, IoResult, IoResultExt};
 use crate::inode::{ContentId, FileData, Inode, InodeAttributes};
 use crate::serde::{load, save};
 use crate::util::IdPool;
-use crate::BackupFSOptions;
+use crate::{BackupFSOptions, CryptInfo};
 
 #[derive(Clone)]
 pub struct Controller(Rc<ControllerSeed>);
@@ -27,6 +27,8 @@ const U16_MSB: u16 = 0b1000_0000_0000_0000;
 
 pub struct ControllerSeed {
     config: BackupFSOptions,
+    cryptinfo_path: PathBuf,
+    cryptinfo: CryptInfo,
     key: Key,
     inode_cipher: RefCell<ChaCha20>,
     contents_cipher: RefCell<ChaCha20>,
@@ -55,13 +57,22 @@ fn encrypted_u64(cipher: &RefCell<ChaCha20>, num: u64) -> [u16; 5] {
 }
 
 impl Controller {
-    pub fn new(
-        config: BackupFSOptions,
-        key: Key,
-        inode_iv: Iv<ChaCha20>,
-        contents_iv: Iv<ChaCha20>,
-    ) -> Self {
-        Self(Rc::new(ControllerSeed {
+    pub fn new(config: BackupFSOptions) -> IoResult<Self> {
+        let cryptinfo_path = config.data_dir.join("cryptinfo");
+        let cryptinfo = if cryptinfo_path.exists() {
+            CryptInfo::load(&cryptinfo_path, &config.password)?
+        } else {
+            if config.readonly {
+                return IoResult::errno_notrace(libc::EROFS);
+            }
+            let cryptinfo = CryptInfo::new();
+            cryptinfo.save(cryptinfo_path.clone(), &config.password)?;
+            cryptinfo
+        };
+        let key = Key::clone_from_slice(&*cryptinfo.key);
+        let inode_iv = Iv::<ChaCha20>::clone_from_slice(&cryptinfo.inode_iv);
+        let contents_iv = Iv::<ChaCha20>::clone_from_slice(&cryptinfo.inode_iv);
+        Ok(Self(Rc::new(ControllerSeed {
             inode_cipher: RefCell::new(ChaCha20::new(&key, &inode_iv)),
             contents_cipher: RefCell::new(ChaCha20::new(&key, &contents_iv)),
             key,
@@ -70,7 +81,9 @@ impl Controller {
             inode_pool_path: config.data_dir.join("inode_pool"),
             inode_pool: RefCell::new(IdPool::new()),
             config,
-        }))
+            cryptinfo_path,
+            cryptinfo,
+        })))
     }
 
     pub fn load_inode_pool(&self) -> IoResult<()> {
@@ -172,6 +185,21 @@ impl Controller {
         Ok(())
     }
 
+    pub fn change_password(&self, password: &str) -> IoResult<()> {
+        self.check_rw()?;
+        self.0
+            .cryptinfo
+            .save(self.0.cryptinfo_path.clone(), password)
+    }
+
+    pub fn check_rw(&self) -> IoResult<()> {
+        if self.0.config.readonly {
+            IoResult::errno_notrace(libc::EROFS)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn inode_path(&self, inode: Inode) -> PathBuf {
         let [a, b, c, d, e] = encrypted_u64(&self.0.inode_cipher, inode.0);
         self.0
@@ -187,6 +215,7 @@ impl Controller {
     }
 
     pub fn next_inode(&self) -> IoResult<Inode> {
+        self.check_rw()?;
         let mut pool = self.0.inode_pool.borrow_mut();
         let res: u64 = pool
             .next()
@@ -222,6 +251,7 @@ impl Controller {
     }
 
     pub fn save<T: Save>(&self, item: T) -> IoResult<()> {
+        self.check_rw()?;
         item.save(self)
     }
 

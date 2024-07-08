@@ -60,6 +60,8 @@ pub struct BackupFSOptions {
     pub password: String,
     #[cfg_attr(feature = "cli", arg(long))]
     pub file_size_padding: Option<f64>,
+    #[cfg_attr(feature = "cli", arg(short, long))]
+    pub readonly: bool,
 }
 
 // Stores inode metadata data in "$data_dir/inodes" and file contents in "$data_dir/contents"
@@ -99,27 +101,15 @@ impl CryptInfo {
 
 impl BackupFS {
     pub fn new(config: BackupFSOptions) -> IoResult<BackupFS> {
-        let BackupFSOptions {
-            data_dir, password, ..
-        } = &config;
+        let BackupFSOptions { data_dir, .. } = &config;
         let lock = fd_lock_rs::FdLock::lock(
             File::create(data_dir.join(".lock"))?,
             LockType::Exclusive,
             false,
         )
         .map_err(io::Error::from)?;
-        let cryptinfo_path = data_dir.join("cryptinfo");
-        let cryptinfo = if cryptinfo_path.exists() {
-            CryptInfo::load(&cryptinfo_path, password)?
-        } else {
-            let cryptinfo = CryptInfo::new();
-            cryptinfo.save(cryptinfo_path, password)?;
-            cryptinfo
-        };
-        let key = Key::clone_from_slice(&*cryptinfo.key);
-        let inode_iv = Iv::<ChaCha20>::clone_from_slice(&cryptinfo.inode_iv);
-        let contents_iv = Iv::<ChaCha20>::clone_from_slice(&cryptinfo.inode_iv);
-        let ctrl = Controller::new(config, key, inode_iv, contents_iv);
+
+        let ctrl = Controller::new(config)?;
 
         if !ctrl.exists::<InodeAttributes>(Inode(FUSE_ROOT_ID)) {
             // Initialize with empty filesystem
@@ -143,6 +133,10 @@ impl BackupFS {
 
     pub fn fsck(&mut self) -> IoResult<()> {
         self.handler.ctrl().fsck(false)
+    }
+
+    pub fn change_password(&mut self, password: &str) -> IoResult<()> {
+        self.handler.ctrl().change_password(password)
     }
 }
 
@@ -174,7 +168,7 @@ impl Filesystem for BackupFS {
 
     fn forget(&mut self, _req: &Request, _inode: u64, _nlookup: u64) {}
 
-    fn getattr(&mut self, _req: &Request, inode: u64, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request<'_>, inode: u64, _fh: Option<u64>, reply: ReplyAttr) {
         match self
             .handler
             .mutate_inode(Inode(inode), |_, inode| Ok((&*inode).into()))

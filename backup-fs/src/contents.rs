@@ -344,6 +344,7 @@ impl Contents {
         Ok(self)
     }
     pub fn writable(&mut self) -> IoResult<&mut Self> {
+        self.ctrl.check_rw()?;
         if self.file.as_ref().map_or(false, |f| f.is_ok()) {
             return Ok(self);
         }

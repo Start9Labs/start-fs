@@ -140,6 +140,10 @@ impl BackupFS {
             handler: Handler::new(ctrl),
         })
     }
+
+    pub fn fsck(&mut self) -> IoResult<()> {
+        self.handler.ctrl().fsck(false)
+    }
 }
 
 impl Filesystem for BackupFS {

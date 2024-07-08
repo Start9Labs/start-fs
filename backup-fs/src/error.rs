@@ -1,6 +1,6 @@
 use fuser::ReplyEntry;
 use libc::c_int;
-use log::{debug, error};
+use log::error;
 use std::backtrace::Backtrace;
 use std::fmt::{Debug, Display};
 use std::io;

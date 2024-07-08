@@ -1,8 +1,8 @@
 use backupfs::{BackupFS, BackupFSOptions};
-use clap::builder::{TypedValueParser, ValueParser};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use fuser::MountOption;
 use log::{error, info};
+use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 
@@ -10,8 +10,16 @@ use std::path::PathBuf;
 struct MountOptions {
     #[command(flatten)]
     backup_opts: BackupFSOptions,
-    #[arg(short = 'o')]
+    #[arg(short = 'o', value_delimiter = ',')]
     opt: Vec<MountOption>,
+    mountpoint: PathBuf,
+}
+
+#[derive(clap::Parser)]
+struct BasicMountOptions {
+    #[arg(short = 'o', value_delimiter = ',')]
+    opt: Vec<MountOption>,
+    data_dir: PathBuf,
     mountpoint: PathBuf,
 }
 
@@ -28,8 +36,37 @@ fn main() {
         .format_timestamp_nanos()
         .parse_filters(std::env::var("RUST_LOG").as_deref().unwrap_or("info"))
         .init();
-    if std::env::args().next().as_deref() == Some("mount.backup-fs") {
-        return mount(MountOptions::parse());
+    if std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(|p| p.file_name())
+        .and_then(|p| p.to_str())
+        == Some("mount.backup-fs")
+    {
+        let BasicMountOptions {
+            opt,
+            data_dir,
+            mountpoint,
+        } = BasicMountOptions::parse();
+        return mount(MountOptions {
+            backup_opts: BackupFSOptions::parse_from(
+                [OsString::from("mount.backup-fs")]
+                    .into_iter()
+                    .chain(opt.iter().filter_map(|opt| {
+                        if let MountOption::CUSTOM(opt) = opt {
+                            Some::<OsString>(format!("--{opt}").into())
+                        } else {
+                            None
+                        }
+                    }))
+                    .chain([data_dir.into_os_string()]),
+            ),
+            opt: opt
+                .into_iter()
+                .filter(|o| !matches!(o, MountOption::CUSTOM(_)))
+                .collect(),
+            mountpoint,
+        });
     }
     let mut app = clap::command!()
         .subcommand(MountOptions::command().name("mount"))

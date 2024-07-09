@@ -13,7 +13,7 @@ use crate::atomic_file::AtomicFile;
 use crate::contents::EncryptedFile;
 use crate::ctrl::{Controller, Exists, Load, Save};
 use crate::directory::DirectoryContents;
-use crate::error::{IoResult, IoResultExt};
+use crate::error::{IoError, IoResult, IoResultExt};
 use crate::get_groups;
 use crate::handle::{FileHandleId, Handler};
 use crate::serde::{load, save};
@@ -131,12 +131,10 @@ impl InodeAttributes {
                 .unwrap_or(self.inode));
         }
 
-        let inode = dir
-            .get(name)
-            .ok_or(libc::ENOENT)
-            .map_err(io::Error::from_raw_os_error)?
-            .inode;
-        Ok(inode)
+        match dir.get(name) {
+            Some(inode) => Ok(inode.inode),
+            None => IoResult::errno_notrace(libc::ENOENT),
+        }
     }
 }
 

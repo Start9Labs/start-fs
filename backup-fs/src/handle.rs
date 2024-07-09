@@ -186,7 +186,7 @@ impl Handler {
                 .parents
                 .contains(&(parent.inode, name.to_owned()))
             {
-                return IoResult::errno(libc::ENOENT);
+                return IoResult::errno_notrace(libc::ENOENT);
             }
             Ok(inode.clone())
         })

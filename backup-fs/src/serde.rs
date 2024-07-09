@@ -1,7 +1,7 @@
 use std::io::{self, Read, Write};
 
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+pub use serde::{Deserialize, Serialize};
 use sha2::digest::Output;
 use sha2::Sha256;
 

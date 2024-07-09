@@ -1,10 +1,8 @@
 #![allow(clippy::needless_return)]
 #![allow(clippy::unnecessary_cast)] // libc::S_* are u16 or u32 depending on the platform
 
-use ::serde::{Deserialize, Serialize};
-use chacha20::cipher::{Iv, IvSizeUser, KeySizeUser};
+use chacha20::cipher::{IvSizeUser, KeySizeUser};
 use chacha20::ChaCha20;
-use chacha20::Key;
 use fd_lock_rs::{FdLock, LockType};
 use fuser::consts::FUSE_HANDLE_KILLPRIV;
 use fuser::{
@@ -13,6 +11,7 @@ use fuser::{
     Request, TimeOrNow, FUSE_ROOT_ID,
 };
 use log::{debug, error};
+use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -27,7 +26,7 @@ use crate::atomic_file::AtomicFile;
 use crate::contents::EncryptedFile;
 use crate::ctrl::{Controller, StatFs};
 use crate::directory::DirectoryContents;
-use crate::error::{to_libc_err, IoResult, IoResultExt};
+use crate::error::IoResult;
 use crate::handle::{FileHandleId, Handler};
 use crate::inode::FileData;
 use crate::inode::BLOCK_SIZE;
@@ -43,6 +42,8 @@ mod error;
 mod handle;
 mod inode;
 mod serde;
+#[cfg(test)]
+mod tests;
 mod util;
 
 pub const MAX_NAME_LENGTH: u32 = 255;
@@ -141,11 +142,7 @@ impl BackupFS {
 }
 
 impl Filesystem for BackupFS {
-    fn init(
-        &mut self,
-        _req: &Request,
-        #[allow(unused_variables)] config: &mut KernelConfig,
-    ) -> Result<(), c_int> {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> Result<(), c_int> {
         config.add_capabilities(FUSE_HANDLE_KILLPRIV).unwrap();
 
         log::info!("filesystem initialized");

@@ -1,5 +1,6 @@
 use crate::{BackupFS, BackupFSOptions};
 use fuser::MountOption;
+use std::process::Command;
 use std::{fs, io, path::Path};
 use tempdir::TempDir;
 

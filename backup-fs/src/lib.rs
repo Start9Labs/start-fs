@@ -255,7 +255,7 @@ impl Filesystem for BackupFS {
         reply: ReplyEntry,
     ) {
         debug!("mkdir() called with {:?} {:?} {:o}", parent, name, mode);
-        self.mknod(req, parent, name, mode & libc::S_IFDIR, umask, 0, reply)
+        self.mknod(req, parent, name, mode | libc::S_IFDIR, umask, 0, reply)
     }
 
     fn unlink(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {

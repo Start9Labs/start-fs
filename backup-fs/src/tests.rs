@@ -47,13 +47,16 @@ fn with_backupfs(
     };
 }
 
-fn tree(path: impl AsRef<Path>) -> Result<Vec<String>, io::Error> {
+fn tree(path: impl AsRef<Path>, dirs: bool) -> Result<Vec<String>, io::Error> {
     let mut children = Vec::new();
     for e in fs::read_dir(path)? {
         let e = e?;
         let name = e.file_name().to_string_lossy().into_owned();
         if e.metadata()?.is_dir() {
-            let grandchildren = tree(e.path())?;
+            if dirs {
+                children.push(name.clone());
+            }
+            let grandchildren = tree(e.path(), dirs)?;
             children.extend(
                 grandchildren
                     .into_iter()
@@ -67,7 +70,7 @@ fn tree(path: impl AsRef<Path>) -> Result<Vec<String>, io::Error> {
     Ok(children)
 }
 
-#[test]
+#[test_log::test]
 fn write_file() {
     let data = TempDir::new("backupfs_data").unwrap();
     with_backupfs(
@@ -86,11 +89,31 @@ fn write_file() {
         },
         None,
     );
-    assert_eq!(tree(data.path().join("inodes")).unwrap().len(), 2);
-    assert_eq!(tree(data.path().join("contents")).unwrap().len(), 1);
+    assert_eq!(tree(data.path().join("inodes"), false).unwrap().len(), 2);
+    assert_eq!(tree(data.path().join("contents"), false).unwrap().len(), 1);
 }
 
-#[test]
+#[test_log::test]
+fn write_directory() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::create_dir(mnt.join("a")).unwrap();
+            fs::create_dir(mnt.join("a/b")).unwrap();
+            fs::create_dir(mnt.join("a/c")).unwrap();
+            assert_eq!(
+                tree(mnt, true).unwrap(),
+                vec!["a".to_owned(), "a/b".to_owned(), "a/c".to_owned()]
+            )
+        },
+        None,
+    );
+    assert_eq!(tree(data.path().join("inodes"), false).unwrap().len(), 4);
+}
+
+#[test_log::test]
 fn preserves_file() {
     let data = TempDir::new("backupfs_data").unwrap();
     with_backupfs(
@@ -111,7 +134,7 @@ fn preserves_file() {
     );
 }
 
-#[test]
+#[test_log::test]
 fn checksum() {
     let data = TempDir::new("backupfs_data").unwrap();
     with_backupfs(data.path(), "ohea".to_owned(), |_mnt| {}, None);
@@ -128,7 +151,7 @@ fn checksum() {
     }
 }
 
-#[test]
+#[test_log::test]
 fn backupfs_change_password() {
     let data = TempDir::new("backupfs_data").unwrap();
     with_backupfs(

@@ -45,3 +45,4 @@ env_logger = { version = "0.11", optional = true }
 [dev-dependencies]
 tempdir = "0.3.7"
 oneshot = "0.1.8"
+test-log = "0.2.16"

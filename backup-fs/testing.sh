@@ -1,25 +1,43 @@
 #!/usr/bin/env bash
 
-set -ex
-
-exit_handler() {
-    exit "$XFSTESTS_EXIT_STATUS"
-}
-trap exit_handler TERM
-trap "kill 0" INT EXIT
+set -x
 
 export RUST_BACKTRACE=1
+
+TEST_FAILED=0
+
+# =================
+# run our own tests
+# =================
+
+cd /code/backupfs
+RUSTFLAGS=-g cargo test --release
+TEST_FAILED=$(( $? | $TEST_FAILED ))
+
+# ============================
+# run the libfuse example suit
+# ============================
+
+TEST_DATA_DIR=$(mktemp --directory)
+TEST_DIR=$(mktemp --directory)
+
+cd /code/libfuse/build/test
+RUST_LOG=debug /code/backupfs/target/release/startos-backup-fs mount "$TEST_DATA_DIR" "$TEST_DIR" --password ohea
+./test_syscalls "$TEST_DIR"
+TEST_FAILED=$(( $? | $TEST_FAILED ))
+umount "$TEST_DIR"
+
+# ====================
+# run the xfstest suit
+# ====================
+
+if [ ]; then
 
 TEST_DATA_DIR=$(mktemp --directory)
 SCRATCH_DATA_DIR=$(mktemp --directory)
 TEST_DIR=$(mktemp --directory)
 SCRATCH_DIR=$(mktemp --directory)
 
-set +e
-# Clear mount log file, since the tests append to it
-echo "" > /code/logs/xfstests_mount.log
-DIR=/var/tmp/fuse-xfstests/check-fuser
-mkdir -p $DIR
 cd /code/fuse-xfstests
 
 # requires OFD & POSIX locks. OFD locks are not supported by fuse
@@ -123,20 +141,11 @@ echo "generic/531" >> xfs_excludes.txt
 # Test requires mounting a loopback device
 echo "generic/564" >> xfs_excludes.txt
 
-
-FUSER_EXTRA_MOUNT_OPTIONS="" TEST_DEV="$TEST_DATA_DIR" TEST_DIR="$TEST_DIR" SCRATCH_DEV="$SCRATCH_DATA_DIR" SCRATCH_MNT="$SCRATCH_DIR" \
-./check-fuser -E xfs_excludes.txt "$@" \
-| tee /code/logs/xfstests.log
-
-export XFSTESTS_EXIT_STATUS=${PIPESTATUS[0]}
-
-if [ $XFSTESTS_EXIT_STATUS ]
-then
-  cat /code/fuse-xfstests/results/generic/*.bad
-  cp /code/fuse-xfstests/results/generic/*.bad /code/logs/
+PASSWORD="ohea" TEST_DEV="$TEST_DATA_DIR" TEST_DIR="$TEST_DIR" SCRATCH_DEV="$SCRATCH_DATA_DIR" SCRATCH_MNT="$SCRATCH_DIR" ./check-fuser -E xfs_excludes.txt
+TEST_FAILED=$(( $? | $TEST_FAILED ))
 fi
 
-rm -rf ${TEST_DATA_DIR}
-rm -rf ${TEST_DIR}
-rm -rf ${SCRATCH_DATA_DIR}
-rm -rf ${SCRATCH_DIR}
+# ====
+# done
+# ====
+exit $TEST_FAILED

@@ -1,10 +1,8 @@
 #![allow(clippy::needless_return)]
 #![allow(clippy::unnecessary_cast)] // libc::S_* are u16 or u32 depending on the platform
 
-use ::serde::{Deserialize, Serialize};
-use chacha20::cipher::{Iv, IvSizeUser, KeySizeUser};
+use chacha20::cipher::{IvSizeUser, KeySizeUser};
 use chacha20::ChaCha20;
-use chacha20::Key;
 use fd_lock_rs::{FdLock, LockType};
 use fuser::consts::FUSE_HANDLE_KILLPRIV;
 use fuser::{
@@ -13,6 +11,7 @@ use fuser::{
     Request, TimeOrNow, FUSE_ROOT_ID,
 };
 use log::{debug, error};
+use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -27,7 +26,7 @@ use crate::atomic_file::AtomicFile;
 use crate::contents::EncryptedFile;
 use crate::ctrl::{Controller, StatFs};
 use crate::directory::DirectoryContents;
-use crate::error::{to_libc_err, IoResult, IoResultExt};
+use crate::error::IoResult;
 use crate::handle::{FileHandleId, Handler};
 use crate::inode::FileData;
 use crate::inode::BLOCK_SIZE;
@@ -43,6 +42,8 @@ mod error;
 mod handle;
 mod inode;
 mod serde;
+#[cfg(test)]
+mod tests;
 mod util;
 
 pub const MAX_NAME_LENGTH: u32 = 255;
@@ -141,11 +142,7 @@ impl BackupFS {
 }
 
 impl Filesystem for BackupFS {
-    fn init(
-        &mut self,
-        _req: &Request,
-        #[allow(unused_variables)] config: &mut KernelConfig,
-    ) -> Result<(), c_int> {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> Result<(), c_int> {
         config.add_capabilities(FUSE_HANDLE_KILLPRIV).unwrap();
 
         log::info!("filesystem initialized");
@@ -257,12 +254,10 @@ impl Filesystem for BackupFS {
         umask: u32,
         reply: ReplyEntry,
     ) {
-        debug!("mkdir() called with {:?} {:?} {:o}", parent, name, mode);
-        self.mknod(req, parent, name, mode & libc::S_IFDIR, umask, 0, reply)
+        self.mknod(req, parent, name, mode | libc::S_IFDIR, umask, 0, reply)
     }
 
     fn unlink(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        debug!("unlink() called with {:?} {:?}", parent, name);
         match self.handler.unlink(req, Inode(parent), name) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e.to_errno_log()),
@@ -270,7 +265,6 @@ impl Filesystem for BackupFS {
     }
 
     fn rmdir(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        debug!("rmdir() called with {:?} {:?}", parent, name);
         match self.handler.unlink(req, Inode(parent), name) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e.to_errno_log()),
@@ -285,16 +279,12 @@ impl Filesystem for BackupFS {
         target: &Path,
         reply: ReplyEntry,
     ) {
-        debug!(
-            "symlink() called with {:?} {:?} {:?}",
-            parent, link_name, target
-        );
         match self.handler.mknod(
             req,
             Inode(parent),
             link_name,
-            0o777,
-            0o777,
+            libc::S_IFLNK | 0o777,
+            0,
             0,
             Some(|_| FileData::Symlink(target.to_owned())),
         ) {
@@ -400,7 +390,6 @@ impl Filesystem for BackupFS {
         lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        //debug!("write() called with {:?} size={:?}", inode, data.len());
         if offset < 0 {
             reply.error(libc::EINVAL);
             return;
@@ -473,7 +462,6 @@ impl Filesystem for BackupFS {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        debug!("readdir() called with {:?}", inode);
         if offset < 0 {
             reply.error(libc::EINVAL);
             return;
@@ -503,7 +491,6 @@ impl Filesystem for BackupFS {
         offset: i64,
         mut reply: ReplyDirectoryPlus,
     ) {
-        debug!("readdirplus() called with {:?}", inode);
         if offset < 0 {
             reply.error(libc::EINVAL);
             return;
@@ -652,7 +639,6 @@ impl Filesystem for BackupFS {
     }
 
     fn access(&mut self, req: &Request, inode: u64, mask: i32, reply: ReplyEmpty) {
-        debug!("access() called with {:?} {:?}", inode, mask);
         match self
             .handler
             .ctrl()
@@ -674,10 +660,6 @@ impl Filesystem for BackupFS {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        debug!(
-            "create() called with {:?} {:?} mode={:?} umask={:?}",
-            parent, name, mode, umask
-        );
         match self
             .handler
             .create(req, Inode(parent), name, mode, umask, flags)
@@ -700,7 +682,6 @@ impl Filesystem for BackupFS {
         mode: i32,
         reply: ReplyEmpty,
     ) {
-        debug!("fallocate() called with {:?} length={:?}", inode, length);
         if offset < 0 || length < 0 {
             reply.error(libc::EINVAL);
             return;
@@ -731,10 +712,6 @@ impl Filesystem for BackupFS {
         flags: u32,
         reply: ReplyWrite,
     ) {
-        debug!(
-            "copy_file_range() called with src ({}, {}, {}) dest ({}, {}, {}) size={}",
-            src_fh, src_inode, src_offset, dest_fh, dest_inode, dest_offset, size
-        );
         match self.handler.copy_file_range(
             req,
             Inode(src_inode),

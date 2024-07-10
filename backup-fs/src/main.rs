@@ -112,15 +112,20 @@ fn mount(
     let result = fuser::Session::new(BackupFS::new(backup_opts).unwrap(), &mountpoint, &opt);
     match result {
         Err(e) => {
+            error!("{:?}", e);
             // Return a special error code for permission denied, which usually indicates that
             // "user_allow_other" is missing from /etc/fuse.conf
             if e.kind() == ErrorKind::PermissionDenied {
-                error!("{}", e.to_string());
                 std::process::exit(2);
             }
             std::process::exit(1);
         }
         Ok(mut s) => {
+            let mut umount = s.unmount_callable();
+            ctrlc::set_handler(move || {
+                let _ = umount.unmount();
+            })
+            .unwrap();
             nix::unistd::daemon(true, true).unwrap();
             s.run().unwrap()
         }

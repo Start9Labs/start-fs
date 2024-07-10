@@ -31,7 +31,9 @@ impl IoError {
     }
 
     pub fn to_errno_log(&self) -> c_int {
-        error!("{self:?}");
+        if self.to_errno() != libc::ENOENT {
+            error!("{self:?}");
+        }
         to_libc_err(&self.inner)
     }
 

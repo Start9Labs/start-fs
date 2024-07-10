@@ -46,3 +46,4 @@ ctrlc = "3.4.4"
 tempdir = "0.3.7"
 oneshot = "0.1.8"
 test-log = "0.2.16"
+tokio = { version = "1.38.0", features = ["fs", "rt", "macros"] }

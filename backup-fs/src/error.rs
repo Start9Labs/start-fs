@@ -5,6 +5,8 @@ use std::backtrace::Backtrace;
 use std::fmt::{Debug, Display};
 use std::io;
 
+use crate::error;
+
 pub fn to_libc_err(e: &io::Error) -> c_int {
     e.raw_os_error().unwrap_or_else(|| libc::EIO)
 }
@@ -63,8 +65,11 @@ impl BkfsError {
             BkfsErrorKind::Io(io) if io.raw_os_error().is_some() => {
                 debug!("{self:?}");
             }
-            _ => {
+            BkfsErrorKind::Io(_) | BkfsErrorKind::Multiple(_) => {
                 warn!("{self:?}");
+            }
+            _ => {
+                error!("{self:?}");
             }
         }
         no

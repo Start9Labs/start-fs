@@ -26,7 +26,7 @@ use crate::atomic_file::AtomicFile;
 use crate::contents::EncryptedFile;
 use crate::ctrl::{Controller, StatFs};
 use crate::directory::DirectoryContents;
-use crate::error::IoResult;
+use crate::error::BkfsResult;
 use crate::handle::{FileHandleId, Handler};
 use crate::inode::FileData;
 use crate::inode::BLOCK_SIZE;
@@ -38,7 +38,7 @@ mod atomic_file;
 mod contents;
 mod ctrl;
 mod directory;
-mod error;
+pub mod error;
 mod handle;
 mod inode;
 mod serde;
@@ -89,10 +89,10 @@ impl CryptInfo {
             contents_iv: rand::random(),
         }
     }
-    pub fn load(path: &Path, password: &str) -> IoResult<Self> {
+    pub fn load(path: &Path, password: &str) -> BkfsResult<Self> {
         load(EncryptedFile::open_pbkdf2(File::open(path)?, password)?)
     }
-    pub fn save(&self, path: PathBuf, password: &str) -> IoResult<()> {
+    pub fn save(&self, path: PathBuf, password: &str) -> BkfsResult<()> {
         save(
             self,
             EncryptedFile::create_pbkdf2(AtomicFile::create(path)?, password)?,
@@ -101,7 +101,7 @@ impl CryptInfo {
 }
 
 impl BackupFS {
-    pub fn new(config: BackupFSOptions) -> IoResult<BackupFS> {
+    pub fn new(config: BackupFSOptions) -> BkfsResult<BackupFS> {
         let BackupFSOptions { data_dir, .. } = &config;
         let lock = fd_lock_rs::FdLock::lock(
             File::create(data_dir.join(".lock"))?,
@@ -132,11 +132,11 @@ impl BackupFS {
         })
     }
 
-    pub fn fsck(&mut self) -> IoResult<()> {
+    pub fn fsck(&mut self) -> BkfsResult<()> {
         self.handler.ctrl().fsck(false)
     }
 
-    pub fn change_password(&mut self, password: &str) -> IoResult<()> {
+    pub fn change_password(&mut self, password: &str) -> BkfsResult<()> {
         self.handler.ctrl().change_password(password)
     }
 }
@@ -765,7 +765,7 @@ pub fn get_groups(pid: u32) -> Vec<u32> {
     vec![]
 }
 
-pub fn fuse_allow_other_enabled() -> IoResult<bool> {
+pub fn fuse_allow_other_enabled() -> BkfsResult<bool> {
     let file = File::open("/etc/fuse.conf")?;
     for line in BufReader::new(file).lines() {
         if line?.trim_start().starts_with("user_allow_other") {

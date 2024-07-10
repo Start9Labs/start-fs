@@ -1,3 +1,4 @@
+use backupfs::error::{BkfsError, BkfsErrorKind};
 use backupfs::{BackupFS, BackupFSOptions};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use fuser::MountOption;
@@ -84,6 +85,21 @@ fn main() {
     }
 }
 
+fn new_fs(opts: BackupFSOptions) -> BackupFS {
+    let res = BackupFS::new(opts);
+    let err = match res {
+        Ok(fs) => return fs,
+        Err(err) => err,
+    };
+    error!("could not load backup: {err:?}");
+    match err.kind {
+        // return a special code if the password was incorrect (presumably)
+        BkfsErrorKind::BadChecksum => std::process::exit(4),
+        // return a special code if we could not load the backend for some other reason
+        _ => std::process::exit(3),
+    }
+}
+
 fn mount(
     MountOptions {
         mut backup_opts,
@@ -109,7 +125,7 @@ fn mount(
         backup_opts.readonly = true;
     }
 
-    let result = fuser::Session::new(BackupFS::new(backup_opts).unwrap(), &mountpoint, &opt);
+    let result = fuser::Session::new(new_fs(backup_opts), &mountpoint, &opt);
     match result {
         Err(e) => {
             error!("{:?}", e);
@@ -133,7 +149,7 @@ fn mount(
 }
 
 fn fsck(options: BackupFSOptions) {
-    backupfs::BackupFS::new(options).unwrap().fsck().unwrap()
+    new_fs(options).fsck().unwrap()
 }
 
 fn change_password(
@@ -142,8 +158,5 @@ fn change_password(
         new_password,
     }: ChangePasswordOptions,
 ) {
-    backupfs::BackupFS::new(backup_opts)
-        .unwrap()
-        .change_password(&new_password)
-        .unwrap()
+    new_fs(backup_opts).change_password(&new_password).unwrap()
 }

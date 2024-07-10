@@ -4,7 +4,7 @@ use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
-use crate::error::IoResult;
+use crate::error::BkfsResult;
 
 pub struct AtomicFile {
     tmp_path: PathBuf,
@@ -12,7 +12,7 @@ pub struct AtomicFile {
     file: Option<File>,
 }
 impl AtomicFile {
-    pub fn new(path: PathBuf, opt: &OpenOptions) -> IoResult<Self> {
+    pub fn new(path: PathBuf, opt: &OpenOptions) -> BkfsResult<Self> {
         if let Some(parent) = path.parent() {
             if !parent.exists() {
                 std::fs::create_dir_all(parent)?;
@@ -27,20 +27,20 @@ impl AtomicFile {
         })
     }
 
-    pub fn create(path: PathBuf) -> IoResult<Self> {
+    pub fn create(path: PathBuf) -> BkfsResult<Self> {
         Self::new(
             path,
             &OpenOptions::new().write(true).truncate(true).create(true),
         )
     }
 
-    pub fn rollback(mut self) -> IoResult<()> {
+    pub fn rollback(mut self) -> BkfsResult<()> {
         drop(self.file.take());
         std::fs::remove_file(&self.tmp_path)?;
         Ok(())
     }
 
-    pub fn save(mut self) -> IoResult<()> {
+    pub fn save(mut self) -> BkfsResult<()> {
         if let Some(file) = self.file.as_mut() {
             file.flush()?;
             file.sync_all()?;

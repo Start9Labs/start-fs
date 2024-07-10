@@ -16,7 +16,7 @@ use log::{debug, warn};
 use crate::contents::Contents;
 use crate::ctrl::Controller;
 use crate::directory::{DirectoryContents, DirectoryEntry};
-use crate::error::{IoResult, IoResultExt};
+use crate::error::{BkfsResult, BkfsResultExt};
 use crate::inode::{FileData, Inode, InodeAttributes};
 use crate::{FMODE_EXEC, MAX_NAME_LENGTH};
 
@@ -45,8 +45,8 @@ impl Handler {
         inode: Inode,
         read: bool,
         write: bool,
-        access: impl FnOnce(&InodeAttributes) -> IoResult<()>,
-    ) -> IoResult<FileHandleId> {
+        access: impl FnOnce(&InodeAttributes) -> BkfsResult<()>,
+    ) -> BkfsResult<FileHandleId> {
         let contents = if let Some(contents) = self.inodes.get(&inode).and_then(Weak::upgrade) {
             contents
         } else {
@@ -71,9 +71,9 @@ impl Handler {
     pub fn handle(&self, fh: FileHandleId) -> Option<&FileHandle> {
         self.open_files.get(&fh)
     }
-    pub fn fclose(&mut self, fh: FileHandleId) -> IoResult<()> {
+    pub fn fclose(&mut self, fh: FileHandleId) -> BkfsResult<()> {
         let Some(handle) = self.open_files.remove(&fh) else {
-            return IoResult::errno(libc::EBADF);
+            return BkfsResult::errno(libc::EBADF);
         };
         handle.close(self)?;
         Ok(())
@@ -87,11 +87,11 @@ impl Handler {
         }
     }
 
-    pub fn mutate_inode<F: FnOnce(&mut Self, &mut InodeAttributes) -> IoResult<T>, T>(
+    pub fn mutate_inode<F: FnOnce(&mut Self, &mut InodeAttributes) -> BkfsResult<T>, T>(
         &mut self,
         inode: Inode,
         f: F,
-    ) -> IoResult<T> {
+    ) -> BkfsResult<T> {
         if let Some(contents) = self.inodes.get(&inode).and_then(Weak::upgrade) {
             let mut contents = contents.borrow_mut();
             f(self, &mut contents.inode)
@@ -100,11 +100,11 @@ impl Handler {
         }
     }
 
-    pub fn peek_inode<F: FnOnce(&InodeAttributes) -> IoResult<T>, T>(
+    pub fn peek_inode<F: FnOnce(&InodeAttributes) -> BkfsResult<T>, T>(
         &self,
         inode: Inode,
         f: F,
-    ) -> IoResult<T> {
+    ) -> BkfsResult<T> {
         if let Some(contents) = self.inodes.get(&inode).and_then(Weak::upgrade) {
             let contents = contents.borrow_mut();
             f(&contents.inode)
@@ -125,7 +125,7 @@ pub struct FileHandle {
     pub contents: Rc<RefCell<Contents>>,
 }
 impl FileHandle {
-    pub fn close(self, handler: &mut Handler) -> IoResult<()> {
+    pub fn close(self, handler: &mut Handler) -> BkfsResult<()> {
         if let Ok(contents) = Rc::try_unwrap(self.contents) {
             contents.into_inner().close(handler)?;
         }
@@ -143,7 +143,7 @@ pub struct OverwriteOptions {
 }
 
 impl Handler {
-    pub fn close_all(&mut self) -> IoResult<()> {
+    pub fn close_all(&mut self) -> BkfsResult<()> {
         std::mem::take(&mut self.inodes);
         let mut errs = Vec::new();
         for (_, handle) in std::mem::take(&mut self.open_files) {
@@ -151,18 +151,7 @@ impl Handler {
                 errs.push(e);
             }
         }
-        errs.into_iter().fold(Ok(()), |acc, x| match acc {
-            Ok(()) => Err(x),
-            Err(e) if e.inner.kind() == x.inner.kind() => {
-                Err(io::Error::new(e.inner.kind(), format!("({e}) ({x})")).into())
-            }
-            Err(e) => Err(io::Error::other(format!(
-                "({}: {e}) ({}: {x})",
-                e.inner.kind(),
-                x.inner.kind()
-            ))
-            .into()),
-        })
+        BkfsResult::multiple((), errs)
     }
 
     pub fn lookup(
@@ -170,9 +159,9 @@ impl Handler {
         req: &Request,
         parent: Inode,
         name: &OsStr,
-    ) -> IoResult<InodeAttributes> {
+    ) -> BkfsResult<InodeAttributes> {
         if name.len() > MAX_NAME_LENGTH as usize {
-            return IoResult::errno(libc::ENAMETOOLONG);
+            return BkfsResult::errno(libc::ENAMETOOLONG);
         }
         let parent = self.ctrl().load::<InodeAttributes>(parent)?;
         parent
@@ -186,7 +175,7 @@ impl Handler {
                 .parents
                 .contains(&(parent.inode, name.to_owned()))
             {
-                return IoResult::errno_notrace(libc::ENOENT);
+                return BkfsResult::errno_notrace(libc::ENOENT);
             }
             Ok(inode.clone())
         })
@@ -208,7 +197,7 @@ impl Handler {
         chgtime: Option<SystemTime>,
         bkuptime: Option<SystemTime>,
         flags: Option<u32>,
-    ) -> IoResult<InodeAttributes> {
+    ) -> BkfsResult<InodeAttributes> {
         let inode = self.mutate_inode(inode, |handler, inode| {
             let changed = inode.attrs.setattr(
                 handler,
@@ -235,12 +224,12 @@ impl Handler {
         Ok(inode)
     }
 
-    pub fn readlink(&mut self, req: &Request, inode: Inode) -> IoResult<PathBuf> {
+    pub fn readlink(&mut self, req: &Request, inode: Inode) -> BkfsResult<PathBuf> {
         debug!("readlink() called on {:?}", inode);
         let inode = self.ctrl().load::<InodeAttributes>(inode)?;
         inode.attrs.check_access(req.uid(), req.gid(), libc::R_OK)?;
         let FileData::Symlink(p) = inode.attrs.contents else {
-            return IoResult::errno(libc::EINVAL);
+            return BkfsResult::errno(libc::EINVAL);
         };
         Ok(p)
     }
@@ -254,7 +243,7 @@ impl Handler {
         umask: u32,
         _rdev: u32,
         contents: Option<F>,
-    ) -> IoResult<InodeAttributes> {
+    ) -> BkfsResult<InodeAttributes> {
         let file_type = mode & libc::S_IFMT as u32;
 
         if file_type != libc::S_IFREG as u32
@@ -263,7 +252,7 @@ impl Handler {
         {
             // TODO
             warn!("mknod() implementation is incomplete. Only supports regular files, symlinks, and directories. Got {:o}", mode);
-            return IoResult::errno(libc::ENOSYS);
+            return BkfsResult::errno(libc::ENOSYS);
         }
 
         let mut parent = self.ctrl().load::<InodeAttributes>(parent)?;
@@ -275,11 +264,11 @@ impl Handler {
         let gid = parent.attrs.creation_gid(req.gid());
 
         let FileData::Directory(dir) = &mut parent.attrs.contents else {
-            return IoResult::errno(libc::ENOTDIR);
+            return BkfsResult::errno(libc::ENOTDIR);
         };
 
         if dir.get(name).is_some() {
-            return IoResult::errno(libc::EEXIST);
+            return BkfsResult::errno(libc::EEXIST);
         }
 
         if req.uid() != 0 {
@@ -300,7 +289,7 @@ impl Handler {
             } else if mode == libc::S_IFDIR as u32 {
                 FileData::Directory(DirectoryContents::new())
             } else {
-                return IoResult::errno(libc::ENOSYS);
+                return BkfsResult::errno(libc::ENOSYS);
             }
         };
 
@@ -324,7 +313,7 @@ impl Handler {
         Ok(new)
     }
 
-    pub fn gc_inode(&mut self, inode: &InodeAttributes) -> IoResult<bool> {
+    pub fn gc_inode(&mut self, inode: &InodeAttributes) -> BkfsResult<bool> {
         if inode.inode.0 == FUSE_ROOT_ID {
             return Ok(false);
         }
@@ -359,14 +348,14 @@ impl Handler {
         Ok(true)
     }
 
-    pub fn unlink(&mut self, req: &Request, parent: Inode, name: &OsStr) -> IoResult<()> {
+    pub fn unlink(&mut self, req: &Request, parent: Inode, name: &OsStr) -> BkfsResult<()> {
         let mut parent = self.ctrl().load::<InodeAttributes>(parent)?;
         parent
             .attrs
             .check_access(req.uid(), req.gid(), libc::W_OK)?;
 
         let FileData::Directory(dir) = &mut parent.attrs.contents else {
-            return IoResult::errno(libc::ENOTDIR);
+            return BkfsResult::errno(libc::ENOTDIR);
         };
 
         let entry = dir
@@ -376,7 +365,7 @@ impl Handler {
         self.mutate_inode(entry.inode, |handler, inode| {
             if let FileData::Directory(dir) = &inode.attrs.contents {
                 if inode.attrs.parents.len() <= 1 && !dir.is_empty() {
-                    return IoResult::errno(libc::ENOTEMPTY);
+                    return BkfsResult::errno(libc::ENOTEMPTY);
                 }
             }
 
@@ -400,7 +389,7 @@ impl Handler {
         new_parent: Inode,
         new_name: &OsStr,
         overwrite: Option<OverwriteOptions>,
-    ) -> IoResult<InodeAttributes> {
+    ) -> BkfsResult<InodeAttributes> {
         use imbl::ordmap::Entry::*;
         self.mutate_inode(inode, |handler, inode| {
             let mut ancestor_queue = vec![new_parent];
@@ -408,7 +397,7 @@ impl Handler {
                 if ancestor == inode.inode {
                     // libc seems to check for this case internally, but we should be safe
                     warn!("tried to create a loop");
-                    return IoResult::errno(libc::EINVAL);
+                    return BkfsResult::errno(libc::EINVAL);
                 }
                 handler.peek_inode(ancestor, |ancestor_inode| {
                     ancestor_queue.extend(ancestor_inode.attrs.parents.iter().map(|pair| pair.0));
@@ -424,7 +413,7 @@ impl Handler {
 
             let sticky_res = new_parent.attrs.check_sticky(&inode.attrs, req.uid());
             let FileData::Directory(dir) = &mut new_parent.attrs.contents else {
-                return IoResult::errno(libc::ENOTDIR);
+                return BkfsResult::errno(libc::ENOTDIR);
             };
 
             let new_entry = DirectoryEntry {
@@ -433,12 +422,12 @@ impl Handler {
             };
             let entry = dir.entry(new_name.to_owned());
             match (entry, overwrite) {
-                (Occupied(_), None) => return IoResult::errno(libc::EEXIST),
+                (Occupied(_), None) => return BkfsResult::errno(libc::EEXIST),
                 (Occupied(mut prev_entry), Some(overwrite)) => {
                     handler.mutate_inode(prev_entry.get().inode, |handler, prev_inode| {
                         if let FileData::Directory(dir) = &prev_inode.attrs.contents {
                             if prev_inode.attrs.parents.len() <= 1 && !dir.is_empty() {
-                                return IoResult::errno(libc::ENOTEMPTY);
+                                return BkfsResult::errno(libc::ENOTEMPTY);
                             }
                         }
 
@@ -481,7 +470,7 @@ impl Handler {
         new_parent: Inode,
         new_name: &OsStr,
         exchange: bool,
-    ) -> IoResult<()> {
+    ) -> BkfsResult<()> {
         let parent = self.ctrl().load::<InodeAttributes>(parent)?;
 
         parent
@@ -533,12 +522,12 @@ impl Handler {
         Ok(())
     }
 
-    pub fn open(&mut self, req: &Request, inode: Inode, flags: i32) -> IoResult<FileHandleId> {
+    pub fn open(&mut self, req: &Request, inode: Inode, flags: i32) -> BkfsResult<FileHandleId> {
         let (access_mask, read, write) = match flags & libc::O_ACCMODE {
             libc::O_RDONLY => {
                 // Behavior is undefined, but most filesystems return EACCES
                 if flags & libc::O_TRUNC != 0 {
-                    return IoResult::errno(libc::EACCES);
+                    return BkfsResult::errno(libc::EACCES);
                 }
                 if flags & FMODE_EXEC != 0 {
                     // Open is from internal exec syscall
@@ -551,7 +540,7 @@ impl Handler {
             libc::O_RDWR => (libc::R_OK | libc::W_OK, true, true),
             // Exactly one access mode flag must be specified
             _ => {
-                return IoResult::errno(libc::EINVAL);
+                return BkfsResult::errno(libc::EINVAL);
             }
         };
 
@@ -569,13 +558,13 @@ impl Handler {
         size: usize,
         _flags: i32,
         _lock_owner: Option<u64>,
-    ) -> IoResult<Vec<u8>> {
+    ) -> BkfsResult<Vec<u8>> {
         let fh = self
             .handle(fh)
             .ok_or(libc::EBADF)
             .map_err(io::Error::from_raw_os_error)?;
         if !fh.read {
-            return IoResult::errno(libc::EACCES);
+            return BkfsResult::errno(libc::EACCES);
         }
 
         let mut contents = fh.contents.borrow_mut();
@@ -599,13 +588,13 @@ impl Handler {
         _write_flags: u32,
         flags: i32,
         _lock_owner: Option<u64>,
-    ) -> IoResult<usize> {
+    ) -> BkfsResult<usize> {
         let fh = self
             .handle(fh)
             .ok_or(libc::EBADF)
             .map_err(io::Error::from_raw_os_error)?;
         if !fh.write {
-            return IoResult::errno(libc::EACCES);
+            return BkfsResult::errno(libc::EACCES);
         }
 
         let mut contents = fh.contents.borrow_mut();
@@ -627,7 +616,7 @@ impl Handler {
         _inode: Inode,
         fh: FileHandleId,
         datasync: bool,
-    ) -> IoResult<()> {
+    ) -> BkfsResult<()> {
         let fh = self
             .handle(fh)
             .ok_or(libc::EBADF)
@@ -636,13 +625,13 @@ impl Handler {
         Ok(())
     }
 
-    pub fn opendir(&mut self, req: &Request, inode: Inode, flags: i32) -> IoResult<FileHandleId> {
+    pub fn opendir(&mut self, req: &Request, inode: Inode, flags: i32) -> BkfsResult<FileHandleId> {
         let inode = self.ctrl().load::<InodeAttributes>(inode)?;
         let (access_mask, read, _) = match flags & libc::O_ACCMODE {
             libc::O_RDONLY => {
                 // Behavior is undefined, but most filesystems return EACCES
                 if flags & libc::O_TRUNC != 0 {
-                    return IoResult::errno(libc::EACCES);
+                    return BkfsResult::errno(libc::EACCES);
                 }
                 (libc::R_OK, true, false)
             }
@@ -650,7 +639,7 @@ impl Handler {
             libc::O_RDWR => (libc::R_OK | libc::W_OK, true, true),
             // Exactly one access mode flag must be specified
             _ => {
-                return IoResult::errno(libc::EINVAL);
+                return BkfsResult::errno(libc::EINVAL);
             }
         };
         inode
@@ -674,14 +663,14 @@ impl Handler {
         inode: Inode,
         fh: FileHandleId,
         mut offset: i64,
-        mut handle_entry: impl FnMut(&mut Self, &OsStr, &DirectoryEntry, i64) -> IoResult<bool>,
-    ) -> IoResult<bool> {
+        mut handle_entry: impl FnMut(&mut Self, &OsStr, &DirectoryEntry, i64) -> BkfsResult<bool>,
+    ) -> BkfsResult<bool> {
         let inode = self.ctrl().load::<InodeAttributes>(inode)?;
         let Some(handle) = self.open_dirs.get_mut(&fh) else {
-            return IoResult::errno(libc::EACCES); // opened without read perm
+            return BkfsResult::errno(libc::EACCES); // opened without read perm
         };
         let FileData::Directory(dir) = inode.attrs.contents else {
-            return IoResult::errno(libc::ENOTDIR);
+            return BkfsResult::errno(libc::ENOTDIR);
         };
 
         let mut cur = handle.cursors.remove(&offset).map(Cow::Owned);
@@ -716,7 +705,7 @@ impl Handler {
             [None, None]
         };
 
-        let mut res: IoResult<bool> = Ok(false);
+        let mut res: BkfsResult<bool> = Ok(false);
         for (name, entry) in special
             .into_iter()
             .flatten()
@@ -731,7 +720,7 @@ impl Handler {
         }
 
         let Some(handle) = self.open_dirs.get_mut(&fh) else {
-            return IoResult::errno(libc::EACCES); // opened without read perm
+            return BkfsResult::errno(libc::EACCES); // opened without read perm
         };
 
         if let Some(cur) = cur {
@@ -749,9 +738,9 @@ impl Handler {
         _inode: Inode,
         fh: FileHandleId,
         _flags: i32,
-    ) -> IoResult<()> {
+    ) -> BkfsResult<()> {
         let Some(ent) = self.open_dirs.remove(&fh) else {
-            return IoResult::errno(libc::EBADF);
+            return BkfsResult::errno(libc::EBADF);
         };
         self.gc_inode(&self.ctrl().load(ent.inode)?)?;
 
@@ -764,7 +753,7 @@ impl Handler {
         inode: Inode,
         key: &[u8],
         value: &[u8],
-    ) -> IoResult<()> {
+    ) -> BkfsResult<()> {
         self.mutate_inode(inode, |handler, inode| {
             let attrs = &mut inode.attrs;
             attrs.xattr_access_check(key, libc::W_OK, req)?;
@@ -775,15 +764,15 @@ impl Handler {
         })
     }
 
-    pub fn getxattr(&self, req: &Request, inode: Inode, key: &[u8]) -> IoResult<Vec<u8>> {
+    pub fn getxattr(&self, req: &Request, inode: Inode, key: &[u8]) -> BkfsResult<Vec<u8>> {
         self.peek_inode(inode, |inode| {
             inode.attrs.xattr_access_check(key, libc::R_OK, req)?;
             match inode.attrs.xattrs.get(key) {
                 Some(v) => Ok(v.clone()),
                 #[cfg(target_os = "linux")]
-                None => IoResult::errno_notrace(libc::ENODATA),
+                None => BkfsResult::errno_notrace(libc::ENODATA),
                 #[cfg(not(target_os = "linux"))]
-                None => IoResult::errno_notrace(libc::ENOATTR),
+                None => BkfsResult::errno_notrace(libc::ENOATTR),
             }
         })
     }
@@ -792,7 +781,7 @@ impl Handler {
         &self,
         req: &'r Request,
         inode: Inode,
-    ) -> IoResult<impl Iterator<Item = (Vec<u8>, Vec<u8>)> + 'r> {
+    ) -> BkfsResult<impl Iterator<Item = (Vec<u8>, Vec<u8>)> + 'r> {
         // TODO: peek_inode and serialize to bytes here
         let inode = self.ctrl().load::<InodeAttributes>(inode)?;
         let mut attrs = inode.attrs;
@@ -802,7 +791,7 @@ impl Handler {
             .filter(move |(key, _)| attrs.xattr_access_check(key, libc::R_OK, req).is_ok()))
     }
 
-    pub fn removexattr(&mut self, req: &Request, inode: Inode, key: &[u8]) -> IoResult<Vec<u8>> {
+    pub fn removexattr(&mut self, req: &Request, inode: Inode, key: &[u8]) -> BkfsResult<Vec<u8>> {
         let value = self.mutate_inode(inode, |handler, inode| {
             let attrs = &mut inode.attrs;
             attrs.xattr_access_check(key, libc::W_OK, req)?;
@@ -814,9 +803,9 @@ impl Handler {
         match value {
             Some(v) => Ok(v),
             #[cfg(target_os = "linux")]
-            None => IoResult::errno_notrace(libc::ENODATA),
+            None => BkfsResult::errno_notrace(libc::ENODATA),
             #[cfg(not(target_os = "linux"))]
-            None => IoResult::errno_notrace(libc::ENOATTR),
+            None => BkfsResult::errno_notrace(libc::ENOATTR),
         }
     }
 
@@ -828,7 +817,7 @@ impl Handler {
         mode: u32,
         umask: u32,
         flags: i32,
-    ) -> IoResult<(InodeAttributes, FileHandleId)> {
+    ) -> BkfsResult<(InodeAttributes, FileHandleId)> {
         let attrs = self.mknod(
             req,
             parent,
@@ -853,9 +842,9 @@ impl Handler {
         dest_offset: u64,
         size: usize,
         flags: u32,
-    ) -> IoResult<usize> {
+    ) -> BkfsResult<usize> {
         if flags != 0 {
-            return IoResult::errno(libc::EINVAL);
+            return BkfsResult::errno(libc::EINVAL);
         }
         let bytes = self.read(req, src_inode, src_fh, src_offset, size, 0, None)?;
         self.write(req, dest_inode, dest_fh, dest_offset, &bytes, 0, 0, None)
@@ -869,13 +858,13 @@ impl Handler {
         offset: u64,
         length: u64,
         mode: i32,
-    ) -> IoResult<()> {
+    ) -> BkfsResult<()> {
         let fh = self
             .handle(fh)
             .ok_or(libc::EBADF)
             .map_err(io::Error::from_raw_os_error)?;
         if !fh.write {
-            return IoResult::errno(libc::EACCES);
+            return BkfsResult::errno(libc::EACCES);
         }
 
         let mut contents = fh.contents.borrow_mut();

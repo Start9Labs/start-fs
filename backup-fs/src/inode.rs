@@ -13,7 +13,7 @@ use crate::atomic_file::AtomicFile;
 use crate::contents::EncryptedFile;
 use crate::ctrl::{Controller, Exists, Load, Save};
 use crate::directory::DirectoryContents;
-use crate::error::{IoError, IoResult, IoResultExt};
+use crate::error::{BkfsError, BkfsResult, BkfsResultExt};
 use crate::get_groups;
 use crate::handle::{FileHandleId, Handler};
 use crate::serde::{load, save};
@@ -115,9 +115,9 @@ impl InodeAttributes {
         }
     }
 
-    pub fn lookup(&self, name: &OsStr) -> IoResult<Inode> {
+    pub fn lookup(&self, name: &OsStr) -> BkfsResult<Inode> {
         let FileData::Directory(dir) = &self.attrs.contents else {
-            return IoResult::errno(libc::ENOTDIR);
+            return BkfsResult::errno(libc::ENOTDIR);
         };
 
         if name == OsStr::new(".") {
@@ -133,7 +133,7 @@ impl InodeAttributes {
 
         match dir.get(name) {
             Some(inode) => Ok(inode.inode),
-            None => IoResult::errno_notrace(libc::ENOENT),
+            None => BkfsResult::errno_notrace(libc::ENOENT),
         }
     }
 }
@@ -187,10 +187,10 @@ impl From<&InodeAttributes> for fuser::FileAttr {
     }
 }
 
-fn parse_xattr_namespace(key: &[u8]) -> IoResult<XattrNamespace> {
+fn parse_xattr_namespace(key: &[u8]) -> BkfsResult<XattrNamespace> {
     let user = b"user.";
     if key.len() < user.len() {
-        return IoResult::errno(libc::ENOTSUP);
+        return BkfsResult::errno(libc::ENOTSUP);
     }
     if key[..user.len()].eq(user) {
         return Ok(XattrNamespace::User);
@@ -198,7 +198,7 @@ fn parse_xattr_namespace(key: &[u8]) -> IoResult<XattrNamespace> {
 
     let system = b"system.";
     if key.len() < system.len() {
-        return IoResult::errno(libc::ENOTSUP);
+        return BkfsResult::errno(libc::ENOTSUP);
     }
     if key[..system.len()].eq(system) {
         return Ok(XattrNamespace::System);
@@ -206,7 +206,7 @@ fn parse_xattr_namespace(key: &[u8]) -> IoResult<XattrNamespace> {
 
     let trusted = b"trusted.";
     if key.len() < trusted.len() {
-        return IoResult::errno(libc::ENOTSUP);
+        return BkfsResult::errno(libc::ENOTSUP);
     }
     if key[..trusted.len()].eq(trusted) {
         return Ok(XattrNamespace::Trusted);
@@ -214,17 +214,17 @@ fn parse_xattr_namespace(key: &[u8]) -> IoResult<XattrNamespace> {
 
     let security = b"security";
     if key.len() < security.len() {
-        return IoResult::errno(libc::ENOTSUP);
+        return BkfsResult::errno(libc::ENOTSUP);
     }
     if key[..security.len()].eq(security) {
         return Ok(XattrNamespace::Security);
     }
 
-    return IoResult::errno(libc::ENOTSUP);
+    return BkfsResult::errno(libc::ENOTSUP);
 }
 
 impl<'a> Save for &'a InodeAttributes {
-    fn save(self, ctrl: &Controller) -> IoResult<()> {
+    fn save(self, ctrl: &Controller) -> BkfsResult<()> {
         save(
             &self.attrs,
             EncryptedFile::create(AtomicFile::create(ctrl.inode_path(self.inode))?, ctrl.key())?,
@@ -234,7 +234,7 @@ impl<'a> Save for &'a InodeAttributes {
 
 impl Load for InodeAttributes {
     type Args<'a> = Inode;
-    fn load(ctrl: &Controller, inode: Self::Args<'_>) -> IoResult<Self> {
+    fn load(ctrl: &Controller, inode: Self::Args<'_>) -> BkfsResult<Self> {
         Ok(InodeAttributes {
             inode,
             attrs: load(EncryptedFile::open(
@@ -269,7 +269,7 @@ impl Attributes {
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
         _flags: Option<u32>,
-    ) -> IoResult<bool> {
+    ) -> BkfsResult<bool> {
         let mut changed = false;
         let mut now_cell = None;
         let mut lazy_now = || *now_cell.get_or_insert(time_now());
@@ -277,7 +277,7 @@ impl Attributes {
         if let Some(mode) = mode {
             debug!("chmod() called with {:?}, {:o}", inode, mode);
             if req.uid() != 0 && req.uid() != self.uid {
-                return IoResult::errno(libc::EPERM);
+                return BkfsResult::errno(libc::EPERM);
             }
             if req.uid() != 0 && req.gid() != self.gid && !get_groups(req.pid()).contains(&self.gid)
             {
@@ -295,7 +295,7 @@ impl Attributes {
             if let Some(gid) = gid {
                 // Non-root users can only change gid to a group they're in
                 if req.uid() != 0 && !get_groups(req.pid()).contains(&gid) {
-                    return IoResult::errno(libc::EPERM);
+                    return BkfsResult::errno(libc::EPERM);
                 }
             }
             if let Some(uid) = uid {
@@ -303,12 +303,12 @@ impl Attributes {
                         // but no-op changes by the owner are not an error
                         && !(uid == self.uid && req.uid() == self.uid)
                 {
-                    return IoResult::errno(libc::EPERM);
+                    return BkfsResult::errno(libc::EPERM);
                 }
             }
             // Only owner may change the group
             if gid.is_some() && req.uid() != 0 && req.uid() != self.uid {
-                return IoResult::errno(libc::EPERM);
+                return BkfsResult::errno(libc::EPERM);
             }
 
             if self.mode & (libc::S_IXUSR | libc::S_IXGRP | libc::S_IXOTH) as u16 != 0 {
@@ -344,7 +344,7 @@ impl Attributes {
                     .map_err(io::Error::from_raw_os_error)?
                     .write
                 {
-                    return IoResult::errno(libc::EACCES);
+                    return BkfsResult::errno(libc::EACCES);
                 }
             } else {
                 self.check_access(req.uid(), req.gid(), libc::W_OK)?;
@@ -357,7 +357,7 @@ impl Attributes {
             debug!("utimens() called with {:?}, atime={:?}", inode, atime);
 
             if self.uid != req.uid() && req.uid() != 0 && atime != TimeOrNow::Now {
-                return IoResult::errno(libc::EPERM);
+                return BkfsResult::errno(libc::EPERM);
             }
 
             if self.uid != req.uid() {
@@ -375,7 +375,7 @@ impl Attributes {
             debug!("utimens() called with {:?}, mtime={:?}", inode, mtime);
 
             if self.uid != req.uid() && req.uid() != 0 && mtime != TimeOrNow::Now {
-                return IoResult::errno(libc::EPERM);
+                return BkfsResult::errno(libc::EPERM);
             }
 
             if self.uid != req.uid() {
@@ -393,7 +393,7 @@ impl Attributes {
             debug!("utimens() called with {:?}, ctime={:?}", inode, ctime);
 
             if self.uid != req.uid() && req.uid() != 0 {
-                return IoResult::errno(libc::EPERM);
+                return BkfsResult::errno(libc::EPERM);
             }
 
             self.ctime = time_from_system_time(&ctime);
@@ -404,7 +404,7 @@ impl Attributes {
             debug!("utimens() called with {:?}, crtime={:?}", inode, crtime);
 
             if self.uid != req.uid() && req.uid() != 0 {
-                return IoResult::errno(libc::EPERM);
+                return BkfsResult::errno(libc::EPERM);
             }
 
             self.crtime = time_from_system_time(&crtime);
@@ -418,7 +418,7 @@ impl Attributes {
         Ok(changed)
     }
 
-    pub fn check_access(&self, uid: u32, gid: u32, mut access_mask: i32) -> IoResult<()> {
+    pub fn check_access(&self, uid: u32, gid: u32, mut access_mask: i32) -> BkfsResult<()> {
         // F_OK tests for existence of file
         if access_mask == libc::F_OK {
             return Ok(());
@@ -435,7 +435,7 @@ impl Attributes {
             return if access_mask == 0 {
                 Ok(())
             } else {
-                IoResult::errno(libc::EACCES)
+                BkfsResult::errno(libc::EACCES)
             };
         }
 
@@ -450,14 +450,14 @@ impl Attributes {
         if access_mask == 0 {
             Ok(())
         } else {
-            IoResult::errno(libc::EACCES)
+            BkfsResult::errno(libc::EACCES)
         }
     }
 
-    pub fn check_sticky(&self, child: &Self, uid: u32) -> IoResult<()> {
+    pub fn check_sticky(&self, child: &Self, uid: u32) -> BkfsResult<()> {
         if self.mode & libc::S_ISVTX as u16 != 0 && uid != 0 && uid != self.uid && uid != child.uid
         {
-            IoResult::errno(libc::EACCES)
+            BkfsResult::errno(libc::EACCES)
         } else {
             Ok(())
         }
@@ -484,16 +484,16 @@ impl Attributes {
         key: &[u8],
         access_mask: i32,
         request: &Request<'_>,
-    ) -> IoResult<()> {
+    ) -> BkfsResult<()> {
         match parse_xattr_namespace(key)? {
             XattrNamespace::Security => {
                 if access_mask != libc::R_OK && request.uid() != 0 {
-                    return IoResult::errno(libc::EPERM);
+                    return BkfsResult::errno(libc::EPERM);
                 }
             }
             XattrNamespace::Trusted => {
                 if request.uid() != 0 {
-                    return IoResult::errno(libc::EPERM);
+                    return BkfsResult::errno(libc::EPERM);
                 }
             }
             XattrNamespace::System => {
@@ -501,7 +501,7 @@ impl Attributes {
                     self.check_access(request.uid(), request.gid(), access_mask)
                         .map_err(|_| io::Error::from_raw_os_error(libc::EPERM))?;
                 } else if request.uid() != 0 {
-                    return IoResult::errno(libc::EPERM);
+                    return BkfsResult::errno(libc::EPERM);
                 }
             }
             XattrNamespace::User => {

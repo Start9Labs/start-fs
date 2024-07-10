@@ -18,7 +18,7 @@ use smallvec::SmallVec;
 
 use crate::atomic_file::AtomicFile;
 use crate::ctrl::Controller;
-use crate::error::{IoResult, IoResultExt};
+use crate::error::{BkfsResult, BkfsResultExt};
 use crate::handle::Handler;
 use crate::inode::{time_now, ContentId, FileData, Inode, InodeAttributes};
 use crate::util::RandReader;
@@ -29,7 +29,7 @@ pub struct EncryptedFile<F: Read + Write + Seek + FileExt = File> {
     cipher: ChaCha20,
 }
 impl<F: Read + Write + Seek + FileExt> EncryptedFile<F> {
-    pub fn open(mut file: F, key: &Key) -> IoResult<Self> {
+    pub fn open(mut file: F, key: &Key) -> BkfsResult<Self> {
         let mut iv = Iv::<ChaCha20>::default();
         file.read_exact(iv.as_mut_slice())?;
         let cipher = ChaCha20::new(key, &iv);
@@ -39,7 +39,7 @@ impl<F: Read + Write + Seek + FileExt> EncryptedFile<F> {
             cipher,
         })
     }
-    pub fn create(mut file: F, key: &Key) -> IoResult<Self> {
+    pub fn create(mut file: F, key: &Key) -> BkfsResult<Self> {
         let mut iv = Iv::<ChaCha20>::default();
         rand::thread_rng().fill_bytes(iv.as_mut_slice());
         file.write_all(iv.as_slice())?;
@@ -50,7 +50,7 @@ impl<F: Read + Write + Seek + FileExt> EncryptedFile<F> {
             cipher,
         })
     }
-    pub fn open_pbkdf2(mut file: F, password: &str) -> IoResult<Self> {
+    pub fn open_pbkdf2(mut file: F, password: &str) -> BkfsResult<Self> {
         let mut iv = Iv::<ChaCha20>::default();
         file.read_exact(iv.as_mut_slice())?;
         let mut key = Key::default();
@@ -68,7 +68,7 @@ impl<F: Read + Write + Seek + FileExt> EncryptedFile<F> {
             cipher,
         })
     }
-    pub fn create_pbkdf2(mut file: F, password: &str) -> IoResult<Self> {
+    pub fn create_pbkdf2(mut file: F, password: &str) -> BkfsResult<Self> {
         let mut iv = Iv::<ChaCha20>::default();
         rand::thread_rng().fill_bytes(iv.as_mut_slice());
         let mut key = Key::default();
@@ -87,7 +87,7 @@ impl<F: Read + Write + Seek + FileExt> EncryptedFile<F> {
             cipher,
         })
     }
-    pub fn read_exact_at(&mut self, mut buf: &mut [u8], mut offset: u64) -> IoResult<()> {
+    pub fn read_exact_at(&mut self, mut buf: &mut [u8], mut offset: u64) -> BkfsResult<()> {
         while !buf.is_empty() {
             let len = match self.file.read_at(buf, offset + self.offset) {
                 Ok(n) => n,
@@ -108,7 +108,7 @@ impl<F: Read + Write + Seek + FileExt> EncryptedFile<F> {
 
         Ok(())
     }
-    pub fn write_all_at(&mut self, buf: &mut [u8], offset: u64) -> IoResult<()> {
+    pub fn write_all_at(&mut self, buf: &mut [u8], offset: u64) -> BkfsResult<()> {
         self.cipher.seek(offset);
         self.cipher.apply_keystream(buf);
         self.file.seek(SeekFrom::Start(offset + self.offset))?;
@@ -117,7 +117,7 @@ impl<F: Read + Write + Seek + FileExt> EncryptedFile<F> {
     }
 }
 impl EncryptedFile<AtomicFile> {
-    pub fn save(self) -> IoResult<()> {
+    pub fn save(self) -> BkfsResult<()> {
         self.file.save()
     }
 }
@@ -158,7 +158,7 @@ pub struct MergedFile {
     written: BTreeMap<u64, u64>, // position, len
 }
 impl MergedFile {
-    fn new(src: EncryptedFile, dst: PathBuf, key: &Key) -> IoResult<Self> {
+    fn new(src: EncryptedFile, dst: PathBuf, key: &Key) -> BkfsResult<Self> {
         let dst = EncryptedFile::create(
             AtomicFile::new(
                 dst,
@@ -247,7 +247,7 @@ impl MergedFile {
             self.written.remove(&p);
         }
     }
-    fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> IoResult<()> {
+    fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> BkfsResult<()> {
         let (src, dst) = self.read_ranges(offset, buf.len() as u64);
         for range in src {
             let buf_range = ((range.start - offset) as usize)..((range.end - offset) as usize);
@@ -259,12 +259,12 @@ impl MergedFile {
         }
         Ok(())
     }
-    fn write_all_at(&mut self, buf: &mut [u8], offset: u64) -> IoResult<()> {
+    fn write_all_at(&mut self, buf: &mut [u8], offset: u64) -> BkfsResult<()> {
         self.dst.write_all_at(buf, offset)?;
         self.add_written(offset, buf.len() as u64);
         Ok(())
     }
-    fn save(mut self, size: u64) -> IoResult<()> {
+    fn save(mut self, size: u64) -> BkfsResult<()> {
         let mut remaining = size;
         let mut start = 0_u64;
         let mut len;
@@ -310,12 +310,12 @@ pub struct Contents {
     ctrl: Controller,
 }
 impl Contents {
-    pub fn open(ctrl: Controller, inode: Inode) -> IoResult<Self> {
+    pub fn open(ctrl: Controller, inode: Inode) -> BkfsResult<Self> {
         let inode: InodeAttributes = ctrl.load(inode)?;
         let content_id = match &inode.attrs.contents {
             FileData::File(a) => *a,
-            FileData::Directory(_) => return IoResult::errno(libc::EISDIR),
-            FileData::Symlink(_) => return IoResult::errno(libc::EINVAL),
+            FileData::Directory(_) => return BkfsResult::errno(libc::EISDIR),
+            FileData::Symlink(_) => return BkfsResult::errno(libc::EINVAL),
         };
         Ok(Self {
             inode,
@@ -325,7 +325,7 @@ impl Contents {
             ctrl,
         })
     }
-    pub fn readable(&mut self) -> IoResult<&mut Self> {
+    pub fn readable(&mut self) -> BkfsResult<&mut Self> {
         if self.file.is_none() {
             let path = self.ctrl.contents_path(self.content_id);
             if !path.exists() {
@@ -343,7 +343,7 @@ impl Contents {
         }
         Ok(self)
     }
-    pub fn writable(&mut self) -> IoResult<&mut Self> {
+    pub fn writable(&mut self) -> BkfsResult<&mut Self> {
         self.ctrl.check_rw()?;
         if self.file.as_ref().map_or(false, |f| f.is_ok()) {
             return Ok(self);
@@ -359,7 +359,7 @@ impl Contents {
             Ok(self)
         }
     }
-    pub fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> IoResult<()> {
+    pub fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> BkfsResult<()> {
         if offset + buf.len() as u64 > self.inode.attrs.size {
             return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
         }
@@ -376,7 +376,7 @@ impl Contents {
         self.changed = true;
         Ok(())
     }
-    pub fn write_all_at(&mut self, buf: &mut [u8], offset: u64) -> IoResult<()> {
+    pub fn write_all_at(&mut self, buf: &mut [u8], offset: u64) -> BkfsResult<()> {
         let this = self.writable()?;
         let file = this
             .file
@@ -399,7 +399,7 @@ impl Contents {
         length: u64,
         mode: i32,
         keep_size: bool,
-    ) -> IoResult<()> {
+    ) -> BkfsResult<()> {
         let this = self.writable()?;
         let file = this
             .file
@@ -422,7 +422,7 @@ impl Contents {
         }
         Ok(())
     }
-    pub fn fsync(&mut self, datasync: bool) -> IoResult<()> {
+    pub fn fsync(&mut self, datasync: bool) -> BkfsResult<()> {
         if datasync {
             if let Some(Ok(f)) = std::mem::take(&mut self.file) {
                 let size = self.ctrl.file_pad(min(
@@ -443,7 +443,7 @@ impl Contents {
     pub fn truncate(&mut self, size: u64) {
         self.inode.attrs.size = size;
     }
-    pub fn close(mut self, handler: &mut Handler) -> IoResult<()> {
+    pub fn close(mut self, handler: &mut Handler) -> BkfsResult<()> {
         self.fsync(true)?;
         handler.gc_inode(&self.inode)?;
         Ok(())

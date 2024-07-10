@@ -1,11 +1,10 @@
+use crate::error::BkfsErrorKind;
 use crate::{BackupFS, BackupFSOptions};
 use fuser::MountOption;
 use std::future::Future;
 use std::path::PathBuf;
-use std::process::Command;
 use std::{fs, io, path::Path};
 use tempdir::TempDir;
-use tokio::runtime::Runtime;
 use tokio::task::JoinSet;
 
 fn with_backupfs(
@@ -198,7 +197,7 @@ fn checksum() {
     });
     match res {
         Ok(_) => panic!(),
-        Err(err) => assert_eq!(&err.inner.to_string(), "checksum validation failed"),
+        Err(err) => assert!(matches!(&err.kind, BkfsErrorKind::BadChecksum)),
     }
 }
 

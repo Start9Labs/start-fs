@@ -14,7 +14,7 @@ use rand::Rng;
 use crate::atomic_file::AtomicFile;
 use crate::contents::EncryptedFile;
 use crate::directory::{DirectoryContents, DirectoryEntry};
-use crate::error::{IoError, IoResult, IoResultExt};
+use crate::error::{BkfsError, BkfsResult, BkfsResultExt};
 use crate::inode::{ContentId, FileData, Inode, InodeAttributes};
 use crate::serde::{load, save};
 use crate::util::IdPool;
@@ -57,13 +57,13 @@ fn encrypted_u64(cipher: &RefCell<ChaCha20>, num: u64) -> [u16; 5] {
 }
 
 impl Controller {
-    pub fn new(config: BackupFSOptions) -> IoResult<Self> {
+    pub fn new(config: BackupFSOptions) -> BkfsResult<Self> {
         let cryptinfo_path = config.data_dir.join("cryptinfo");
         let cryptinfo = if cryptinfo_path.exists() {
             CryptInfo::load(&cryptinfo_path, &config.password)?
         } else {
             if config.readonly {
-                return IoResult::errno_notrace(libc::EROFS);
+                return BkfsResult::errno_notrace(libc::EROFS);
             }
             let cryptinfo = CryptInfo::new();
             cryptinfo.save(cryptinfo_path.clone(), &config.password)?;
@@ -86,10 +86,10 @@ impl Controller {
         })))
     }
 
-    pub fn load_inode_pool(&self) -> IoResult<()> {
+    pub fn load_inode_pool(&self) -> BkfsResult<()> {
         if self.0.inode_pool_path.exists() {
             match File::open(&self.0.inode_pool_path)
-                .map_err(IoError::from)
+                .map_err(BkfsError::from)
                 .and_then(|f| EncryptedFile::open(f, &self.key()))
                 .and_then(load)
             {
@@ -107,7 +107,7 @@ impl Controller {
         Ok(())
     }
 
-    pub fn fsck(&self, find_orphans: bool) -> IoResult<()> {
+    pub fn fsck(&self, find_orphans: bool) -> BkfsResult<()> {
         self.0.inode_pool.replace(IdPool::new());
         self.fsck_inode(Inode(FUSE_ROOT_ID), None)?;
         if find_orphans {
@@ -120,7 +120,7 @@ impl Controller {
         &self,
         inode: Inode,
         parent: Option<(&(Inode, OsString), &DirectoryEntry)>,
-    ) -> IoResult<bool> {
+    ) -> BkfsResult<bool> {
         let mut prune = false;
         let mut changed = false;
         self.0.inode_pool.borrow_mut().remove(inode.0);
@@ -180,21 +180,21 @@ impl Controller {
         Ok(prune)
     }
 
-    fn find_orphans(&self) -> IoResult<()> {
+    fn find_orphans(&self) -> BkfsResult<()> {
         // TODO
         Ok(())
     }
 
-    pub fn change_password(&self, password: &str) -> IoResult<()> {
+    pub fn change_password(&self, password: &str) -> BkfsResult<()> {
         self.check_rw()?;
         self.0
             .cryptinfo
             .save(self.0.cryptinfo_path.clone(), password)
     }
 
-    pub fn check_rw(&self) -> IoResult<()> {
+    pub fn check_rw(&self) -> BkfsResult<()> {
         if self.0.config.readonly {
-            IoResult::errno_notrace(libc::EROFS)
+            BkfsResult::errno_notrace(libc::EROFS)
         } else {
             Ok(())
         }
@@ -214,7 +214,7 @@ impl Controller {
             .join(format!("{a:04x}/{b:04x}/{c:04x}/{d:04x}/{e:02x}"))
     }
 
-    pub fn next_inode(&self) -> IoResult<Inode> {
+    pub fn next_inode(&self) -> BkfsResult<Inode> {
         self.check_rw()?;
         let mut pool = self.0.inode_pool.borrow_mut();
         let res: u64 = pool
@@ -250,12 +250,12 @@ impl Controller {
         &self.0.config
     }
 
-    pub fn save<T: Save>(&self, item: T) -> IoResult<()> {
+    pub fn save<T: Save>(&self, item: T) -> BkfsResult<()> {
         self.check_rw()?;
         item.save(self)
     }
 
-    pub fn load<T: Load>(&self, args: T::Args<'_>) -> IoResult<T> {
+    pub fn load<T: Load>(&self, args: T::Args<'_>) -> BkfsResult<T> {
         T::load(self, args)
     }
 
@@ -265,12 +265,12 @@ impl Controller {
 }
 
 pub trait Save {
-    fn save(self, ctrl: &Controller) -> IoResult<()>;
+    fn save(self, ctrl: &Controller) -> BkfsResult<()>;
 }
 
 pub trait Load: Sized {
     type Args<'a>;
-    fn load(ctrl: &Controller, args: Self::Args<'_>) -> IoResult<Self>;
+    fn load(ctrl: &Controller, args: Self::Args<'_>) -> BkfsResult<Self>;
 }
 
 pub trait Exists: Load {

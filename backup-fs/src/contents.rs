@@ -1,3 +1,4 @@
+use std::backtrace::Backtrace;
 use std::cmp::{max, min};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -18,7 +19,7 @@ use smallvec::SmallVec;
 
 use crate::atomic_file::AtomicFile;
 use crate::ctrl::Controller;
-use crate::error::{BkfsResult, BkfsResultExt};
+use crate::error::{BkfsError, BkfsResult, BkfsResultExt};
 use crate::handle::Handler;
 use crate::inode::{time_now, ContentId, FileData, Inode, InodeAttributes};
 use crate::util::RandReader;
@@ -60,7 +61,10 @@ impl<F: Read + Write + Seek + FileExt> EncryptedFile<F> {
             600_000,
             key.as_mut_slice(),
         )
-        .map_err(io::Error::other)?;
+        .map_err(|_| BkfsError {
+            kind: crate::error::BkfsErrorKind::BadCrypt,
+            backtrace: Some(Box::new(Backtrace::capture())),
+        })?;
         let cipher = ChaCha20::new(&key, &iv);
         Ok(Self {
             file,
@@ -78,7 +82,10 @@ impl<F: Read + Write + Seek + FileExt> EncryptedFile<F> {
             600_000,
             key.as_mut_slice(),
         )
-        .map_err(io::Error::other)?;
+        .map_err(|_| BkfsError {
+            kind: crate::error::BkfsErrorKind::BadCrypt,
+            backtrace: Some(Box::new(Backtrace::capture())),
+        })?;
         file.write_all(iv.as_slice())?;
         let cipher = ChaCha20::new(&key, &iv);
         Ok(Self {

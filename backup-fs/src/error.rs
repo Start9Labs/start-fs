@@ -13,6 +13,8 @@ pub fn to_libc_err(e: &io::Error) -> c_int {
 pub enum BkfsErrorKind {
     Io(io::Error),
     BadChecksum,
+    BadCrypt,
+    Bincode(bincode::Error),
     Multiple(Vec<BkfsErrorKind>),
 }
 
@@ -21,6 +23,8 @@ impl Display for BkfsErrorKind {
         match &self {
             BkfsErrorKind::Io(err) => <io::Error as Display>::fmt(err, f),
             BkfsErrorKind::BadChecksum => write!(f, "bad checksum"),
+            BkfsErrorKind::BadCrypt => write!(f, "bad crypt"),
+            BkfsErrorKind::Bincode(err) => <bincode::Error as Display>::fmt(err, f),
             BkfsErrorKind::Multiple(errs) => {
                 for err in errs {
                     <BkfsErrorKind as Display>::fmt(err, f)?;
@@ -55,10 +59,13 @@ impl BkfsError {
 
     pub fn to_errno_log(&self) -> c_int {
         let no = self.to_errno();
-        if no == libc::ENOENT {
-            debug!("{self:?}");
-        } else {
-            warn!("{self:?}");
+        match &self.kind {
+            BkfsErrorKind::Io(io) if io.raw_os_error().is_some() => {
+                debug!("{self:?}");
+            }
+            _ => {
+                warn!("{self:?}");
+            }
         }
         no
     }
@@ -66,8 +73,7 @@ impl BkfsError {
     pub fn to_errno(&self) -> c_int {
         match &self.kind {
             BkfsErrorKind::Io(err) => to_libc_err(err),
-            BkfsErrorKind::BadChecksum => libc::EIO,
-            BkfsErrorKind::Multiple(_) => todo!(),
+            _ => libc::EIO,
         }
     }
 
@@ -103,6 +109,8 @@ impl std::error::Error for BkfsError {
         match &self.kind {
             BkfsErrorKind::Io(err) => Some(err),
             BkfsErrorKind::BadChecksum => None,
+            BkfsErrorKind::BadCrypt => None,
+            BkfsErrorKind::Bincode(err) => Some(err),
             BkfsErrorKind::Multiple(_) => None,
         }
     }
@@ -112,6 +120,16 @@ impl From<io::Error> for BkfsError {
     #[track_caller]
     fn from(inner: io::Error) -> Self {
         Self::wrap(inner)
+    }
+}
+
+impl From<bincode::Error> for BkfsError {
+    #[track_caller]
+    fn from(inner: bincode::Error) -> Self {
+        BkfsError {
+            kind: BkfsErrorKind::Bincode(inner),
+            backtrace: None,
+        }
     }
 }
 

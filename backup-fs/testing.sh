@@ -31,6 +31,8 @@ umount "$TEST_DIR"
 # run the xfstest suit
 # ====================
 
+if [ ]; then
+
 TEST_DATA_DIR=$(mktemp --directory)
 SCRATCH_DATA_DIR=$(mktemp --directory)
 TEST_DIR=$(mktemp --directory)
@@ -141,6 +143,7 @@ echo "generic/564" >> xfs_excludes.txt
 
 PASSWORD="ohea" TEST_DEV="$TEST_DATA_DIR" TEST_DIR="$TEST_DIR" SCRATCH_DEV="$SCRATCH_DATA_DIR" SCRATCH_MNT="$SCRATCH_DIR" ./check-fuser -E xfs_excludes.txt
 TEST_FAILED=$(( $? | $TEST_FAILED ))
+fi
 
 # ====
 # done

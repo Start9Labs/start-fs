@@ -375,7 +375,6 @@ impl Handler {
 
         self.mutate_inode(entry.inode, |handler, inode| {
             if let FileData::Directory(dir) = &inode.attrs.contents {
-                dbg!(inode.attrs.parents.len(), &dir);
                 if inode.attrs.parents.len() <= 1 && !dir.is_empty() {
                     return IoResult::errno(libc::ENOTEMPTY);
                 }
@@ -402,14 +401,17 @@ impl Handler {
         new_name: &OsStr,
         overwrite: Option<OverwriteOptions>,
     ) -> IoResult<InodeAttributes> {
+        use imbl::ordmap::Entry::*;
         self.mutate_inode(inode, |handler, inode| {
             let mut ancestor_queue = vec![new_parent];
             while let Some(ancestor) = ancestor_queue.pop() {
                 if ancestor == inode.inode {
+                    // libc seems to check for this case internally, but we should be safe
+                    warn!("tried to create a loop");
                     return IoResult::errno(libc::EINVAL);
                 }
-                handler.peek_inode(ancestor, |inode| {
-                    ancestor_queue.extend(inode.attrs.parents.iter().map(|pair| pair.0));
+                handler.peek_inode(ancestor, |ancestor_inode| {
+                    ancestor_queue.extend(ancestor_inode.attrs.parents.iter().map(|pair| pair.0));
                     Ok(())
                 })?;
             }
@@ -420,30 +422,42 @@ impl Handler {
                 .attrs
                 .check_access(req.uid(), req.gid(), libc::W_OK)?;
 
+            let sticky_res = new_parent.attrs.check_sticky(&inode.attrs, req.uid());
             let FileData::Directory(dir) = &mut new_parent.attrs.contents else {
                 return IoResult::errno(libc::ENOTDIR);
             };
 
-            if let Some(inode) = dir.insert(
-                new_name.to_owned(),
-                DirectoryEntry {
-                    inode: inode.inode,
-                    ty: (&inode.attrs.contents).into(),
-                },
-            ) {
-                if let Some(overwrite) = overwrite {
-                    handler.mutate_inode(inode.inode, |handler, inode| {
-                        inode
+            let new_entry = DirectoryEntry {
+                inode: inode.inode,
+                ty: (&inode.attrs.contents).into(),
+            };
+            let entry = dir.entry(new_name.to_owned());
+            match (entry, overwrite) {
+                (Occupied(_), None) => return IoResult::errno(libc::EEXIST),
+                (Occupied(mut prev_entry), Some(overwrite)) => {
+                    handler.mutate_inode(prev_entry.get().inode, |handler, prev_inode| {
+                        if let FileData::Directory(dir) = &prev_inode.attrs.contents {
+                            if prev_inode.attrs.parents.len() <= 1 && !dir.is_empty() {
+                                return IoResult::errno(libc::ENOTEMPTY);
+                            }
+                        }
+
+                        sticky_res?;
+
+                        prev_inode
                             .attrs
                             .parents
                             .remove(&(new_parent.inode, new_name.to_owned()));
-                        if !overwrite.gc || !handler.gc_inode(inode)? {
-                            handler.ctrl().save(&*inode)?;
+
+                        if !overwrite.gc || !handler.gc_inode(prev_inode)? {
+                            handler.ctrl().save(&*prev_inode)?;
                         }
                         Ok(())
                     })?;
-                } else {
-                    return IoResult::errno(libc::EEXIST);
+                    *prev_entry.get_mut() = new_entry;
+                }
+                (Vacant(e), _) => {
+                    e.insert(new_entry);
                 }
             }
 
@@ -484,6 +498,8 @@ impl Handler {
                 .check_access(req.uid(), req.gid(), libc::W_OK)?;
 
             if new_parent.inode == parent.inode && name == new_name {
+                // libc handles this case internally, but we should check
+                warn!("rename noop");
                 return Ok(());
             }
 

@@ -254,12 +254,10 @@ impl Filesystem for BackupFS {
         umask: u32,
         reply: ReplyEntry,
     ) {
-        debug!("mkdir() called with {:?} {:?} {:o}", parent, name, mode);
         self.mknod(req, parent, name, mode | libc::S_IFDIR, umask, 0, reply)
     }
 
     fn unlink(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        debug!("unlink() called with {:?} {:?}", parent, name);
         match self.handler.unlink(req, Inode(parent), name) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e.to_errno_log()),
@@ -267,7 +265,6 @@ impl Filesystem for BackupFS {
     }
 
     fn rmdir(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        debug!("rmdir() called with {:?} {:?}", parent, name);
         match self.handler.unlink(req, Inode(parent), name) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e.to_errno_log()),
@@ -282,16 +279,12 @@ impl Filesystem for BackupFS {
         target: &Path,
         reply: ReplyEntry,
     ) {
-        debug!(
-            "symlink() called with {:?} {:?} {:?}",
-            parent, link_name, target
-        );
         match self.handler.mknod(
             req,
             Inode(parent),
             link_name,
-            libc::S_IFLNK,
-            0o777,
+            libc::S_IFLNK | 0o777,
+            0,
             0,
             Some(|_| FileData::Symlink(target.to_owned())),
         ) {
@@ -397,7 +390,6 @@ impl Filesystem for BackupFS {
         lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        //debug!("write() called with {:?} size={:?}", inode, data.len());
         if offset < 0 {
             reply.error(libc::EINVAL);
             return;
@@ -470,7 +462,6 @@ impl Filesystem for BackupFS {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        debug!("readdir() called with {:?}", inode);
         if offset < 0 {
             reply.error(libc::EINVAL);
             return;
@@ -500,7 +491,6 @@ impl Filesystem for BackupFS {
         offset: i64,
         mut reply: ReplyDirectoryPlus,
     ) {
-        debug!("readdirplus() called with {:?}", inode);
         if offset < 0 {
             reply.error(libc::EINVAL);
             return;
@@ -649,7 +639,6 @@ impl Filesystem for BackupFS {
     }
 
     fn access(&mut self, req: &Request, inode: u64, mask: i32, reply: ReplyEmpty) {
-        debug!("access() called with {:?} {:?}", inode, mask);
         match self
             .handler
             .ctrl()
@@ -671,10 +660,6 @@ impl Filesystem for BackupFS {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        debug!(
-            "create() called with {:?} {:?} mode={:?} umask={:?}",
-            parent, name, mode, umask
-        );
         match self
             .handler
             .create(req, Inode(parent), name, mode, umask, flags)
@@ -697,7 +682,6 @@ impl Filesystem for BackupFS {
         mode: i32,
         reply: ReplyEmpty,
     ) {
-        debug!("fallocate() called with {:?} length={:?}", inode, length);
         if offset < 0 || length < 0 {
             reply.error(libc::EINVAL);
             return;
@@ -728,10 +712,6 @@ impl Filesystem for BackupFS {
         flags: u32,
         reply: ReplyWrite,
     ) {
-        debug!(
-            "copy_file_range() called with src ({}, {}, {}) dest ({}, {}, {}) size={}",
-            src_fh, src_inode, src_offset, dest_fh, dest_inode, dest_offset, size
-        );
         match self.handler.copy_file_range(
             req,
             Inode(src_inode),

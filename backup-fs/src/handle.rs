@@ -375,6 +375,7 @@ impl Handler {
 
         self.mutate_inode(entry.inode, |handler, inode| {
             if let FileData::Directory(dir) = &inode.attrs.contents {
+                dbg!(inode.attrs.parents.len(), &dir);
                 if inode.attrs.parents.len() <= 1 && !dir.is_empty() {
                     return IoResult::errno(libc::ENOTEMPTY);
                 }
@@ -402,6 +403,17 @@ impl Handler {
         overwrite: Option<OverwriteOptions>,
     ) -> IoResult<InodeAttributes> {
         self.mutate_inode(inode, |handler, inode| {
+            let mut ancestor_queue = vec![new_parent];
+            while let Some(ancestor) = ancestor_queue.pop() {
+                if ancestor == inode.inode {
+                    return IoResult::errno(libc::EINVAL);
+                }
+                handler.peek_inode(ancestor, |inode| {
+                    ancestor_queue.extend(inode.attrs.parents.iter().map(|pair| pair.0));
+                    Ok(())
+                })?;
+            }
+
             let mut new_parent = handler.ctrl().load::<InodeAttributes>(new_parent)?;
 
             new_parent
@@ -470,6 +482,10 @@ impl Handler {
             new_parent
                 .attrs
                 .check_access(req.uid(), req.gid(), libc::W_OK)?;
+
+            if new_parent.inode == parent.inode && name == new_name {
+                return Ok(());
+            }
 
             let new_inode = new_parent.lookup(new_name)?;
 

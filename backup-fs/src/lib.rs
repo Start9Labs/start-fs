@@ -290,7 +290,7 @@ impl Filesystem for BackupFS {
             req,
             Inode(parent),
             link_name,
-            0o777,
+            libc::S_IFLNK,
             0o777,
             0,
             Some(|_| FileData::Symlink(target.to_owned())),

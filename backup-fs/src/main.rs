@@ -4,7 +4,7 @@ use fuser::MountOption;
 use log::{error, info};
 use std::ffi::OsString;
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(clap::Parser)]
 struct MountOptions {
@@ -36,9 +36,10 @@ fn main() {
         .format_timestamp_nanos()
         .parse_filters(std::env::var("RUST_LOG").as_deref().unwrap_or("info"))
         .init();
-    if std::env::current_exe()
-        .ok()
+    if std::env::args()
+        .next()
         .as_deref()
+        .map(Path::new)
         .and_then(|p| p.file_name())
         .and_then(|p| p.to_str())
         == Some("mount.backup-fs")

@@ -1,6 +1,6 @@
 use fuser::ReplyEntry;
 use libc::c_int;
-use log::error;
+use log::{debug, warn};
 use std::backtrace::Backtrace;
 use std::fmt::{Debug, Display};
 use std::io;
@@ -55,8 +55,10 @@ impl BkfsError {
 
     pub fn to_errno_log(&self) -> c_int {
         let no = self.to_errno();
-        if no != libc::ENOENT {
-            error!("{self:?}");
+        if no == libc::ENOENT {
+            debug!("{self:?}");
+        } else {
+            warn!("{self:?}");
         }
         no
     }

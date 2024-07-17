@@ -545,15 +545,15 @@ impl Attributes {
                 }
             }
             XattrNamespace::System => {
-                if key.eq(b"system.posix_acl_access") {
-                    if value.is_some() {
+                if value.is_some() {
+                    if key.eq(b"system.posix_acl_access") {
                         if self.uid != request.uid() && !self.is_root_for(idmap, request.uid(), [])
                         {
                             return BkfsResult::errno(libc::EPERM);
                         }
+                    } else if request.uid() != 0 && !self.is_root_for(idmap, request.uid(), []) {
+                        return BkfsResult::errno(libc::EPERM);
                     }
-                } else if request.uid() != 0 && !self.is_root_for(idmap, request.uid(), []) {
-                    return BkfsResult::errno(libc::EPERM);
                 }
             }
             XattrNamespace::User => {

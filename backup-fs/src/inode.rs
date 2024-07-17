@@ -552,7 +552,7 @@ impl Attributes {
                             return BkfsResult::errno(libc::EPERM);
                         }
                     }
-                } else if request.uid() != 0 {
+                } else if request.uid() != 0 && !self.is_root_for(idmap, request.uid(), []) {
                     return BkfsResult::errno(libc::EPERM);
                 }
             }

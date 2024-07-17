@@ -15,9 +15,11 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
+use std::num::ParseIntError;
 use std::os::raw::c_int;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 use typenum::ToInt;
 use zeroize::Zeroizing;
@@ -26,7 +28,7 @@ use crate::atomic_file::AtomicFile;
 use crate::contents::EncryptedFile;
 use crate::ctrl::{Controller, StatFs};
 use crate::directory::DirectoryContents;
-use crate::error::BkfsResult;
+use crate::error::{BkfsError, BkfsResult};
 use crate::handle::{FileHandleId, Handler};
 use crate::inode::FileData;
 use crate::inode::BLOCK_SIZE;
@@ -47,7 +49,7 @@ mod tests;
 mod util;
 
 pub const MAX_NAME_LENGTH: u32 = 255;
-const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024 * 1024;
+// const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024 * 1024;
 pub const ENTRY_TTL: Duration = Duration::new(3600, 0);
 
 const FMODE_EXEC: i32 = 0x20;
@@ -63,6 +65,33 @@ pub struct BackupFSOptions {
     pub file_size_padding: Option<f64>,
     #[cfg_attr(feature = "cli", arg(short, long))]
     pub readonly: bool,
+    #[cfg_attr(feature = "cli", arg(long))]
+    pub idmapped_root: Vec<IdMappedRoot>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct IdMappedRoot {
+    root_uid: u32,
+    range: u32,
+}
+impl IdMappedRoot {
+    pub fn is_root_for(&self, uid: u32, uids: impl IntoIterator<Item = u32>) -> bool {
+        self.root_uid == uid
+            && uids
+                .into_iter()
+                .all(|uid| uid >= self.root_uid && uid < self.root_uid + self.range)
+    }
+}
+impl FromStr for IdMappedRoot {
+    type Err = BkfsError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (root_uid, range) = s
+            .split_once(":")
+            .map(|(uid, range)| Ok::<(u32, u32), ParseIntError>((uid.parse()?, range.parse()?)))
+            .ok_or_else(|| BkfsError::wrap(io::Error::other("invalid idmap")))?
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        Ok(Self { root_uid, range })
+    }
 }
 
 // Stores inode metadata data in "$data_dir/inodes" and file contents in "$data_dir/contents"
@@ -643,8 +672,14 @@ impl Filesystem for BackupFS {
             .handler
             .ctrl()
             .load::<InodeAttributes>(Inode(inode))
-            .and_then(|inode| inode.attrs.check_access(req.uid(), req.gid(), mask))
-        {
+            .and_then(|inode| {
+                inode.attrs.check_access(
+                    &self.handler.ctrl().config().idmapped_root,
+                    req.uid(),
+                    req.gid(),
+                    mask,
+                )
+            }) {
             Ok(_) => reply.ok(),
             Err(e) => reply.error(e.to_errno()),
         }

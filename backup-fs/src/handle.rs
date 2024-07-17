@@ -45,7 +45,7 @@ impl Handler {
         inode: Inode,
         read: bool,
         write: bool,
-        access: impl FnOnce(&InodeAttributes) -> BkfsResult<()>,
+        access: impl FnOnce(&mut Self, &InodeAttributes) -> BkfsResult<()>,
     ) -> BkfsResult<FileHandleId> {
         let contents = if let Some(contents) = self.inodes.get(&inode).and_then(Weak::upgrade) {
             contents
@@ -54,7 +54,7 @@ impl Handler {
             self.inodes.insert(inode, Rc::downgrade(&contents));
             contents
         };
-        access(&RefCell::borrow(&*contents).inode)?;
+        access(self, &RefCell::borrow(&*contents).inode)?;
         let fh = self.next_fh;
         self.next_fh.0 += 1;
         self.open_files.insert(
@@ -164,9 +164,12 @@ impl Handler {
             return BkfsResult::errno(libc::ENAMETOOLONG);
         }
         let parent = self.ctrl().load::<InodeAttributes>(parent)?;
-        parent
-            .attrs
-            .check_access(req.uid(), req.gid(), libc::X_OK)?;
+        parent.attrs.check_access(
+            &self.ctrl().config().idmapped_root,
+            req.uid(),
+            req.gid(),
+            libc::X_OK,
+        )?;
 
         let inode = parent.lookup(name)?;
         self.mutate_inode(inode, |_, inode| {
@@ -227,7 +230,12 @@ impl Handler {
     pub fn readlink(&mut self, req: &Request, inode: Inode) -> BkfsResult<PathBuf> {
         debug!("readlink() called on {:?}", inode);
         let inode = self.ctrl().load::<InodeAttributes>(inode)?;
-        inode.attrs.check_access(req.uid(), req.gid(), libc::R_OK)?;
+        inode.attrs.check_access(
+            &self.ctrl().config().idmapped_root,
+            req.uid(),
+            req.gid(),
+            libc::R_OK,
+        )?;
         let FileData::Symlink(p) = inode.attrs.contents else {
             return BkfsResult::errno(libc::EINVAL);
         };
@@ -257,9 +265,12 @@ impl Handler {
 
         let mut parent = self.ctrl().load::<InodeAttributes>(parent)?;
 
-        parent
-            .attrs
-            .check_access(req.uid(), req.gid(), libc::W_OK)?;
+        parent.attrs.check_access(
+            &self.ctrl().config().idmapped_root,
+            req.uid(),
+            req.gid(),
+            libc::W_OK,
+        )?;
 
         let gid = parent.attrs.creation_gid(req.gid());
 
@@ -350,9 +361,12 @@ impl Handler {
 
     pub fn unlink(&mut self, req: &Request, parent: Inode, name: &OsStr) -> BkfsResult<()> {
         let mut parent = self.ctrl().load::<InodeAttributes>(parent)?;
-        parent
-            .attrs
-            .check_access(req.uid(), req.gid(), libc::W_OK)?;
+        parent.attrs.check_access(
+            &self.ctrl().config().idmapped_root,
+            req.uid(),
+            req.gid(),
+            libc::W_OK,
+        )?;
 
         let FileData::Directory(dir) = &mut parent.attrs.contents else {
             return BkfsResult::errno(libc::ENOTDIR);
@@ -407,9 +421,12 @@ impl Handler {
 
             let mut new_parent = handler.ctrl().load::<InodeAttributes>(new_parent)?;
 
-            new_parent
-                .attrs
-                .check_access(req.uid(), req.gid(), libc::W_OK)?;
+            new_parent.attrs.check_access(
+                &handler.ctrl().config().idmapped_root,
+                req.uid(),
+                req.gid(),
+                libc::W_OK,
+            )?;
 
             let sticky_res = new_parent.attrs.check_sticky(&inode.attrs, req.uid());
             let FileData::Directory(dir) = &mut new_parent.attrs.contents else {
@@ -473,18 +490,24 @@ impl Handler {
     ) -> BkfsResult<()> {
         let parent = self.ctrl().load::<InodeAttributes>(parent)?;
 
-        parent
-            .attrs
-            .check_access(req.uid(), req.gid(), libc::W_OK)?;
+        parent.attrs.check_access(
+            &self.ctrl().config().idmapped_root,
+            req.uid(),
+            req.gid(),
+            libc::W_OK,
+        )?;
 
         let inode = parent.lookup(name)?;
 
         if exchange {
             let new_parent = self.ctrl().load::<InodeAttributes>(new_parent)?;
 
-            new_parent
-                .attrs
-                .check_access(req.uid(), req.gid(), libc::W_OK)?;
+            new_parent.attrs.check_access(
+                &self.ctrl().config().idmapped_root,
+                req.uid(),
+                req.gid(),
+                libc::W_OK,
+            )?;
 
             if new_parent.inode == parent.inode && name == new_name {
                 // libc handles this case internally, but we should check
@@ -544,8 +567,13 @@ impl Handler {
             }
         };
 
-        self.fopen(inode, read, write, |inode| {
-            inode.attrs.check_access(req.uid(), req.gid(), access_mask)
+        self.fopen(inode, read, write, |handler, inode| {
+            inode.attrs.check_access(
+                &handler.ctrl().config().idmapped_root,
+                req.uid(),
+                req.gid(),
+                access_mask,
+            )
         })
     }
 
@@ -642,9 +670,12 @@ impl Handler {
                 return BkfsResult::errno(libc::EINVAL);
             }
         };
-        inode
-            .attrs
-            .check_access(req.uid(), req.gid(), access_mask)?;
+        inode.attrs.check_access(
+            &self.ctrl().config().idmapped_root,
+            req.uid(),
+            req.gid(),
+            access_mask,
+        )?;
         let fh = self.next_fh;
         self.next_fh.0 += 1;
         self.open_dirs.insert(
@@ -756,7 +787,12 @@ impl Handler {
     ) -> BkfsResult<()> {
         self.mutate_inode(inode, |handler, inode| {
             let attrs = &mut inode.attrs;
-            attrs.xattr_access_check(key, libc::W_OK, req)?;
+            attrs.xattr_access_check(
+                &handler.ctrl().config().idmapped_root,
+                key,
+                Some(Some(value)),
+                req,
+            )?;
             attrs.xattrs.insert(key.to_vec(), value.to_vec());
             attrs.changed();
             handler.ctrl().save(&*inode)?;
@@ -766,7 +802,9 @@ impl Handler {
 
     pub fn getxattr(&self, req: &Request, inode: Inode, key: &[u8]) -> BkfsResult<Vec<u8>> {
         self.peek_inode(inode, |inode| {
-            inode.attrs.xattr_access_check(key, libc::R_OK, req)?;
+            inode
+                .attrs
+                .xattr_access_check(&self.ctrl().config().idmapped_root, key, None, req)?;
             match inode.attrs.xattrs.get(key) {
                 Some(v) => Ok(v.clone()),
                 #[cfg(target_os = "linux")]
@@ -786,15 +824,21 @@ impl Handler {
         let inode = self.ctrl().load::<InodeAttributes>(inode)?;
         let mut attrs = inode.attrs;
         let xattrs = std::mem::replace(&mut attrs.xattrs, Default::default());
+        let idmap = self.ctrl().config().idmapped_root.clone();
         Ok(xattrs
             .into_iter()
-            .filter(move |(key, _)| attrs.xattr_access_check(key, libc::R_OK, req).is_ok()))
+            .filter(move |(key, _)| attrs.xattr_access_check(&idmap, key, None, req).is_ok()))
     }
 
     pub fn removexattr(&mut self, req: &Request, inode: Inode, key: &[u8]) -> BkfsResult<Vec<u8>> {
         let value = self.mutate_inode(inode, |handler, inode| {
             let attrs = &mut inode.attrs;
-            attrs.xattr_access_check(key, libc::W_OK, req)?;
+            attrs.xattr_access_check(
+                &handler.ctrl().config().idmapped_root,
+                key,
+                Some(None),
+                req,
+            )?;
             let value = attrs.xattrs.remove(key);
             attrs.changed();
             handler.ctrl().save(&*inode)?;

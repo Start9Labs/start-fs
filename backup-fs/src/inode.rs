@@ -1,6 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
+use std::os::raw::c_void;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,10 +14,10 @@ use crate::atomic_file::AtomicFile;
 use crate::contents::EncryptedFile;
 use crate::ctrl::{Controller, Exists, Load, Save};
 use crate::directory::DirectoryContents;
-use crate::error::{BkfsError, BkfsResult, BkfsResultExt};
-use crate::get_groups;
+use crate::error::{BkfsResult, BkfsResultExt};
 use crate::handle::{FileHandleId, Handler};
 use crate::serde::{load, save};
+use crate::{get_groups, IdMappedRoot};
 
 pub const BLOCK_SIZE: u64 = 4096;
 
@@ -276,10 +277,14 @@ impl Attributes {
 
         if let Some(mode) = mode {
             debug!("chmod() called with {:?}, {:o}", inode, mode);
-            if req.uid() != 0 && req.uid() != self.uid {
+            if !self.is_root_for(&handler.ctrl().config().idmapped_root, req.uid(), [])
+                && req.uid() != self.uid
+            {
                 return BkfsResult::errno(libc::EPERM);
             }
-            if req.uid() != 0 && req.gid() != self.gid && !get_groups(req.pid()).contains(&self.gid)
+            if !self.is_root_for(&handler.ctrl().config().idmapped_root, req.uid(), [])
+                && req.gid() != self.gid
+                && !get_groups(req.pid()).contains(&self.gid)
             {
                 // If SGID is set and the file belongs to a group that the caller is not part of
                 // then the SGID bit is suppose to be cleared during chmod
@@ -294,21 +299,20 @@ impl Attributes {
             debug!("chown() called with {:?} {:?} {:?}", inode, uid, gid);
             if let Some(gid) = gid {
                 // Non-root users can only change gid to a group they're in
-                if req.uid() != 0 && !get_groups(req.pid()).contains(&gid) {
+                // Only owner may change the group
+                if !self.is_root_for(&handler.ctrl().config().idmapped_root, req.uid(), [gid])
+                    && (!get_groups(req.pid()).contains(&gid) || req.uid() != self.uid)
+                {
                     return BkfsResult::errno(libc::EPERM);
                 }
             }
             if let Some(uid) = uid {
-                if req.uid() != 0
+                if !self.is_root_for(&handler.ctrl().config().idmapped_root, req.uid(), [uid])
                         // but no-op changes by the owner are not an error
                         && !(uid == self.uid && req.uid() == self.uid)
                 {
                     return BkfsResult::errno(libc::EPERM);
                 }
-            }
-            // Only owner may change the group
-            if gid.is_some() && req.uid() != 0 && req.uid() != self.uid {
-                return BkfsResult::errno(libc::EPERM);
             }
 
             if self.mode & (libc::S_IXUSR | libc::S_IXGRP | libc::S_IXOTH) as u16 != 0 {
@@ -324,7 +328,7 @@ impl Attributes {
             if let Some(gid) = gid {
                 self.gid = gid;
                 // Clear SETGID unless user is root
-                if req.uid() != 0 {
+                if !self.is_root_for(&handler.ctrl().config().idmapped_root, req.uid(), []) {
                     self.mode &= !libc::S_ISGID as u16;
                 }
             }
@@ -347,7 +351,12 @@ impl Attributes {
                     return BkfsResult::errno(libc::EACCES);
                 }
             } else {
-                self.check_access(req.uid(), req.gid(), libc::W_OK)?;
+                self.check_access(
+                    &handler.ctrl().config().idmapped_root,
+                    req.uid(),
+                    req.gid(),
+                    libc::W_OK,
+                )?;
             }
             self.size = size;
             changed = true;
@@ -356,12 +365,20 @@ impl Attributes {
         if let Some(atime) = atime {
             debug!("utimens() called with {:?}, atime={:?}", inode, atime);
 
-            if self.uid != req.uid() && req.uid() != 0 && atime != TimeOrNow::Now {
+            if self.uid != req.uid()
+                && !self.is_root_for(&handler.ctrl().config().idmapped_root, req.uid(), [])
+                && atime != TimeOrNow::Now
+            {
                 return BkfsResult::errno(libc::EPERM);
             }
 
             if self.uid != req.uid() {
-                self.check_access(req.uid(), req.gid(), libc::W_OK)?;
+                self.check_access(
+                    &handler.ctrl().config().idmapped_root,
+                    req.uid(),
+                    req.gid(),
+                    libc::W_OK,
+                )?;
             }
 
             self.atime = match atime {
@@ -374,12 +391,20 @@ impl Attributes {
         if let Some(mtime) = mtime {
             debug!("utimens() called with {:?}, mtime={:?}", inode, mtime);
 
-            if self.uid != req.uid() && req.uid() != 0 && mtime != TimeOrNow::Now {
+            if self.uid != req.uid()
+                && !self.is_root_for(&handler.ctrl().config().idmapped_root, req.uid(), [])
+                && mtime != TimeOrNow::Now
+            {
                 return BkfsResult::errno(libc::EPERM);
             }
 
             if self.uid != req.uid() {
-                self.check_access(req.uid(), req.gid(), libc::W_OK)?;
+                self.check_access(
+                    &handler.ctrl().config().idmapped_root,
+                    req.uid(),
+                    req.gid(),
+                    libc::W_OK,
+                )?;
             }
 
             self.mtime = match mtime {
@@ -392,7 +417,9 @@ impl Attributes {
         if let Some(ctime) = ctime {
             debug!("utimens() called with {:?}, ctime={:?}", inode, ctime);
 
-            if self.uid != req.uid() && req.uid() != 0 {
+            if self.uid != req.uid()
+                && !self.is_root_for(&handler.ctrl().config().idmapped_root, req.uid(), [])
+            {
                 return BkfsResult::errno(libc::EPERM);
             }
 
@@ -403,7 +430,9 @@ impl Attributes {
         if let Some(crtime) = crtime {
             debug!("utimens() called with {:?}, crtime={:?}", inode, crtime);
 
-            if self.uid != req.uid() && req.uid() != 0 {
+            if self.uid != req.uid()
+                && !self.is_root_for(&handler.ctrl().config().idmapped_root, req.uid(), [])
+            {
                 return BkfsResult::errno(libc::EPERM);
             }
 
@@ -418,7 +447,25 @@ impl Attributes {
         Ok(changed)
     }
 
-    pub fn check_access(&self, uid: u32, gid: u32, mut access_mask: i32) -> BkfsResult<()> {
+    pub fn is_root_for(
+        &self,
+        idmap: &[IdMappedRoot],
+        uid: u32,
+        uids: impl IntoIterator<Item = u32> + Clone,
+    ) -> bool {
+        uid == 0
+            || idmap
+                .into_iter()
+                .any(|idmap| idmap.is_root_for(uid, [self.uid].into_iter().chain(uids.clone())))
+    }
+
+    pub fn check_access(
+        &self,
+        idmap: &[IdMappedRoot],
+        uid: u32,
+        gid: u32,
+        mut access_mask: i32,
+    ) -> BkfsResult<()> {
         // F_OK tests for existence of file
         if access_mask == libc::F_OK {
             return Ok(());
@@ -426,7 +473,7 @@ impl Attributes {
         let file_mode = i32::from(self.mode);
 
         // root is allowed to read & write anything
-        if uid == 0 {
+        if self.is_root_for(idmap, uid, []) {
             // root only allowed to exec if one of the X bits is set
             access_mask &= libc::X_OK;
             access_mask -= access_mask & (file_mode >> 6);
@@ -481,13 +528,14 @@ impl Attributes {
 
     pub fn xattr_access_check(
         &self,
+        idmap: &[IdMappedRoot],
         key: &[u8],
-        access_mask: i32,
+        value: Option<Option<&[u8]>>,
         request: &Request<'_>,
     ) -> BkfsResult<()> {
         match parse_xattr_namespace(key)? {
             XattrNamespace::Security => {
-                if access_mask != libc::R_OK && request.uid() != 0 {
+                if value.is_some() && request.uid() != 0 {
                     return BkfsResult::errno(libc::EPERM);
                 }
             }
@@ -498,15 +546,28 @@ impl Attributes {
             }
             XattrNamespace::System => {
                 if key.eq(b"system.posix_acl_access") {
-                    self.check_access(request.uid(), request.gid(), access_mask)
-                        .map_err(|_| io::Error::from_raw_os_error(libc::EPERM))?;
+                    if value.is_some() {
+                        if self.uid != request.uid() && !self.is_root_for(idmap, request.uid(), [])
+                        {
+                            return BkfsResult::errno(libc::EPERM);
+                        }
+                    }
                 } else if request.uid() != 0 {
                     return BkfsResult::errno(libc::EPERM);
                 }
             }
             XattrNamespace::User => {
-                self.check_access(request.uid(), request.gid(), access_mask)
-                    .map_err(|_| io::Error::from_raw_os_error(libc::EPERM))?;
+                self.check_access(
+                    idmap,
+                    request.uid(),
+                    request.gid(),
+                    if value.is_some() {
+                        libc::W_OK
+                    } else {
+                        libc::R_OK
+                    },
+                )
+                .map_err(|_| io::Error::from_raw_os_error(libc::EPERM))?;
             }
         }
 

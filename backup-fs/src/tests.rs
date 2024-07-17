@@ -35,6 +35,7 @@ fn with_backupfs(
             password,
             file_size_padding,
             readonly: false,
+            idmapped_root: vec![],
         })
         .unwrap();
         let mut fs = fuser::Session::new(fs, mnt_dir, &opt).unwrap();
@@ -194,6 +195,7 @@ fn checksum() {
         password: "rtns".to_owned(),
         file_size_padding: None,
         readonly: false,
+        idmapped_root: vec![],
     });
     match res {
         Ok(_) => panic!(),
@@ -220,6 +222,7 @@ fn change_password() {
             password: "ohea".to_owned(),
             file_size_padding: None,
             readonly: false,
+            idmapped_root: vec![],
         })
         .unwrap();
         fs.change_password("rtns").unwrap();

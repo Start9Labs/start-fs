@@ -816,6 +816,7 @@ dependencies = [
  "nix 0.29.0",
  "oneshot",
  "pbkdf2",
+ "ppv-lite86",
  "rand 0.8.5",
  "serde",
  "sha2",

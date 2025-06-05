@@ -304,6 +304,7 @@ impl MergedFile {
         } else if start > size {
             self.dst.file.deref_mut().set_len(size + self.dst.offset)?;
         }
+        drop(self.src);
         self.dst.save()?;
         Ok(())
     }

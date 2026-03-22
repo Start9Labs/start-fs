@@ -237,7 +237,7 @@ impl Controller {
             .config
             .file_size_padding
             .map(|p| p * size as f64)
-            .map(|p| p * rand::thread_rng().gen_range(0_f64..=1_f64))
+            .map(|p| p * rand::rng().random_range(0_f64..=1_f64))
             .map(|p| p as u64)
             .unwrap_or(0))
     }

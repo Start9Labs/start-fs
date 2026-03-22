@@ -1,7 +1,6 @@
 #![allow(clippy::needless_return)]
 #![allow(clippy::unnecessary_cast)] // libc::S_* are u16 or u32 depending on the platform
 
-use bincode::{Decode, Encode};
 use chacha20::cipher::{IvSizeUser, KeySizeUser};
 use chacha20::ChaCha20;
 use fd_lock_rs::{FdLock, LockType};
@@ -12,6 +11,7 @@ use fuser::{
     Request, TimeOrNow, FUSE_ROOT_ID,
 };
 use log::{debug, error};
+use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -104,9 +104,8 @@ pub struct BackupFS {
 const CHACHA_KEY_SIZE: usize = <<ChaCha20 as KeySizeUser>::KeySize as ToInt<usize>>::INT;
 const CHACHA_IV_SIZE: usize = <<ChaCha20 as IvSizeUser>::IvSize as ToInt<usize>>::INT;
 
-#[derive(Encode, Decode)]
+#[derive(Deserialize, Serialize)]
 pub struct CryptInfo {
-    #[bincode(with_serde)]
     pub key: Zeroizing<[u8; CHACHA_KEY_SIZE]>,
     pub inode_iv: [u8; CHACHA_IV_SIZE],
     pub contents_iv: [u8; CHACHA_IV_SIZE],

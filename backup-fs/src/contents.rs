@@ -13,7 +13,7 @@ use chacha20::{ChaCha20, Key};
 use itertools::Itertools;
 use pbkdf2::hmac::Hmac;
 use pbkdf2::pbkdf2;
-use rand::{thread_rng, RngCore};
+use rand::{rng, RngCore};
 use sha2::Sha256;
 use smallvec::SmallVec;
 
@@ -42,7 +42,7 @@ impl<F: Read + Write + Seek + FileExt> EncryptedFile<F> {
     }
     pub fn create(mut file: F, key: &Key) -> BkfsResult<Self> {
         let mut iv = Iv::<ChaCha20>::default();
-        rand::thread_rng().fill_bytes(iv.as_mut_slice());
+        rng().fill_bytes(iv.as_mut_slice());
         file.write_all(iv.as_slice())?;
         let cipher = ChaCha20::new(key, &iv);
         Ok(Self {
@@ -74,7 +74,7 @@ impl<F: Read + Write + Seek + FileExt> EncryptedFile<F> {
     }
     pub fn create_pbkdf2(mut file: F, password: &str) -> BkfsResult<Self> {
         let mut iv = Iv::<ChaCha20>::default();
-        rand::thread_rng().fill_bytes(iv.as_mut_slice());
+        rng().fill_bytes(iv.as_mut_slice());
         let mut key = Key::default();
         pbkdf2::<Hmac<Sha256>>(
             password.as_bytes(),
@@ -297,7 +297,7 @@ impl MergedFile {
             self.dst.seek(SeekFrom::Start(start))?;
             io::copy(
                 &mut ((&mut self.src)
-                    .chain(RandReader::new_crypto(thread_rng())) // pad with randomness
+                    .chain(RandReader::new_crypto(rng())) // pad with randomness
                     .take(len)),
                 &mut self.dst,
             )?;
@@ -430,18 +430,16 @@ impl Contents {
         }
         Ok(())
     }
-    pub fn fsync(&mut self, datasync: bool) -> BkfsResult<()> {
-        if datasync {
-            if let Some(Ok(f)) = std::mem::take(&mut self.file) {
-                let size = self.ctrl.file_pad(min(
-                    self.inode.attrs.size,
-                    max(
-                        f.src.file.metadata()?.len(),
-                        f.written.last_key_value().map_or(0, |(p, l)| *p + *l),
-                    ),
-                ));
-                f.save(size)?;
-            }
+    pub fn fsync(&mut self) -> BkfsResult<()> {
+        if let Some(Ok(f)) = std::mem::take(&mut self.file) {
+            let size = self.ctrl.file_pad(min(
+                self.inode.attrs.size,
+                max(
+                    f.src.file.metadata()?.len(),
+                    f.written.last_key_value().map_or(0, |(p, l)| *p + *l),
+                ),
+            ));
+            f.save(size)?;
         }
         if self.changed {
             self.ctrl.save(&self.inode)?;
@@ -452,7 +450,7 @@ impl Contents {
         self.inode.attrs.size = size;
     }
     pub fn close(mut self, handler: &mut Handler) -> BkfsResult<()> {
-        self.fsync(true)?;
+        self.fsync()?;
         handler.gc_inode(&self.inode)?;
         Ok(())
     }

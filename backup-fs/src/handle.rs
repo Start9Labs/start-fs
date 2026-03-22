@@ -126,8 +126,9 @@ pub struct FileHandle {
 }
 impl FileHandle {
     pub fn close(self, handler: &mut Handler) -> BkfsResult<()> {
-        if let Ok(contents) = Rc::try_unwrap(self.contents) {
-            contents.into_inner().close(handler)?;
+        match Rc::try_unwrap(self.contents) {
+            Ok(contents) => contents.into_inner().close(handler)?,
+            Err(contents) => contents.borrow_mut().fsync()?,
         }
         Ok(())
     }
@@ -643,13 +644,12 @@ impl Handler {
         _req: &Request,
         _inode: Inode,
         fh: FileHandleId,
-        datasync: bool,
     ) -> BkfsResult<()> {
         let fh = self
             .handle(fh)
             .ok_or(libc::EBADF)
             .map_err(io::Error::from_raw_os_error)?;
-        fh.contents.borrow_mut().fsync(datasync)?;
+        fh.contents.borrow_mut().fsync()?;
         Ok(())
     }
 

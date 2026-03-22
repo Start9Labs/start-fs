@@ -1,6 +1,7 @@
 #![allow(clippy::needless_return)]
 #![allow(clippy::unnecessary_cast)] // libc::S_* are u16 or u32 depending on the platform
 
+use bincode::{Decode, Encode};
 use chacha20::cipher::{IvSizeUser, KeySizeUser};
 use chacha20::ChaCha20;
 use fd_lock_rs::{FdLock, LockType};
@@ -11,7 +12,6 @@ use fuser::{
     Request, TimeOrNow, FUSE_ROOT_ID,
 };
 use log::{debug, error};
-use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -104,8 +104,9 @@ pub struct BackupFS {
 const CHACHA_KEY_SIZE: usize = <<ChaCha20 as KeySizeUser>::KeySize as ToInt<usize>>::INT;
 const CHACHA_IV_SIZE: usize = <<ChaCha20 as IvSizeUser>::IvSize as ToInt<usize>>::INT;
 
-#[derive(Deserialize, Serialize)]
+#[derive(Encode, Decode)]
 pub struct CryptInfo {
+    #[bincode(with_serde)]
     pub key: Zeroizing<[u8; CHACHA_KEY_SIZE]>,
     pub inode_iv: [u8; CHACHA_IV_SIZE],
     pub contents_iv: [u8; CHACHA_IV_SIZE],
@@ -465,10 +466,10 @@ impl Filesystem for BackupFS {
         }
     }
 
-    fn fsync(&mut self, req: &Request, inode: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
+    fn fsync(&mut self, req: &Request, inode: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
         match self
             .handler
-            .fsync(req, Inode(inode), FileHandleId(fh), datasync)
+            .fsync(req, Inode(inode), FileHandleId(fh))
         {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e.to_errno_log()),

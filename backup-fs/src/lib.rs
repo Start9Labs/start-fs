@@ -4,7 +4,7 @@
 use chacha20::cipher::{IvSizeUser, KeySizeUser};
 use chacha20::ChaCha20;
 use fd_lock_rs::{FdLock, LockType};
-use fuser::consts::FUSE_HANDLE_KILLPRIV;
+use fuser::consts::{FOPEN_DIRECT_IO, FUSE_HANDLE_KILLPRIV};
 use fuser::{
     Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
@@ -369,7 +369,7 @@ impl Filesystem for BackupFS {
     fn open(&mut self, req: &Request, inode: u64, flags: i32, reply: ReplyOpen) {
         debug!("open() called for {:?}", inode);
         match self.handler.open(req, Inode(inode), flags) {
-            Ok(FileHandleId(fh)) => reply.opened(fh, 0),
+            Ok(FileHandleId(fh)) => reply.opened(fh, FOPEN_DIRECT_IO),
             Err(e) => reply.error(e.to_errno_log()),
         }
     }
@@ -478,7 +478,7 @@ impl Filesystem for BackupFS {
     fn opendir(&mut self, req: &Request, inode: u64, flags: i32, reply: ReplyOpen) {
         debug!("opendir() called on {:?}", inode);
         match self.handler.opendir(req, Inode(inode), flags) {
-            Ok(FileHandleId(fh)) => reply.opened(fh, 0),
+            Ok(FileHandleId(fh)) => reply.opened(fh, FOPEN_DIRECT_IO),
             Err(e) => reply.error(e.to_errno_log()),
         }
     }

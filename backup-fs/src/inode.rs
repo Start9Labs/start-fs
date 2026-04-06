@@ -1,7 +1,5 @@
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
 use std::io;
-use std::os::raw::c_void;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -239,7 +237,7 @@ impl Load for InodeAttributes {
         Ok(InodeAttributes {
             inode,
             attrs: load(EncryptedFile::open(
-                File::open(&ctrl.resolve_inode_path(inode))?,
+                crate::open_direct(&ctrl.resolve_inode_path(inode), false)?,
                 ctrl.key(),
             )?)?,
         })

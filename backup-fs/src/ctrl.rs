@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::ffi::OsString;
-use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -113,7 +112,7 @@ impl Controller {
 
     pub fn load_inode_pool(&self) -> BkfsResult<()> {
         if self.0.inode_pool_path.exists() {
-            match File::open(&self.0.inode_pool_path)
+            match crate::open_direct(&self.0.inode_pool_path, false)
                 .map_err(BkfsError::from)
                 .and_then(|f| EncryptedFile::open(f, &self.key()))
                 .and_then(load)

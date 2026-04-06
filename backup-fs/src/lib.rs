@@ -54,6 +54,16 @@ pub const ENTRY_TTL: Duration = Duration::new(3600, 0);
 
 const FMODE_EXEC: i32 = 0x20;
 
+pub(crate) fn open_direct(path: &Path, create: bool) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opts = File::options();
+    opts.read(true).custom_flags(libc::O_DIRECT);
+    if create {
+        opts.write(true).create(true).truncate(true);
+    }
+    opts.open(path)
+}
+
 #[cfg_attr(feature = "cli", derive(clap::Parser))]
 pub struct BackupFSOptions {
     pub data_dir: PathBuf,

@@ -46,6 +46,7 @@ mod inode;
 mod serde;
 #[cfg(test)]
 mod tests;
+#[allow(dead_code)]
 mod util;
 
 pub const MAX_NAME_LENGTH: u32 = 255;
@@ -107,7 +108,7 @@ impl FromStr for IdMappedRoot {
 // Stores inode metadata data in "$data_dir/inodes" and file contents in "$data_dir/contents"
 // Directory data is stored in the file's contents, as a serialized DirectoryDescriptor
 pub struct BackupFS {
-    lock: FdLock<File>,
+    _lock: FdLock<File>,
     handler: Handler,
 }
 
@@ -166,7 +167,7 @@ impl BackupFS {
         ctrl.load_inode_pool()?;
 
         Ok(BackupFS {
-            lock,
+            _lock: lock,
             handler: Handler::new(ctrl),
         })
     }

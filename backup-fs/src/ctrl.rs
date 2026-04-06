@@ -58,6 +58,8 @@ fn legacy_path(base: &PathBuf, encrypted: [u8; 8]) -> PathBuf {
     base.join(format!("{a:04x}/{b:04x}/{c:04x}/{d:04x}/{e:02x}"))
 }
 
+/// 2-level path: 2 bytes for directory (65K buckets), 6 bytes for filename.
+/// Supports ~4B files before any bucket exceeds FAT32's 65K entry limit.
 fn current_path(base: &PathBuf, encrypted: [u8; 8]) -> PathBuf {
     let dir = u16::from_be_bytes([encrypted[0], encrypted[1]]);
     let file = &encrypted[2..];
@@ -224,16 +226,14 @@ impl Controller {
         }
     }
 
-    /// Returns the current (2-level) path for writing new/updated inodes.
-    /// Also removes the legacy (5-level) path if it exists.
+    /// Returns the current (2-level) path for writing. Cleans up legacy (5-level) copy.
     pub fn inode_path(&self, inode: Inode) -> PathBuf {
         let encrypted = encrypt_u64(&self.0.inode_cipher, inode.0);
         self.cleanup_legacy(&self.0.inode_dir, encrypted);
         current_path(&self.0.inode_dir, encrypted)
     }
 
-    /// Returns the current (2-level) path for writing new/updated contents.
-    /// Also removes the legacy (5-level) path if it exists.
+    /// Returns the current (2-level) path for writing. Cleans up legacy (5-level) copy.
     pub fn contents_path(&self, contents: ContentId) -> PathBuf {
         let encrypted = encrypt_u64(&self.0.contents_cipher, contents.0);
         self.cleanup_legacy(&self.0.contents_dir, encrypted);
@@ -247,7 +247,6 @@ impl Controller {
         }
     }
 
-    /// Resolves an inode path, checking current (2-level) then legacy (5-level).
     pub fn resolve_inode_path(&self, inode: Inode) -> PathBuf {
         resolve_path(
             &self.0.inode_dir,
@@ -255,7 +254,6 @@ impl Controller {
         )
     }
 
-    /// Resolves a contents path, checking current (2-level) then legacy (5-level).
     pub fn resolve_contents_path(&self, contents: ContentId) -> PathBuf {
         resolve_path(
             &self.0.contents_dir,

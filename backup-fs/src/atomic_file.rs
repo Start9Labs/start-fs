@@ -38,6 +38,7 @@ impl AtomicFile {
         )
     }
 
+    #[allow(dead_code)]
     pub fn rollback(mut self) -> BkfsResult<()> {
         drop(self.file.take());
         std::fs::remove_file(&self.tmp_path)?;

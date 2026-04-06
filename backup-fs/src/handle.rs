@@ -655,7 +655,7 @@ impl Handler {
 
     pub fn opendir(&mut self, req: &Request, inode: Inode, flags: i32) -> BkfsResult<FileHandleId> {
         let inode = self.ctrl().load::<InodeAttributes>(inode)?;
-        let (access_mask, read, _) = match flags & libc::O_ACCMODE {
+        let (access_mask, _read, _) = match flags & libc::O_ACCMODE {
             libc::O_RDONLY => {
                 // Behavior is undefined, but most filesystems return EACCES
                 if flags & libc::O_TRUNC != 0 {

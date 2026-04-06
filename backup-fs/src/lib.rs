@@ -4,7 +4,7 @@
 use chacha20::cipher::{IvSizeUser, KeySizeUser};
 use chacha20::ChaCha20;
 use fd_lock_rs::{FdLock, LockType};
-use fuser::consts::FUSE_HANDLE_KILLPRIV;
+use fuser::consts::{FOPEN_DIRECT_IO, FUSE_HANDLE_KILLPRIV};
 use fuser::{
     Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
@@ -46,6 +46,7 @@ mod inode;
 mod serde;
 #[cfg(test)]
 mod tests;
+#[allow(dead_code)]
 mod util;
 
 pub const MAX_NAME_LENGTH: u32 = 255;
@@ -53,6 +54,16 @@ pub const MAX_NAME_LENGTH: u32 = 255;
 pub const ENTRY_TTL: Duration = Duration::new(3600, 0);
 
 const FMODE_EXEC: i32 = 0x20;
+
+pub(crate) fn open_direct(path: &Path, create: bool) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opts = File::options();
+    opts.read(true).custom_flags(libc::O_DIRECT);
+    if create {
+        opts.write(true).create(true).truncate(true);
+    }
+    opts.open(path)
+}
 
 #[cfg_attr(feature = "cli", derive(clap::Parser))]
 pub struct BackupFSOptions {
@@ -97,7 +108,7 @@ impl FromStr for IdMappedRoot {
 // Stores inode metadata data in "$data_dir/inodes" and file contents in "$data_dir/contents"
 // Directory data is stored in the file's contents, as a serialized DirectoryDescriptor
 pub struct BackupFS {
-    lock: FdLock<File>,
+    _lock: FdLock<File>,
     handler: Handler,
 }
 
@@ -156,7 +167,7 @@ impl BackupFS {
         ctrl.load_inode_pool()?;
 
         Ok(BackupFS {
-            lock,
+            _lock: lock,
             handler: Handler::new(ctrl),
         })
     }
@@ -369,7 +380,7 @@ impl Filesystem for BackupFS {
     fn open(&mut self, req: &Request, inode: u64, flags: i32, reply: ReplyOpen) {
         debug!("open() called for {:?}", inode);
         match self.handler.open(req, Inode(inode), flags) {
-            Ok(FileHandleId(fh)) => reply.opened(fh, 0),
+            Ok(FileHandleId(fh)) => reply.opened(fh, FOPEN_DIRECT_IO),
             Err(e) => reply.error(e.to_errno_log()),
         }
     }
@@ -478,7 +489,7 @@ impl Filesystem for BackupFS {
     fn opendir(&mut self, req: &Request, inode: u64, flags: i32, reply: ReplyOpen) {
         debug!("opendir() called on {:?}", inode);
         match self.handler.opendir(req, Inode(inode), flags) {
-            Ok(FileHandleId(fh)) => reply.opened(fh, 0),
+            Ok(FileHandleId(fh)) => reply.opened(fh, FOPEN_DIRECT_IO),
             Err(e) => reply.error(e.to_errno_log()),
         }
     }

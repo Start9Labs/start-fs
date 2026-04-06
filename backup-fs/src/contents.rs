@@ -5,7 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::{DerefMut, Range};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::PathBuf;
 
 use chacha20::cipher::{Iv, KeyIvInit, StreamCipher, StreamCipherSeek};
@@ -22,6 +22,7 @@ use crate::ctrl::Controller;
 use crate::error::{BkfsError, BkfsResult, BkfsResultExt};
 use crate::handle::Handler;
 use crate::inode::{time_now, ContentId, FileData, Inode, InodeAttributes};
+use crate::open_direct;
 use crate::util::RandReader;
 
 pub struct EncryptedFile<F: Read + Write + Seek + FileExt = File> {
@@ -173,7 +174,8 @@ impl MergedFile {
                     .read(true)
                     .write(true)
                     .truncate(true)
-                    .create(true),
+                    .create(true)
+                    .custom_flags(libc::O_DIRECT),
             )?,
             key,
         )?;
@@ -335,19 +337,26 @@ impl Contents {
     }
     pub fn readable(&mut self) -> BkfsResult<&mut Self> {
         if self.file.is_none() {
-            let path = self.ctrl.contents_path(self.content_id);
+            let path = self.ctrl.resolve_contents_path(self.content_id);
             if !path.exists() {
+                // New file: use the current (2-level) path
+                let path = self.ctrl.contents_path(self.content_id);
                 if let Some(parent) = path.parent() {
                     if !parent.exists() {
                         std::fs::create_dir_all(parent)?;
                     }
                 }
-                EncryptedFile::create(File::create(&path)?, self.ctrl.key())?;
+                EncryptedFile::create(open_direct(&path, true)?, self.ctrl.key())?;
+                self.file = Some(Err(EncryptedFile::open(
+                    open_direct(&path, false)?,
+                    self.ctrl.key(),
+                )?));
+            } else {
+                self.file = Some(Err(EncryptedFile::open(
+                    open_direct(&path, false)?,
+                    self.ctrl.key(),
+                )?));
             }
-            self.file = Some(Err(EncryptedFile::open(
-                File::open(&path)?,
-                self.ctrl.key(),
-            )?));
         }
         Ok(self)
     }

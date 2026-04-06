@@ -1,4 +1,4 @@
-use backupfs::error::{BkfsError, BkfsErrorKind};
+use backupfs::error::BkfsErrorKind;
 use backupfs::{BackupFS, BackupFSOptions};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use fuser::MountOption;

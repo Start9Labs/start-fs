@@ -1,7 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::ops::{Deref, DerefMut};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::PathBuf;
 
 use crate::error::BkfsResult;
@@ -30,10 +30,15 @@ impl AtomicFile {
     pub fn create(path: PathBuf) -> BkfsResult<Self> {
         Self::new(
             path,
-            &OpenOptions::new().write(true).truncate(true).create(true),
+            OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .create(true)
+                .custom_flags(libc::O_DIRECT),
         )
     }
 
+    #[allow(dead_code)]
     pub fn rollback(mut self) -> BkfsResult<()> {
         drop(self.file.take());
         std::fs::remove_file(&self.tmp_path)?;

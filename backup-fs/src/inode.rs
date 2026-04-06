@@ -239,7 +239,7 @@ impl Load for InodeAttributes {
         Ok(InodeAttributes {
             inode,
             attrs: load(EncryptedFile::open(
-                File::open(&ctrl.inode_path(inode))?,
+                File::open(&ctrl.resolve_inode_path(inode))?,
                 ctrl.key(),
             )?)?,
         })
@@ -248,7 +248,7 @@ impl Load for InodeAttributes {
 
 impl Exists for InodeAttributes {
     fn exists(ctrl: &Controller, inode: Self::Args<'_>) -> bool {
-        ctrl.inode_path(inode).exists()
+        ctrl.resolve_inode_path(inode).exists()
     }
 }
 

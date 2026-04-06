@@ -349,9 +349,9 @@ impl Handler {
         debug!("deleting inode {:?}", inode);
         self.inodes.remove(&inode.inode);
 
-        std::fs::remove_file(self.ctrl().inode_path(inode.inode))?;
+        std::fs::remove_file(self.ctrl().resolve_inode_path(inode.inode))?;
         if let FileData::File(contents) = inode.attrs.contents {
-            let path = self.ctrl().contents_path(contents);
+            let path = self.ctrl().resolve_contents_path(contents);
             if path.exists() {
                 std::fs::remove_file(path)?;
             }

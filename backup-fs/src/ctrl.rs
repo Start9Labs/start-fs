@@ -38,22 +38,47 @@ pub struct ControllerSeed {
     inode_pool: RefCell<IdPool>,
 }
 
-fn encrypted_u64(cipher: &RefCell<ChaCha20>, num: u64) -> [u16; 5] {
-    let mut inode_buf = u64::to_be_bytes(num);
+fn encrypt_u64(cipher: &RefCell<ChaCha20>, num: u64) -> [u8; 8] {
+    let mut buf = u64::to_be_bytes(num);
     let mut cipher = cipher.borrow_mut();
     cipher.seek(num * std::mem::size_of::<u64>() as u64);
-    cipher.apply_keystream(&mut inode_buf);
-    let a = u16::from_be_bytes([inode_buf[0], inode_buf[1]]);
-    let b = u16::from_be_bytes([inode_buf[2], inode_buf[3]]);
-    let c = u16::from_be_bytes([inode_buf[4], inode_buf[5]]);
-    let d = u16::from_be_bytes([inode_buf[6], inode_buf[7]]);
-    [
-        a & !U16_MSB,
-        b & !U16_MSB,
-        c & !U16_MSB,
-        d & !U16_MSB,
-        (a & U16_MSB >> 12) | (a & U16_MSB >> 13) | (a & U16_MSB >> 14) | (a & U16_MSB >> 15),
-    ]
+    cipher.apply_keystream(&mut buf);
+    buf
+}
+
+fn legacy_path(base: &PathBuf, encrypted: [u8; 8]) -> PathBuf {
+    let a = u16::from_be_bytes([encrypted[0], encrypted[1]]);
+    let b = u16::from_be_bytes([encrypted[2], encrypted[3]]);
+    let c = u16::from_be_bytes([encrypted[4], encrypted[5]]);
+    let d = u16::from_be_bytes([encrypted[6], encrypted[7]]);
+    let e = (a & U16_MSB >> 12) | (a & U16_MSB >> 13) | (a & U16_MSB >> 14) | (a & U16_MSB >> 15);
+    let a = a & !U16_MSB;
+    let b = b & !U16_MSB;
+    let c = c & !U16_MSB;
+    let d = d & !U16_MSB;
+    base.join(format!("{a:04x}/{b:04x}/{c:04x}/{d:04x}/{e:02x}"))
+}
+
+fn current_path(base: &PathBuf, encrypted: [u8; 8]) -> PathBuf {
+    let dir = u16::from_be_bytes([encrypted[0], encrypted[1]]);
+    let file = &encrypted[2..];
+    base.join(format!(
+        "{dir:04x}/{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        file[0], file[1], file[2], file[3], file[4], file[5]
+    ))
+}
+
+/// Returns the current (2-level) path, falling back to legacy (5-level) if only that exists.
+fn resolve_path(base: &PathBuf, encrypted: [u8; 8]) -> PathBuf {
+    let path = current_path(base, encrypted);
+    if path.exists() {
+        return path;
+    }
+    let legacy = legacy_path(base, encrypted);
+    if legacy.exists() {
+        return legacy;
+    }
+    path
 }
 
 impl Controller {
@@ -200,18 +225,43 @@ impl Controller {
         }
     }
 
+    /// Returns the current (2-level) path for writing new/updated inodes.
+    /// Also removes the legacy (5-level) path if it exists.
     pub fn inode_path(&self, inode: Inode) -> PathBuf {
-        let [a, b, c, d, e] = encrypted_u64(&self.0.inode_cipher, inode.0);
-        self.0
-            .inode_dir
-            .join(format!("{a:04x}/{b:04x}/{c:04x}/{d:04x}/{e:02x}"))
+        let encrypted = encrypt_u64(&self.0.inode_cipher, inode.0);
+        self.cleanup_legacy(&self.0.inode_dir, encrypted);
+        current_path(&self.0.inode_dir, encrypted)
     }
 
+    /// Returns the current (2-level) path for writing new/updated contents.
+    /// Also removes the legacy (5-level) path if it exists.
     pub fn contents_path(&self, contents: ContentId) -> PathBuf {
-        let [a, b, c, d, e] = encrypted_u64(&self.0.contents_cipher, contents.0);
-        self.0
-            .contents_dir
-            .join(format!("{a:04x}/{b:04x}/{c:04x}/{d:04x}/{e:02x}"))
+        let encrypted = encrypt_u64(&self.0.contents_cipher, contents.0);
+        self.cleanup_legacy(&self.0.contents_dir, encrypted);
+        current_path(&self.0.contents_dir, encrypted)
+    }
+
+    fn cleanup_legacy(&self, base: &PathBuf, encrypted: [u8; 8]) {
+        let legacy = legacy_path(base, encrypted);
+        if legacy.exists() {
+            let _ = std::fs::remove_file(&legacy);
+        }
+    }
+
+    /// Resolves an inode path, checking current (2-level) then legacy (5-level).
+    pub fn resolve_inode_path(&self, inode: Inode) -> PathBuf {
+        resolve_path(
+            &self.0.inode_dir,
+            encrypt_u64(&self.0.inode_cipher, inode.0),
+        )
+    }
+
+    /// Resolves a contents path, checking current (2-level) then legacy (5-level).
+    pub fn resolve_contents_path(&self, contents: ContentId) -> PathBuf {
+        resolve_path(
+            &self.0.contents_dir,
+            encrypt_u64(&self.0.contents_cipher, contents.0),
+        )
     }
 
     pub fn next_inode(&self) -> BkfsResult<Inode> {

@@ -106,7 +106,7 @@ fn uring_pwrite_all(fd: RawFd, buf: &[u8], offset: u64) -> io::Result<()> {
     }
     ring.submit_and_wait(n_chunks)?;
 
-    // Reap completions
+    // Reap completions and check for errors / short writes
     let cq = ring.completion();
     let mut errors: Option<io::Error> = None;
     let mut completed = 0;
@@ -115,6 +115,15 @@ fn uring_pwrite_all(fd: RawFd, buf: &[u8], offset: u64) -> io::Result<()> {
         let ret = cqe.result();
         if ret < 0 {
             errors.get_or_insert(io::Error::from_raw_os_error(-ret));
+        } else {
+            let idx = cqe.user_data() as usize;
+            let expected = buf.chunks(FLUSH_CHUNK).nth(idx).map_or(0, |c| c.len());
+            if (ret as usize) < expected {
+                errors.get_or_insert(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "io_uring: short write",
+                ));
+            }
         }
     }
     if completed < n_chunks {

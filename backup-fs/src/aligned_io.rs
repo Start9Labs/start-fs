@@ -13,6 +13,7 @@ use crate::error::BkfsResult;
 const BLOCK_SIZE: usize = 4096;
 const ALIGN_MASK: usize = BLOCK_SIZE - 1;
 const BUF_CAP: usize = 1 << 20; // 1 MiB
+const FLUSH_CHUNK: usize = 64 * 1024; // 64 KiB — small enough to yield the CPU between SMB writes
 
 // ── Aligned buffer ────────────────────────────────────
 
@@ -135,14 +136,23 @@ impl<F: FileExt> BufferedDirectFile<F> {
         self.file.as_ref().unwrap()
     }
 
-    /// Flush dirty bytes to disk as a single aligned pwrite.
+    /// Flush dirty bytes to disk in block-aligned chunks.
+    ///
+    /// Writes are chunked to avoid a single large O_DIRECT pwrite that can
+    /// monopolize the CPU in the CIFS client, starving NIC interrupts.
     fn flush_dirty(state: &mut BufState, file: &F) -> io::Result<()> {
         if state.dirty_start >= state.dirty_end {
             return Ok(());
         }
         let start = state.dirty_start & !ALIGN_MASK;
         let end = ((state.dirty_end + ALIGN_MASK) & !ALIGN_MASK).min(state.buf.len());
-        pwrite_full(file, &state.buf.as_slice()[start..end], state.base + start as u64)?;
+        let buf = &state.buf.as_slice()[start..end];
+        let mut pos = 0;
+        while pos < buf.len() {
+            let chunk = buf.len().saturating_sub(pos).min(FLUSH_CHUNK);
+            pwrite_full(file, &buf[pos..pos + chunk], state.base + (start + pos) as u64)?;
+            pos += chunk;
+        }
         state.dirty_start = usize::MAX;
         state.dirty_end = 0;
         Ok(())

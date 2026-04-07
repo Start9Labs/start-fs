@@ -111,15 +111,15 @@ struct BufState {
 /// All actual disk I/O goes through the aligned internal buffer, satisfying
 /// O_DIRECT's alignment requirements for buffer address, file offset, and
 /// I/O size transparently.
-pub struct BufferedDirectFile<F> {
-    file: F,
+pub struct BufferedDirectFile<F: FileExt> {
+    file: Option<F>,
     state: RefCell<BufState>,
 }
 
 impl<F: FileExt> BufferedDirectFile<F> {
     pub fn new(file: F) -> Self {
         Self {
-            file,
+            file: Some(file),
             state: RefCell::new(BufState {
                 buf: AlignedBuf::new(BUF_CAP),
                 base: u64::MAX, // sentinel: no window loaded
@@ -129,6 +129,10 @@ impl<F: FileExt> BufferedDirectFile<F> {
                 pos: 0,
             }),
         }
+    }
+
+    fn file(&self) -> &F {
+        self.file.as_ref().unwrap()
     }
 
     /// Flush dirty bytes to disk as a single aligned pwrite.
@@ -163,13 +167,22 @@ impl<F: FileExt> BufferedDirectFile<F> {
     }
 }
 
+impl<F: FileExt> Drop for BufferedDirectFile<F> {
+    fn drop(&mut self) {
+        if let Some(file) = &self.file {
+            let state = self.state.get_mut();
+            let _ = Self::flush_dirty(state, file);
+        }
+    }
+}
+
 impl<F: FileExt> FileExt for BufferedDirectFile<F> {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
         let mut state = self.state.borrow_mut();
-        Self::ensure_window(&mut state, &self.file, offset)?;
+        Self::ensure_window(&mut state, self.file(), offset)?;
         let off = (offset - state.base) as usize;
         let available = state.valid.saturating_sub(off);
         let n = buf.len().min(available);
@@ -182,7 +195,7 @@ impl<F: FileExt> FileExt for BufferedDirectFile<F> {
             return Ok(0);
         }
         let mut state = self.state.borrow_mut();
-        Self::ensure_window(&mut state, &self.file, offset)?;
+        Self::ensure_window(&mut state, self.file(), offset)?;
         let off = (offset - state.base) as usize;
         let space = BUF_CAP - off;
         let n = buf.len().min(space);
@@ -199,8 +212,9 @@ impl<F: FileExt> Read for BufferedDirectFile<F> {
         if buf.is_empty() {
             return Ok(0);
         }
+        let file = self.file.as_ref().unwrap();
         let state = self.state.get_mut();
-        Self::ensure_window(state, &self.file, state.pos)?;
+        Self::ensure_window(state, file, state.pos)?;
         let off = (state.pos - state.base) as usize;
         let available = state.valid.saturating_sub(off);
         let n = buf.len().min(available);
@@ -215,8 +229,9 @@ impl<F: FileExt> Write for BufferedDirectFile<F> {
         if buf.is_empty() {
             return Ok(0);
         }
+        let file = self.file.as_ref().unwrap();
         let state = self.state.get_mut();
-        Self::ensure_window(state, &self.file, state.pos)?;
+        Self::ensure_window(state, file, state.pos)?;
         let off = (state.pos - state.base) as usize;
         let space = BUF_CAP - off;
         let n = buf.len().min(space);
@@ -229,8 +244,9 @@ impl<F: FileExt> Write for BufferedDirectFile<F> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        let file = self.file.as_ref().unwrap();
         let state = self.state.get_mut();
-        Self::flush_dirty(state, &self.file)
+        Self::flush_dirty(state, file)
     }
 }
 
@@ -262,26 +278,28 @@ impl<F: FileExt> Seek for BufferedDirectFile<F> {
 
 impl BufferedDirectFile<File> {
     pub fn metadata(&self) -> io::Result<Metadata> {
-        self.file.metadata()
+        self.file().metadata()
     }
 }
 
 impl BufferedDirectFile<AtomicFile> {
     pub fn save(mut self) -> BkfsResult<()> {
         self.flush()?;
-        self.file.save()
+        // Take the file so Drop doesn't double-flush
+        self.file.take().unwrap().save()
     }
 
     pub fn set_len(&mut self, size: u64) -> io::Result<()> {
+        let file = self.file.as_ref().unwrap();
         let state = self.state.get_mut();
-        Self::flush_dirty(state, &self.file)?;
+        Self::flush_dirty(state, file)?;
         // Invalidate — file geometry changed
         state.base = u64::MAX;
         state.valid = 0;
-        self.file.set_len(size)
+        self.file.as_ref().unwrap().set_len(size)
     }
 
     pub fn as_raw_fd(&self) -> RawFd {
-        self.file.deref().as_raw_fd()
+        self.file().deref().as_raw_fd()
     }
 }

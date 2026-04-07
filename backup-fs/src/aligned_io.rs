@@ -161,11 +161,6 @@ impl<F: FileExt> BufferedDirectFile<F> {
     /// avoid an O_DIRECT read (which can deadlock CIFS for regions beyond EOF).
     fn reset_window(state: &mut BufState, offset: u64) {
         state.base = align_down(offset);
-        // Zero the buffer so partial-block flushes don't write garbage
-        // SAFETY: buf is valid for writes
-        unsafe {
-            std::ptr::write_bytes(state.buf.ptr.as_ptr(), 0, state.buf.len);
-        }
         state.valid = 0;
         state.dirty_start = usize::MAX;
         state.dirty_end = 0;

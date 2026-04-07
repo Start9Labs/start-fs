@@ -36,6 +36,7 @@ use crate::inode::{Inode, InodeAttributes};
 use crate::serde::load;
 use crate::serde::save;
 
+mod aligned_io;
 mod atomic_file;
 mod contents;
 mod ctrl;
@@ -55,14 +56,14 @@ pub const ENTRY_TTL: Duration = Duration::new(3600, 0);
 
 const FMODE_EXEC: i32 = 0x20;
 
-pub(crate) fn open_direct(path: &Path, create: bool) -> io::Result<File> {
+pub(crate) fn open_direct(path: &Path, create: bool) -> io::Result<aligned_io::BufferedDirectFile<File>> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut opts = File::options();
     opts.read(true).custom_flags(libc::O_DIRECT);
     if create {
         opts.write(true).create(true).truncate(true);
     }
-    opts.open(path)
+    Ok(aligned_io::BufferedDirectFile::new(opts.open(path)?))
 }
 
 #[cfg_attr(feature = "cli", derive(clap::Parser))]
@@ -130,12 +131,18 @@ impl CryptInfo {
         }
     }
     pub fn load(path: &Path, password: &str) -> BkfsResult<Self> {
-        load(EncryptedFile::open_pbkdf2(File::open(path)?, password)?)
+        load(EncryptedFile::open_pbkdf2(
+            aligned_io::BufferedDirectFile::new(File::open(path)?),
+            password,
+        )?)
     }
     pub fn save(&self, path: PathBuf, password: &str) -> BkfsResult<()> {
         save(
             self,
-            EncryptedFile::create_pbkdf2(AtomicFile::create(path)?, password)?,
+            EncryptedFile::create_pbkdf2(
+                aligned_io::BufferedDirectFile::new(AtomicFile::create(path)?),
+                password,
+            )?,
         )
     }
 }

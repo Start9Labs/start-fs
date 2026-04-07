@@ -31,6 +31,7 @@ impl AtomicFile {
         Self::new(
             path,
             OpenOptions::new()
+                .read(true)
                 .write(true)
                 .truncate(true)
                 .create(true)

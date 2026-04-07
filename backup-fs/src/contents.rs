@@ -3,8 +3,7 @@ use std::cmp::{max, min};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::ops::{DerefMut, Range};
-use std::os::fd::AsRawFd;
+use std::ops::Range;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::PathBuf;
 
@@ -17,15 +16,16 @@ use rand::{rng, RngCore};
 use sha2::Sha256;
 use smallvec::SmallVec;
 
+use crate::aligned_io::BufferedDirectFile;
 use crate::atomic_file::AtomicFile;
 use crate::ctrl::Controller;
-use crate::error::{BkfsError, BkfsResult, BkfsResultExt};
+use crate::error::{BkfsError, BkfsErrorKind, BkfsResult, BkfsResultExt};
 use crate::handle::Handler;
 use crate::inode::{time_now, ContentId, FileData, Inode, InodeAttributes};
 use crate::open_direct;
 use crate::util::RandReader;
 
-pub struct EncryptedFile<F: Read + Write + Seek + FileExt = File> {
+pub struct EncryptedFile<F: Read + Write + Seek + FileExt = BufferedDirectFile<File>> {
     file: F,
     offset: u64,
     cipher: ChaCha20,
@@ -113,7 +113,6 @@ impl<F: Read + Write + Seek + FileExt> EncryptedFile<F> {
         if !buf.is_empty() {
             buf.fill(0);
         }
-
         Ok(())
     }
     pub fn write_all_at(&mut self, buf: &mut [u8], offset: u64) -> BkfsResult<()> {
@@ -124,7 +123,7 @@ impl<F: Read + Write + Seek + FileExt> EncryptedFile<F> {
         Ok(())
     }
 }
-impl EncryptedFile<AtomicFile> {
+impl EncryptedFile<BufferedDirectFile<AtomicFile>> {
     pub fn save(self) -> BkfsResult<()> {
         self.file.save()
     }
@@ -162,13 +161,13 @@ impl<F: Read + Write + Seek + FileExt> Write for EncryptedFile<F> {
 
 pub struct MergedFile {
     src: EncryptedFile,
-    dst: EncryptedFile<AtomicFile>,
+    dst: EncryptedFile<BufferedDirectFile<AtomicFile>>,
     written: BTreeMap<u64, u64>, // position, len
 }
 impl MergedFile {
     fn new(src: EncryptedFile, dst: PathBuf, key: &Key) -> BkfsResult<Self> {
         let dst = EncryptedFile::create(
-            AtomicFile::new(
+            BufferedDirectFile::new(AtomicFile::new(
                 dst,
                 OpenOptions::new()
                     .read(true)
@@ -176,7 +175,7 @@ impl MergedFile {
                     .truncate(true)
                     .create(true)
                     .custom_flags(libc::O_DIRECT),
-            )?,
+            )?),
             key,
         )?;
         Ok(Self {
@@ -304,7 +303,7 @@ impl MergedFile {
                 &mut self.dst,
             )?;
         } else if start > size {
-            self.dst.file.deref_mut().set_len(size + self.dst.offset)?;
+            self.dst.file.set_len(size + self.dst.offset)?;
         }
         drop(self.src);
         self.dst.save()?;
@@ -335,28 +334,36 @@ impl Contents {
             ctrl,
         })
     }
+    fn init_content_file(&self, path: &std::path::Path) -> BkfsResult<()> {
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let mut init = EncryptedFile::create(open_direct(path, true)?, self.ctrl.key())?;
+        init.file.flush()?;
+        Ok(())
+    }
     pub fn readable(&mut self) -> BkfsResult<&mut Self> {
         if self.file.is_none() {
             let path = self.ctrl.resolve_contents_path(self.content_id);
-            if !path.exists() {
-                // New file: use the current (2-level) path
-                let path = self.ctrl.contents_path(self.content_id);
-                if let Some(parent) = path.parent() {
-                    if !parent.exists() {
-                        std::fs::create_dir_all(parent)?;
-                    }
+            self.file = Some(Err(match open_direct(&path, false)
+                .map_err(BkfsError::from)
+                .and_then(|f| EncryptedFile::open(f, self.ctrl.key()))
+            {
+                Ok(f) => f,
+                Err(e)
+                    if matches!(
+                        &e.kind,
+                        BkfsErrorKind::Io(io) if matches!(io.kind(), io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof)
+                    ) =>
+                {
+                    let path = self.ctrl.contents_path(self.content_id);
+                    self.init_content_file(&path)?;
+                    EncryptedFile::open(open_direct(&path, false)?, self.ctrl.key())?
                 }
-                EncryptedFile::create(open_direct(&path, true)?, self.ctrl.key())?;
-                self.file = Some(Err(EncryptedFile::open(
-                    open_direct(&path, false)?,
-                    self.ctrl.key(),
-                )?));
-            } else {
-                self.file = Some(Err(EncryptedFile::open(
-                    open_direct(&path, false)?,
-                    self.ctrl.key(),
-                )?));
-            }
+                Err(e) => return Err(e),
+            }));
         }
         Ok(self)
     }

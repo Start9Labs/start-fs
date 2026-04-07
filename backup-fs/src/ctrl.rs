@@ -271,7 +271,9 @@ impl Controller {
         save(
             &*pool,
             EncryptedFile::create(
-                AtomicFile::create(self.0.inode_pool_path.clone())?,
+                crate::aligned_io::BufferedDirectFile::new(
+                    AtomicFile::create(self.0.inode_pool_path.clone())?,
+                ),
                 self.key(),
             )?,
         )?;

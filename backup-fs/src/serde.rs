@@ -5,6 +5,7 @@ pub use serde::{Deserialize, Serialize};
 use sha2::digest::Output;
 use sha2::Sha256;
 
+use crate::aligned_io::BufferedDirectFile;
 use crate::atomic_file::AtomicFile;
 use crate::contents::EncryptedFile;
 use crate::error::{BkfsError, BkfsErrorKind, BkfsResult};
@@ -26,7 +27,7 @@ pub fn load<T: DeserializeOwned>(mut from: EncryptedFile) -> BkfsResult<T> {
     }
 }
 
-pub fn save<T: Serialize>(value: &T, mut to: EncryptedFile<AtomicFile>) -> BkfsResult<()> {
+pub fn save<T: Serialize>(value: &T, mut to: EncryptedFile<BufferedDirectFile<AtomicFile>>) -> BkfsResult<()> {
     let mut w = HashIO::<Sha256, _>::new(&mut to);
     bincode::serialize_into(&mut w, value)?;
     let hash = w.finalize();

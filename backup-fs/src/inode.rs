@@ -226,7 +226,7 @@ impl<'a> Save for &'a InodeAttributes {
     fn save(self, ctrl: &Controller) -> BkfsResult<()> {
         save(
             &self.attrs,
-            EncryptedFile::create(AtomicFile::create(ctrl.inode_path(self.inode))?, ctrl.key())?,
+            EncryptedFile::create(crate::aligned_io::BufferedDirectFile::new(AtomicFile::create(ctrl.inode_path(self.inode))?), ctrl.key())?,
         )
     }
 }

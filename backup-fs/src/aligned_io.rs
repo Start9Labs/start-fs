@@ -13,7 +13,7 @@ use crate::error::BkfsResult;
 const BLOCK_SIZE: usize = 4096;
 const ALIGN_MASK: usize = BLOCK_SIZE - 1;
 const BUF_CAP: usize = 1 << 20; // 1 MiB
-const FLUSH_CHUNK: usize = 64 * 1024; // 64 KiB — small enough to yield the CPU between SMB writes
+const FLUSH_CHUNK: usize = 64 * 1024; // 64 KiB per SQE
 
 // ── Aligned buffer ────────────────────────────────────
 
@@ -75,18 +75,56 @@ fn pread_full<F: FileExt>(file: &F, buf: &mut [u8], offset: u64) -> io::Result<u
     Ok(pos)
 }
 
-/// Perform a full pwrite, retrying on EINTR.
-fn pwrite_full<F: FileExt>(file: &F, buf: &[u8], offset: u64) -> io::Result<()> {
-    let mut pos = 0;
-    while pos < buf.len() {
-        match file.write_at(&buf[pos..], offset + pos as u64) {
-            Ok(0) => {
-                return Err(io::Error::new(io::ErrorKind::WriteZero, "write_at returned 0"))
-            }
-            Ok(n) => pos += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
+// ── io_uring pipelined flush ──────────────────────────
+
+/// Submit all chunks as pwrite SQEs, then reap completions.
+fn uring_pwrite_all(fd: RawFd, buf: &[u8], offset: u64) -> io::Result<()> {
+    use io_uring::{opcode, types, IoUring};
+
+    if buf.is_empty() {
+        return Ok(());
+    }
+
+    let n_chunks = (buf.len() + FLUSH_CHUNK - 1) / FLUSH_CHUNK;
+    let mut ring = IoUring::new(n_chunks as u32)?;
+
+    // Submit all chunks
+    {
+        let mut sq = ring.submission();
+        for (i, chunk) in buf.chunks(FLUSH_CHUNK).enumerate() {
+            let off = offset + (i * FLUSH_CHUNK) as u64;
+            let entry = opcode::Write::new(types::Fd(fd), chunk.as_ptr(), chunk.len() as u32)
+                .offset(off)
+                .build()
+                .user_data(i as u64);
+            // SAFETY: the buffer is alive for the duration of this function,
+            // and we wait for all completions before returning.
+            unsafe { sq.push(&entry) }.map_err(|_| {
+                io::Error::new(io::ErrorKind::Other, "io_uring submission queue full")
+            })?;
         }
+    }
+    ring.submit_and_wait(n_chunks)?;
+
+    // Reap completions
+    let cq = ring.completion();
+    let mut errors: Option<io::Error> = None;
+    let mut completed = 0;
+    for cqe in cq {
+        completed += 1;
+        let ret = cqe.result();
+        if ret < 0 {
+            errors.get_or_insert(io::Error::from_raw_os_error(-ret));
+        }
+    }
+    if completed < n_chunks {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "io_uring: not all writes completed",
+        ));
+    }
+    if let Some(e) = errors {
+        return Err(e);
     }
     Ok(())
 }
@@ -111,13 +149,13 @@ struct BufState {
 ///
 /// All actual disk I/O goes through the aligned internal buffer, satisfying
 /// O_DIRECT's alignment requirements for buffer address, file offset, and
-/// I/O size transparently.
-pub struct BufferedDirectFile<F: FileExt> {
+/// I/O size transparently. Flushes are pipelined via io_uring.
+pub struct BufferedDirectFile<F: FileExt + AsRawFd> {
     file: Option<F>,
     state: RefCell<BufState>,
 }
 
-impl<F: FileExt> BufferedDirectFile<F> {
+impl<F: FileExt + AsRawFd> BufferedDirectFile<F> {
     pub fn new(file: F) -> Self {
         Self {
             file: Some(file),
@@ -136,10 +174,7 @@ impl<F: FileExt> BufferedDirectFile<F> {
         self.file.as_ref().unwrap()
     }
 
-    /// Flush dirty bytes to disk in block-aligned chunks.
-    ///
-    /// Writes are chunked to avoid a single large O_DIRECT pwrite that can
-    /// monopolize the CPU in the CIFS client, starving NIC interrupts.
+    /// Flush dirty bytes to disk via io_uring pipelined writes.
     fn flush_dirty(state: &mut BufState, file: &F) -> io::Result<()> {
         if state.dirty_start >= state.dirty_end {
             return Ok(());
@@ -147,12 +182,7 @@ impl<F: FileExt> BufferedDirectFile<F> {
         let start = state.dirty_start & !ALIGN_MASK;
         let end = ((state.dirty_end + ALIGN_MASK) & !ALIGN_MASK).min(state.buf.len());
         let buf = &state.buf.as_slice()[start..end];
-        let mut pos = 0;
-        while pos < buf.len() {
-            let chunk = buf.len().saturating_sub(pos).min(FLUSH_CHUNK);
-            pwrite_full(file, &buf[pos..pos + chunk], state.base + (start + pos) as u64)?;
-            pos += chunk;
-        }
+        uring_pwrite_all(file.as_raw_fd(), buf, state.base + start as u64)?;
         state.dirty_start = usize::MAX;
         state.dirty_end = 0;
         Ok(())
@@ -197,7 +227,7 @@ impl<F: FileExt> BufferedDirectFile<F> {
     }
 }
 
-impl<F: FileExt> Drop for BufferedDirectFile<F> {
+impl<F: FileExt + AsRawFd> Drop for BufferedDirectFile<F> {
     fn drop(&mut self) {
         if let Some(file) = &self.file {
             let state = self.state.get_mut();
@@ -206,7 +236,7 @@ impl<F: FileExt> Drop for BufferedDirectFile<F> {
     }
 }
 
-impl<F: FileExt> FileExt for BufferedDirectFile<F> {
+impl<F: FileExt + AsRawFd> FileExt for BufferedDirectFile<F> {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -237,7 +267,7 @@ impl<F: FileExt> FileExt for BufferedDirectFile<F> {
     }
 }
 
-impl<F: FileExt> Read for BufferedDirectFile<F> {
+impl<F: FileExt + AsRawFd> Read for BufferedDirectFile<F> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -254,7 +284,7 @@ impl<F: FileExt> Read for BufferedDirectFile<F> {
     }
 }
 
-impl<F: FileExt> Write for BufferedDirectFile<F> {
+impl<F: FileExt + AsRawFd> Write for BufferedDirectFile<F> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -280,7 +310,7 @@ impl<F: FileExt> Write for BufferedDirectFile<F> {
     }
 }
 
-impl<F: FileExt> Seek for BufferedDirectFile<F> {
+impl<F: FileExt + AsRawFd> Seek for BufferedDirectFile<F> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         let state = self.state.get_mut();
         state.pos = match pos {

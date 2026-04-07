@@ -19,7 +19,7 @@ use smallvec::SmallVec;
 use crate::aligned_io::BufferedDirectFile;
 use crate::atomic_file::AtomicFile;
 use crate::ctrl::Controller;
-use crate::error::{BkfsError, BkfsResult, BkfsResultExt};
+use crate::error::{BkfsError, BkfsErrorKind, BkfsResult, BkfsResultExt};
 use crate::handle::Handler;
 use crate::inode::{time_now, ContentId, FileData, Inode, InodeAttributes};
 use crate::open_direct;
@@ -334,28 +334,36 @@ impl Contents {
             ctrl,
         })
     }
+    fn init_content_file(&self, path: &std::path::Path) -> BkfsResult<()> {
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let mut init = EncryptedFile::create(open_direct(path, true)?, self.ctrl.key())?;
+        init.file.flush()?;
+        Ok(())
+    }
     pub fn readable(&mut self) -> BkfsResult<&mut Self> {
         if self.file.is_none() {
             let path = self.ctrl.resolve_contents_path(self.content_id);
-            if !path.exists() {
-                // New file: use the current (2-level) path
-                let path = self.ctrl.contents_path(self.content_id);
-                if let Some(parent) = path.parent() {
-                    if !parent.exists() {
-                        std::fs::create_dir_all(parent)?;
-                    }
+            self.file = Some(Err(match open_direct(&path, false)
+                .map_err(BkfsError::from)
+                .and_then(|f| EncryptedFile::open(f, self.ctrl.key()))
+            {
+                Ok(f) => f,
+                Err(e)
+                    if matches!(
+                        &e.kind,
+                        BkfsErrorKind::Io(io) if matches!(io.kind(), io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof)
+                    ) =>
+                {
+                    let path = self.ctrl.contents_path(self.content_id);
+                    self.init_content_file(&path)?;
+                    EncryptedFile::open(open_direct(&path, false)?, self.ctrl.key())?
                 }
-                EncryptedFile::create(open_direct(&path, true)?, self.ctrl.key())?;
-                self.file = Some(Err(EncryptedFile::open(
-                    open_direct(&path, false)?,
-                    self.ctrl.key(),
-                )?));
-            } else {
-                self.file = Some(Err(EncryptedFile::open(
-                    open_direct(&path, false)?,
-                    self.ctrl.key(),
-                )?));
-            }
+                Err(e) => return Err(e),
+            }));
         }
         Ok(self)
     }

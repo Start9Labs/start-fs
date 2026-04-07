@@ -157,13 +157,38 @@ impl<F: FileExt> BufferedDirectFile<F> {
         Ok(())
     }
 
-    /// Ensure the buffer window covers `offset`. Flushes and reloads if needed.
-    fn ensure_window(state: &mut BufState, file: &F, offset: u64) -> io::Result<()> {
+    /// Reset window without reading from disk. Used on the write path to
+    /// avoid an O_DIRECT read (which can deadlock CIFS for regions beyond EOF).
+    fn reset_window(state: &mut BufState, offset: u64) {
+        state.base = align_down(offset);
+        // Zero the buffer so partial-block flushes don't write garbage
+        // SAFETY: buf is valid for writes
+        unsafe {
+            std::ptr::write_bytes(state.buf.ptr.as_ptr(), 0, state.buf.len);
+        }
+        state.valid = 0;
+        state.dirty_start = usize::MAX;
+        state.dirty_end = 0;
+    }
+
+    /// Ensure the buffer window covers `offset` for reading. Flushes and reloads.
+    fn ensure_window_read(state: &mut BufState, file: &F, offset: u64) -> io::Result<()> {
         if offset >= state.base && offset - state.base < BUF_CAP as u64 {
             return Ok(());
         }
         Self::flush_dirty(state, file)?;
         Self::load_window(state, file, offset)
+    }
+
+    /// Ensure the buffer window covers `offset` for writing. Flushes dirty data
+    /// but does NOT read the new window from disk.
+    fn ensure_window_write(state: &mut BufState, file: &F, offset: u64) -> io::Result<()> {
+        if offset >= state.base && offset - state.base < BUF_CAP as u64 {
+            return Ok(());
+        }
+        Self::flush_dirty(state, file)?;
+        Self::reset_window(state, offset);
+        Ok(())
     }
 }
 
@@ -182,7 +207,7 @@ impl<F: FileExt> FileExt for BufferedDirectFile<F> {
             return Ok(0);
         }
         let mut state = self.state.borrow_mut();
-        Self::ensure_window(&mut state, self.file(), offset)?;
+        Self::ensure_window_read(&mut state, self.file(), offset)?;
         let off = (offset - state.base) as usize;
         let available = state.valid.saturating_sub(off);
         let n = buf.len().min(available);
@@ -195,7 +220,7 @@ impl<F: FileExt> FileExt for BufferedDirectFile<F> {
             return Ok(0);
         }
         let mut state = self.state.borrow_mut();
-        Self::ensure_window(&mut state, self.file(), offset)?;
+        Self::ensure_window_write(&mut state, self.file(), offset)?;
         let off = (offset - state.base) as usize;
         let space = BUF_CAP - off;
         let n = buf.len().min(space);
@@ -214,7 +239,7 @@ impl<F: FileExt> Read for BufferedDirectFile<F> {
         }
         let file = self.file.as_ref().unwrap();
         let state = self.state.get_mut();
-        Self::ensure_window(state, file, state.pos)?;
+        Self::ensure_window_read(state, file, state.pos)?;
         let off = (state.pos - state.base) as usize;
         let available = state.valid.saturating_sub(off);
         let n = buf.len().min(available);
@@ -231,7 +256,7 @@ impl<F: FileExt> Write for BufferedDirectFile<F> {
         }
         let file = self.file.as_ref().unwrap();
         let state = self.state.get_mut();
-        Self::ensure_window(state, file, state.pos)?;
+        Self::ensure_window_write(state, file, state.pos)?;
         let off = (state.pos - state.base) as usize;
         let space = BUF_CAP - off;
         let n = buf.len().min(space);

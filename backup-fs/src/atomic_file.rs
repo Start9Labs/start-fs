@@ -1,6 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::ops::{Deref, DerefMut};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::PathBuf;
 
@@ -115,6 +116,11 @@ impl Write for AtomicFile {
 impl Seek for AtomicFile {
     fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
         self.deref_mut().seek(pos)
+    }
+}
+impl AsRawFd for AtomicFile {
+    fn as_raw_fd(&self) -> RawFd {
+        self.deref().as_raw_fd()
     }
 }
 impl FileExt for AtomicFile {

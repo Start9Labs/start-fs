@@ -42,6 +42,7 @@ zeroize = { version = "1.8.1", features = ["serde"] }
 clap = { version = "=4.5.7", optional = true, features = ["derive", "cargo"] }
 env_logger = { version = "0.11", optional = true }
 ctrlc = "3.4.4"
+io-uring = "0.7.11"
 
 [dev-dependencies]
 tempdir = "0.3.7"

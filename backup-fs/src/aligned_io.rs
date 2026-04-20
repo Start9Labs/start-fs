@@ -13,7 +13,34 @@ use crate::error::BkfsResult;
 const BLOCK_SIZE: usize = 4096;
 const ALIGN_MASK: usize = BLOCK_SIZE - 1;
 const BUF_CAP: usize = 1 << 20; // 1 MiB
-const FLUSH_CHUNK: usize = 64 * 1024; // 64 KiB per SQE
+
+/// Chunk size for flush on network filesystems (CIFS/NFS). Keeps per-write
+/// work small enough that CIFS client doesn't stall NIC TX completions.
+const NETFS_FLUSH_CHUNK: usize = 64 * 1024;
+
+/// Chunk size for flush on local filesystems. A single SQE per flush
+/// minimizes per-command overhead on UAS/BOT USB and local block devices.
+const LOCAL_FLUSH_CHUNK: usize = BUF_CAP;
+
+/// Ring is sized for the worst case (most chunks per flush).
+const RING_ENTRIES: u32 = (BUF_CAP / NETFS_FLUSH_CHUNK) as u32;
+
+/// Detect whether an fd lives on a network filesystem that needs small chunks.
+fn flush_chunk_for(fd: RawFd) -> usize {
+    use std::mem::MaybeUninit;
+    let mut sb = MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: fstatfs writes to the provided buffer
+    let rc = unsafe { libc::fstatfs(fd, sb.as_mut_ptr()) };
+    if rc != 0 {
+        return NETFS_FLUSH_CHUNK; // conservative fallback
+    }
+    let sb = unsafe { sb.assume_init() };
+    // CIFS: 0xFF534D42, SMB2: 0xFE534D42, NFS: 0x6969
+    match sb.f_type as u64 {
+        0xFF534D42 | 0xFE534D42 | 0x6969 => NETFS_FLUSH_CHUNK,
+        _ => LOCAL_FLUSH_CHUNK,
+    }
+}
 
 // ── Aligned buffer ────────────────────────────────────
 
@@ -77,22 +104,27 @@ fn pread_full<F: FileExt>(file: &F, buf: &mut [u8], offset: u64) -> io::Result<u
 
 // ── io_uring pipelined flush ──────────────────────────
 
-/// Submit all chunks as pwrite SQEs, then reap completions.
-fn uring_pwrite_all(fd: RawFd, buf: &[u8], offset: u64) -> io::Result<()> {
-    use io_uring::{opcode, types, IoUring};
+/// Submit all chunks as pwrite SQEs on a reused ring, then reap completions.
+fn uring_pwrite_all(
+    ring: &mut io_uring::IoUring,
+    fd: RawFd,
+    buf: &[u8],
+    offset: u64,
+    chunk_size: usize,
+) -> io::Result<()> {
+    use io_uring::{opcode, types};
 
     if buf.is_empty() {
         return Ok(());
     }
 
-    let n_chunks = (buf.len() + FLUSH_CHUNK - 1) / FLUSH_CHUNK;
-    let mut ring = IoUring::new(n_chunks as u32)?;
+    let n_chunks = (buf.len() + chunk_size - 1) / chunk_size;
 
     // Submit all chunks
     {
         let mut sq = ring.submission();
-        for (i, chunk) in buf.chunks(FLUSH_CHUNK).enumerate() {
-            let off = offset + (i * FLUSH_CHUNK) as u64;
+        for (i, chunk) in buf.chunks(chunk_size).enumerate() {
+            let off = offset + (i * chunk_size) as u64;
             let entry = opcode::Write::new(types::Fd(fd), chunk.as_ptr(), chunk.len() as u32)
                 .offset(off)
                 .build()
@@ -107,17 +139,16 @@ fn uring_pwrite_all(fd: RawFd, buf: &[u8], offset: u64) -> io::Result<()> {
     ring.submit_and_wait(n_chunks)?;
 
     // Reap completions and check for errors / short writes
-    let cq = ring.completion();
     let mut errors: Option<io::Error> = None;
     let mut completed = 0;
-    for cqe in cq {
+    for cqe in ring.completion() {
         completed += 1;
         let ret = cqe.result();
         if ret < 0 {
             errors.get_or_insert(io::Error::from_raw_os_error(-ret));
         } else {
             let idx = cqe.user_data() as usize;
-            let expected = buf.chunks(FLUSH_CHUNK).nth(idx).map_or(0, |c| c.len());
+            let expected = buf.chunks(chunk_size).nth(idx).map_or(0, |c| c.len());
             if (ret as usize) < expected {
                 errors.get_or_insert(io::Error::new(
                     io::ErrorKind::WriteZero,
@@ -146,12 +177,19 @@ struct BufState {
     base: u64,
     /// Bytes in the buffer that contain valid data (from disk or writes).
     valid: usize,
+    /// Prefix length of the buffer loaded from disk (via load_window).
+    /// Anything outside [0, loaded) needs a RMW read before a partial-block flush.
+    loaded: usize,
     /// First dirty byte in the buffer (usize::MAX when clean).
     dirty_start: usize,
     /// One-past-last dirty byte.
     dirty_end: usize,
     /// Sequential read/write cursor (absolute file offset).
     pos: u64,
+    /// Reusable io_uring for flush_dirty.
+    ring: io_uring::IoUring,
+    /// Flush chunk size (selected per-filesystem at construction).
+    flush_chunk: usize,
 }
 
 /// Wraps an O_DIRECT file descriptor with a 1 MiB write-back buffer.
@@ -165,18 +203,22 @@ pub struct BufferedDirectFile<F: FileExt + AsRawFd> {
 }
 
 impl<F: FileExt + AsRawFd> BufferedDirectFile<F> {
-    pub fn new(file: F) -> Self {
-        Self {
+    pub fn new(file: F) -> io::Result<Self> {
+        let flush_chunk = flush_chunk_for(file.as_raw_fd());
+        Ok(Self {
             file: Some(file),
             state: RefCell::new(BufState {
                 buf: AlignedBuf::new(BUF_CAP),
                 base: u64::MAX, // sentinel: no window loaded
                 valid: 0,
+                loaded: 0,
                 dirty_start: usize::MAX,
                 dirty_end: 0,
                 pos: 0,
+                ring: io_uring::IoUring::new(RING_ENTRIES)?,
+                flush_chunk,
             }),
-        }
+        })
     }
 
     fn file(&self) -> &F {
@@ -184,14 +226,54 @@ impl<F: FileExt + AsRawFd> BufferedDirectFile<F> {
     }
 
     /// Flush dirty bytes to disk via io_uring pipelined writes.
+    ///
+    /// O_DIRECT requires block-aligned writes, so the flush range is rounded
+    /// out to block boundaries. If the dirty range doesn't start/end on a
+    /// block boundary, the partial blocks at the edges are read from disk
+    /// first to preserve their non-dirty bytes (read-modify-write).
     fn flush_dirty(state: &mut BufState, file: &F) -> io::Result<()> {
         if state.dirty_start >= state.dirty_end {
             return Ok(());
         }
         let start = state.dirty_start & !ALIGN_MASK;
         let end = ((state.dirty_end + ALIGN_MASK) & !ALIGN_MASK).min(state.buf.len());
+
+        // Fill partial-block gaps from disk. Only read the non-dirty portion
+        // of each partial block to avoid clobbering the user's writes.
+        //
+        // Head gap: bytes [start..dirty_start) — the prefix of the first block
+        // that rounds down past the dirty range.
+        if start < state.dirty_start && state.loaded < state.dirty_start {
+            let gap_start = state.loaded.max(start);
+            let head = &mut state.buf.as_mut_slice()[gap_start..state.dirty_start];
+            let n = pread_full(file, head, state.base + gap_start as u64)?;
+            if n < head.len() {
+                head[n..].fill(0);
+            }
+            state.loaded = state.loaded.max(gap_start + n);
+        }
+
+        // Tail gap: bytes [dirty_end..end) — the suffix of the last block
+        // that rounds up past the dirty range.
+        if end > state.dirty_end && state.loaded < end {
+            let gap_start = state.loaded.max(state.dirty_end);
+            let tail = &mut state.buf.as_mut_slice()[gap_start..end];
+            let n = pread_full(file, tail, state.base + gap_start as u64)?;
+            if n < tail.len() {
+                tail[n..].fill(0);
+            }
+            state.loaded = state.loaded.max(gap_start + n);
+        }
+
         let buf = &state.buf.as_slice()[start..end];
-        uring_pwrite_all(file.as_raw_fd(), buf, state.base + start as u64)?;
+        let chunk = state.flush_chunk;
+        uring_pwrite_all(
+            &mut state.ring,
+            file.as_raw_fd(),
+            buf,
+            state.base + start as u64,
+            chunk,
+        )?;
         state.dirty_start = usize::MAX;
         state.dirty_end = 0;
         Ok(())
@@ -200,7 +282,9 @@ impl<F: FileExt + AsRawFd> BufferedDirectFile<F> {
     /// Load a new window starting at the block containing `offset`.
     fn load_window(state: &mut BufState, file: &F, offset: u64) -> io::Result<()> {
         state.base = align_down(offset);
-        state.valid = pread_full(file, state.buf.as_mut_slice(), state.base)?;
+        let n = pread_full(file, state.buf.as_mut_slice(), state.base)?;
+        state.valid = n;
+        state.loaded = n;
         state.dirty_start = usize::MAX;
         state.dirty_end = 0;
         Ok(())
@@ -211,6 +295,7 @@ impl<F: FileExt + AsRawFd> BufferedDirectFile<F> {
     fn reset_window(state: &mut BufState, offset: u64) {
         state.base = align_down(offset);
         state.valid = 0;
+        state.loaded = 0;
         state.dirty_start = usize::MAX;
         state.dirty_end = 0;
     }

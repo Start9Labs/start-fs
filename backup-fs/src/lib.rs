@@ -63,7 +63,8 @@ pub(crate) fn open_direct(path: &Path, create: bool) -> io::Result<aligned_io::B
     if create {
         opts.write(true).create(true).truncate(true);
     }
-    Ok(aligned_io::BufferedDirectFile::new(opts.open(path)?))
+    aligned_io::BufferedDirectFile::new(opts.open(path)?)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 }
 
 #[cfg_attr(feature = "cli", derive(clap::Parser))]
@@ -132,7 +133,7 @@ impl CryptInfo {
     }
     pub fn load(path: &Path, password: &str) -> BkfsResult<Self> {
         load(EncryptedFile::open_pbkdf2(
-            aligned_io::BufferedDirectFile::new(File::open(path)?),
+            aligned_io::BufferedDirectFile::new(File::open(path)?)?,
             password,
         )?)
     }
@@ -140,7 +141,7 @@ impl CryptInfo {
         save(
             self,
             EncryptedFile::create_pbkdf2(
-                aligned_io::BufferedDirectFile::new(AtomicFile::create(path)?),
+                aligned_io::BufferedDirectFile::new(AtomicFile::create(path)?)?,
                 password,
             )?,
         )

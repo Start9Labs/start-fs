@@ -175,7 +175,7 @@ impl MergedFile {
                     .truncate(true)
                     .create(true)
                     .custom_flags(libc::O_DIRECT),
-            )?),
+            )?)?,
             key,
         )?;
         Ok(Self {

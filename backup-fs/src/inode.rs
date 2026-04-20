@@ -165,7 +165,8 @@ impl From<&InodeAttributes> for fuser::FileAttr {
         fuser::FileAttr {
             ino: inode.0,
             size: attrs.size,
-            blocks: (attrs.size + BLOCK_SIZE - 1) / BLOCK_SIZE,
+            // st_blocks is reported in 512-byte units per POSIX, independent of blksize
+            blocks: attrs.size.div_ceil(512),
             atime: system_time_from_time(attrs.atime.0, attrs.atime.1),
             mtime: system_time_from_time(attrs.mtime.0, attrs.mtime.1),
             ctime: system_time_from_time(attrs.ctime.0, attrs.ctime.1),

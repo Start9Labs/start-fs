@@ -44,6 +44,7 @@ mod directory;
 pub mod error;
 mod handle;
 mod inode;
+mod pool;
 mod serde;
 #[cfg(test)]
 mod tests;

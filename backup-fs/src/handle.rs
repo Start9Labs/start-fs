@@ -1,12 +1,11 @@
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::cmp::min;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::ops::Bound;
 use std::path::PathBuf;
-use std::rc::{Rc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::SystemTime;
 
 use fuser::consts::FUSE_WRITE_KILL_PRIV;
@@ -29,7 +28,7 @@ const DIRTY_INODE_LIMIT: usize = 1024;
 pub struct Handler {
     ctrl: Controller,
     next_fh: FileHandleId,
-    inodes: BTreeMap<Inode, Weak<RefCell<Contents>>>,
+    inodes: BTreeMap<Inode, Weak<Mutex<Contents>>>,
     /// Inode attrs with unpersisted changes. Only non-open inodes go
     /// here — for open inodes, Contents holds the authoritative copy and
     /// will persist via Contents::fsync on release.
@@ -122,7 +121,7 @@ impl Handler {
     /// hasn't been flushed.
     pub fn load_inode(&self, inode: Inode) -> BkfsResult<InodeAttributes> {
         if let Some(contents) = self.inodes.get(&inode).and_then(Weak::upgrade) {
-            return Ok(contents.borrow().inode.clone());
+            return Ok(contents.lock().unwrap().inode.clone());
         }
         if let Some(attrs) = self.dirty.get(&inode) {
             return Ok(attrs.clone());
@@ -144,19 +143,19 @@ impl Handler {
         } else if let Some(dirty) = self.dirty.remove(&inode) {
             // Fold any pending metadata-only changes into the fresh
             // Contents so they persist via Contents::fsync on release.
-            let contents = Rc::new(RefCell::new(Contents::open_with_attrs(
+            let contents = Arc::new(Mutex::new(Contents::open_with_attrs(
                 self.ctrl.clone(),
                 dirty,
                 true,
             )?));
-            self.inodes.insert(inode, Rc::downgrade(&contents));
+            self.inodes.insert(inode, Arc::downgrade(&contents));
             contents
         } else {
-            let contents = Rc::new(RefCell::new(Contents::open(self.ctrl.clone(), inode)?));
-            self.inodes.insert(inode, Rc::downgrade(&contents));
+            let contents = Arc::new(Mutex::new(Contents::open(self.ctrl.clone(), inode)?));
+            self.inodes.insert(inode, Arc::downgrade(&contents));
             contents
         };
-        access(self, &RefCell::borrow(&*contents).inode)?;
+        access(self, &contents.lock().unwrap().inode)?;
         let fh = self.next_fh;
         self.next_fh.0 += 1;
         self.open_files.insert(
@@ -195,7 +194,7 @@ impl Handler {
         f: F,
     ) -> BkfsResult<T> {
         if let Some(contents) = self.inodes.get(&inode).and_then(Weak::upgrade) {
-            let mut contents = contents.borrow_mut();
+            let mut contents = contents.lock().unwrap();
             f(self, &mut contents.inode)
         } else if let Some(mut attrs) = self.dirty.remove(&inode) {
             let result = f(self, &mut attrs);
@@ -219,7 +218,7 @@ impl Handler {
         f: F,
     ) -> BkfsResult<T> {
         if let Some(contents) = self.inodes.get(&inode).and_then(Weak::upgrade) {
-            let contents = contents.borrow_mut();
+            let contents = contents.lock().unwrap();
             f(&contents.inode)
         } else if let Some(attrs) = self.dirty.get(&inode) {
             f(attrs)
@@ -237,13 +236,13 @@ pub struct FileHandle {
     pub inode: Inode,
     pub read: bool,
     pub write: bool,
-    pub contents: Rc<RefCell<Contents>>,
+    pub contents: Arc<Mutex<Contents>>,
 }
 impl FileHandle {
     pub fn close(self, handler: &mut Handler) -> BkfsResult<()> {
-        match Rc::try_unwrap(self.contents) {
-            Ok(contents) => contents.into_inner().close(handler)?,
-            Err(contents) => contents.borrow_mut().fsync()?,
+        match Arc::try_unwrap(self.contents) {
+            Ok(contents) => contents.into_inner().unwrap().close(handler)?,
+            Err(contents) => contents.lock().unwrap().fsync()?,
         }
         Ok(())
     }
@@ -727,7 +726,7 @@ impl Handler {
             return BkfsResult::errno(libc::EACCES);
         }
 
-        let mut contents = fh.contents.borrow_mut();
+        let mut contents = fh.contents.lock().unwrap();
 
         let size = min(size, (contents.inode.attrs.size - offset) as usize);
 
@@ -757,7 +756,7 @@ impl Handler {
             return BkfsResult::errno(libc::EACCES);
         }
 
-        let mut contents = fh.contents.borrow_mut();
+        let mut contents = fh.contents.lock().unwrap();
 
         let mut buf = data.to_vec();
 
@@ -780,7 +779,7 @@ impl Handler {
             .handle(fh)
             .ok_or(libc::EBADF)
             .map_err(io::Error::from_raw_os_error)?;
-        fh.contents.borrow_mut().fsync()?;
+        fh.contents.lock().unwrap().fsync()?;
         Ok(())
     }
 
@@ -1042,7 +1041,7 @@ impl Handler {
             return BkfsResult::errno(libc::EACCES);
         }
 
-        let mut contents = fh.contents.borrow_mut();
+        let mut contents = fh.contents.lock().unwrap();
         contents.fallocate(offset, length, mode, mode & libc::FALLOC_FL_KEEP_SIZE != 0)?;
         Ok(())
     }

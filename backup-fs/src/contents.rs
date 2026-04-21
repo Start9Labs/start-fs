@@ -318,6 +318,15 @@ pub struct Contents {
     file: Option<Result<MergedFile, EncryptedFile>>,
     ctrl: Controller,
 }
+
+// Contents will be owned by an Arc<Mutex<_>> shared with the worker
+// pool — if any field regresses to a !Send type we want to fail the
+// build here rather than at the dispatch site.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<Contents>();
+};
+
 impl Contents {
     pub fn open(ctrl: Controller, inode: Inode) -> BkfsResult<Self> {
         let attrs: InodeAttributes = ctrl.load(inode)?;

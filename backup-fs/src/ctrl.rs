@@ -1,8 +1,7 @@
-use std::cell::RefCell;
 use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use chacha20::cipher::{Iv, KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20::{ChaCha20, Key};
@@ -20,7 +19,15 @@ use crate::util::IdPool;
 use crate::{BackupFSOptions, CryptInfo};
 
 #[derive(Clone)]
-pub struct Controller(Rc<ControllerSeed>);
+pub struct Controller(Arc<ControllerSeed>);
+
+// Controller is cloned across worker threads once the worker pool is
+// wired up. Compile-time check that interior mutability stays
+// thread-safe.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Controller>();
+};
 
 const U16_MSB: u16 = 0b1000_0000_0000_0000;
 
@@ -29,17 +36,17 @@ pub struct ControllerSeed {
     cryptinfo_path: PathBuf,
     cryptinfo: CryptInfo,
     key: Key,
-    inode_cipher: RefCell<ChaCha20>,
-    contents_cipher: RefCell<ChaCha20>,
+    inode_cipher: Mutex<ChaCha20>,
+    contents_cipher: Mutex<ChaCha20>,
     inode_dir: PathBuf,
     contents_dir: PathBuf,
     inode_pool_path: PathBuf,
-    inode_pool: RefCell<IdPool>,
+    inode_pool: Mutex<IdPool>,
 }
 
-fn encrypt_u64(cipher: &RefCell<ChaCha20>, num: u64) -> [u8; 8] {
+fn encrypt_u64(cipher: &Mutex<ChaCha20>, num: u64) -> [u8; 8] {
     let mut buf = u64::to_be_bytes(num);
-    let mut cipher = cipher.borrow_mut();
+    let mut cipher = cipher.lock().unwrap();
     cipher.seek(num * std::mem::size_of::<u64>() as u64);
     cipher.apply_keystream(&mut buf);
     buf
@@ -98,14 +105,14 @@ impl Controller {
         let key = Key::clone_from_slice(&*cryptinfo.key);
         let inode_iv = Iv::<ChaCha20>::clone_from_slice(&cryptinfo.inode_iv);
         let contents_iv = Iv::<ChaCha20>::clone_from_slice(&cryptinfo.inode_iv);
-        Ok(Self(Rc::new(ControllerSeed {
-            inode_cipher: RefCell::new(ChaCha20::new(&key, &inode_iv)),
-            contents_cipher: RefCell::new(ChaCha20::new(&key, &contents_iv)),
+        Ok(Self(Arc::new(ControllerSeed {
+            inode_cipher: Mutex::new(ChaCha20::new(&key, &inode_iv)),
+            contents_cipher: Mutex::new(ChaCha20::new(&key, &contents_iv)),
             key,
             inode_dir: config.data_dir.join("inodes"),
             contents_dir: config.data_dir.join("contents"),
             inode_pool_path: config.data_dir.join("inode_pool"),
-            inode_pool: RefCell::new(IdPool::new()),
+            inode_pool: Mutex::new(IdPool::new()),
             config,
             cryptinfo_path,
             cryptinfo,
@@ -120,7 +127,7 @@ impl Controller {
                 .and_then(load)
             {
                 Ok(pool) => {
-                    self.0.inode_pool.replace(pool);
+                    *self.0.inode_pool.lock().unwrap() = pool;
                     return Ok(());
                 }
                 Err(e) => {
@@ -134,7 +141,7 @@ impl Controller {
     }
 
     pub fn fsck(&self, find_orphans: bool) -> BkfsResult<()> {
-        self.0.inode_pool.replace(IdPool::new());
+        *self.0.inode_pool.lock().unwrap() = IdPool::new();
         self.fsck_inode(Inode(FUSE_ROOT_ID), None)?;
         if find_orphans {
             self.find_orphans()?;
@@ -149,7 +156,7 @@ impl Controller {
     ) -> BkfsResult<bool> {
         let mut prune = false;
         let mut changed = false;
-        self.0.inode_pool.borrow_mut().remove(inode.0);
+        self.0.inode_pool.lock().unwrap().remove(inode.0);
         // match self.load::(args)
         let mut inode = match self.load::<InodeAttributes>(inode) {
             Ok(mut inode) => {
@@ -263,7 +270,7 @@ impl Controller {
 
     pub fn next_inode(&self) -> BkfsResult<Inode> {
         self.check_rw()?;
-        let mut pool = self.0.inode_pool.borrow_mut();
+        let mut pool = self.0.inode_pool.lock().unwrap();
         let res: u64 = pool
             .next()
             .ok_or(libc::EMFILE)
@@ -333,7 +340,7 @@ pub struct StatFs {
 
 impl Controller {
     pub fn statfs(&self) -> StatFs {
-        let pool = self.0.inode_pool.borrow();
+        let pool = self.0.inode_pool.lock().unwrap();
         StatFs {
             ffree: pool.free_space(),
             files: pool.used_space(),

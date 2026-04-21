@@ -1,7 +1,10 @@
 use std::ffi::OsString;
+use std::fs::File;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chacha20::cipher::{Iv, KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20::{ChaCha20, Key};
@@ -42,6 +45,14 @@ pub struct ControllerSeed {
     contents_dir: PathBuf,
     inode_pool_path: PathBuf,
     inode_pool: Mutex<IdPool>,
+    /// Counts fast (non-durable) saves since the last syncfs. Both
+    /// dispatch-thread eviction and worker-thread content saves bump
+    /// this; when it reaches the batch threshold, the next caller
+    /// triggers a syncfs that flushes everything accumulated.
+    pending_saves: AtomicUsize,
+    /// Cached fd on the data dir for syncfs. Lazily opened and reused
+    /// so the batched syncfs path doesn't pay an open(2) on every call.
+    data_dir_fd: OnceLock<File>,
 }
 
 fn encrypt_u64(cipher: &Mutex<ChaCha20>, num: u64) -> [u8; 8] {
@@ -113,6 +124,8 @@ impl Controller {
             contents_dir: config.data_dir.join("contents"),
             inode_pool_path: config.data_dir.join("inode_pool"),
             inode_pool: Mutex::new(IdPool::new()),
+            pending_saves: AtomicUsize::new(0),
+            data_dir_fd: OnceLock::new(),
             config,
             cryptinfo_path,
             cryptinfo,
@@ -311,6 +324,14 @@ impl Controller {
         item.save(self)
     }
 
+    /// As `save`, but skips per-file sync_all. The caller must account for
+    /// the write in `tick_save` (or call `syncfs` directly) so durability
+    /// eventually catches up.
+    pub fn save_fast<T: Save>(&self, item: T) -> BkfsResult<()> {
+        self.check_rw()?;
+        item.save_fast(self)
+    }
+
     pub fn load<T: Load>(&self, args: T::Args<'_>) -> BkfsResult<T> {
         T::load(self, args)
     }
@@ -318,10 +339,68 @@ impl Controller {
     pub fn exists<T: Exists>(&self, args: T::Args<'_>) -> bool {
         T::exists(self, args)
     }
+
+    fn data_dir_fd(&self) -> io::Result<&File> {
+        if let Some(f) = self.0.data_dir_fd.get() {
+            return Ok(f);
+        }
+        let fd = File::open(&self.0.config.data_dir)?;
+        // Another thread may have raced us; either outcome is fine,
+        // the loser drops its fd.
+        let _ = self.0.data_dir_fd.set(fd);
+        Ok(self.0.data_dir_fd.get().unwrap())
+    }
+
+    /// Flush the entire backing filesystem's page cache and device
+    /// write cache. One syncfs replaces many per-file fsync calls when
+    /// batching writes with `save_fast`.
+    pub fn syncfs(&self) -> io::Result<()> {
+        let fd = self.data_dir_fd()?.as_raw_fd();
+        // Zero the pending counter under the same call — any races
+        // just cause an extra syncfs later, which is harmless.
+        self.0.pending_saves.store(0, Ordering::Relaxed);
+        // SAFETY: fd is a valid fd we own (held in data_dir_fd).
+        if unsafe { libc::syncfs(fd) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Batch threshold for group-commit. Overridden via
+    /// `BACKUPFS_SYNC_BATCH`. Larger batches amortize more per-fsync
+    /// cost but widen the durability window.
+    fn sync_batch() -> usize {
+        static BATCH: OnceLock<usize> = OnceLock::new();
+        *BATCH.get_or_init(|| {
+            std::env::var("BACKUPFS_SYNC_BATCH")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(256)
+        })
+    }
+
+    /// Account for one fast save. When the batch threshold is reached,
+    /// issue a syncfs that flushes everything accumulated.
+    pub fn tick_save(&self) -> io::Result<()> {
+        let n = self.0.pending_saves.fetch_add(1, Ordering::Relaxed) + 1;
+        if n >= Self::sync_batch() {
+            self.syncfs()?;
+        }
+        Ok(())
+    }
 }
 
 pub trait Save {
     fn save(self, ctrl: &Controller) -> BkfsResult<()>;
+    /// Save without sync_all. Default falls back to `save`; implement
+    /// this for types whose save path supports the fast variant.
+    fn save_fast(self, ctrl: &Controller) -> BkfsResult<()>
+    where
+        Self: Sized,
+    {
+        self.save(ctrl)
+    }
 }
 
 pub trait Load: Sized {

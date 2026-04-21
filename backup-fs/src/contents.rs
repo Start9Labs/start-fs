@@ -127,6 +127,17 @@ impl EncryptedFile<BufferedDirectFile<AtomicFile>> {
     pub fn save(self) -> BkfsResult<()> {
         self.file.save()
     }
+    pub fn save_fast(self) -> BkfsResult<()> {
+        self.file.save_fast()
+    }
+}
+impl EncryptedFile<AtomicFile> {
+    pub fn save(self) -> BkfsResult<()> {
+        self.file.save()
+    }
+    pub fn save_fast(self) -> BkfsResult<()> {
+        self.file.save_fast()
+    }
 }
 impl<F: Read + Write + Seek + FileExt> Read for EncryptedFile<F> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -272,7 +283,9 @@ impl MergedFile {
         self.add_written(offset, buf.len() as u64);
         Ok(())
     }
-    fn save(mut self, size: u64) -> BkfsResult<()> {
+    /// Drain `src` into `dst`, truncate to `size`. Leaves the inner
+    /// destination staged but not yet renamed into place.
+    fn finalize(&mut self, size: u64) -> BkfsResult<()> {
         let mut remaining = size;
         let mut start = 0_u64;
         let mut len;
@@ -305,8 +318,16 @@ impl MergedFile {
         } else if start > size {
             self.dst.file.set_len(size + self.dst.offset)?;
         }
+        Ok(())
+    }
+
+    /// Drain and rename without a per-file sync_all. Durability is
+    /// deferred to the caller's batched syncfs — see
+    /// `Controller::tick_save` / `Controller::syncfs`.
+    fn save_fast(mut self, size: u64) -> BkfsResult<()> {
+        self.finalize(size)?;
         drop(self.src);
-        self.dst.save()?;
+        self.dst.save_fast()?;
         Ok(())
     }
 }
@@ -468,7 +489,12 @@ impl Contents {
         }
         Ok(())
     }
-    pub fn fsync(&mut self) -> BkfsResult<()> {
+    /// Drain pending writes to disk via the fast path (no per-file
+    /// sync_all). Both the content file and the inode go through a
+    /// batched syncfs — see `Controller::tick_save`. Returns the
+    /// newly-saved inode attrs if a content write happened so the
+    /// caller can route the metadata save appropriately.
+    pub fn flush(&mut self) -> BkfsResult<()> {
         if let Some(Ok(f)) = std::mem::take(&mut self.file) {
             let size = self.ctrl.file_pad(min(
                 self.inode.attrs.size,
@@ -477,19 +503,61 @@ impl Contents {
                     f.written.last_key_value().map_or(0, |(p, l)| *p + *l),
                 ),
             ));
-            f.save(size)?;
+            f.save_fast(size)?;
+            self.ctrl.tick_save()?;
         }
         if self.changed {
-            self.ctrl.save(&self.inode)?;
+            self.ctrl.save_fast(&self.inode)?;
+            self.ctrl.tick_save()?;
+            self.changed = false;
         }
         Ok(())
     }
+
+    /// User-requested fsync: flush then syncfs. Forces everything
+    /// accumulated across all fast saves to stable storage, not just
+    /// this file — that's exactly what the kernel documentation
+    /// suggests syncfs is for, and it matches what rsync / cp
+    /// actually need after a large batch.
+    pub fn fsync(&mut self) -> BkfsResult<()> {
+        self.flush()?;
+        self.ctrl.syncfs()?;
+        Ok(())
+    }
+
     pub fn truncate(&mut self, size: u64) {
         self.inode.attrs.size = size;
     }
     pub fn close(mut self, handler: &mut Handler) -> BkfsResult<()> {
-        self.fsync()?;
-        handler.gc_inode(&self.inode)?;
+        // Write the content file fast, then hand the inode save to the
+        // dirty cache so subsequent setattrs (rsync's post-close
+        // chmod/chown/utime trio) coalesce onto the same disk write.
+        self.flush_content_only()?;
+        let attrs = self.inode.clone();
+        let changed = self.changed;
+        // Drop so the Weak in handler.inodes has strong_count == 0 and
+        // gc_inode can collect if this was the last reference.
+        drop(self);
+        if !handler.gc_inode(&attrs)? && changed {
+            handler.save_inode(&attrs)?;
+        }
+        Ok(())
+    }
+
+    /// Flush content data (fast path), but don't persist the inode —
+    /// the caller will route that through the dirty cache.
+    fn flush_content_only(&mut self) -> BkfsResult<()> {
+        if let Some(Ok(f)) = std::mem::take(&mut self.file) {
+            let size = self.ctrl.file_pad(min(
+                self.inode.attrs.size,
+                max(
+                    f.src.file.metadata()?.len(),
+                    f.written.last_key_value().map_or(0, |(p, l)| *p + *l),
+                ),
+            ));
+            f.save_fast(size)?;
+            self.ctrl.tick_save()?;
+        }
         Ok(())
     }
 }

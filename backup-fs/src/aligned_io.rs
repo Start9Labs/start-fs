@@ -561,6 +561,14 @@ impl BufferedDirectFile<AtomicFile> {
         self.file.take().unwrap().save()
     }
 
+    /// Flush the buffered window + rename, but skip sync_all. Paired
+    /// with a batched syncfs at the dispatch layer — see
+    /// `AtomicFile::save_fast` for the trade-off.
+    pub fn save_fast(mut self) -> BkfsResult<()> {
+        self.flush()?;
+        self.file.take().unwrap().save_fast()
+    }
+
     pub fn set_len(&mut self, size: u64) -> io::Result<()> {
         let file = self.file.as_ref().unwrap();
         let state = self.state.get_mut();

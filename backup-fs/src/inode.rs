@@ -1,4 +1,5 @@
 use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -14,7 +15,7 @@ use crate::ctrl::{Controller, Exists, Load, Save};
 use crate::directory::DirectoryContents;
 use crate::error::{BkfsResult, BkfsResultExt};
 use crate::handle::{FileHandleId, Handler};
-use crate::serde::{load, save};
+use crate::serde::{load, save, save_fast};
 use crate::{get_groups, IdMappedRoot};
 
 pub const BLOCK_SIZE: u64 = 4096;
@@ -227,7 +228,19 @@ impl<'a> Save for &'a InodeAttributes {
     fn save(self, ctrl: &Controller) -> BkfsResult<()> {
         save(
             &self.attrs,
-            EncryptedFile::create(crate::aligned_io::BufferedDirectFile::new(AtomicFile::create(ctrl.inode_path(self.inode))?)?, ctrl.key())?,
+            EncryptedFile::create(
+                AtomicFile::create_buffered(ctrl.inode_path(self.inode))?,
+                ctrl.key(),
+            )?,
+        )
+    }
+    fn save_fast(self, ctrl: &Controller) -> BkfsResult<()> {
+        save_fast(
+            &self.attrs,
+            EncryptedFile::create(
+                AtomicFile::create_buffered(ctrl.inode_path(self.inode))?,
+                ctrl.key(),
+            )?,
         )
     }
 }
@@ -238,7 +251,7 @@ impl Load for InodeAttributes {
         Ok(InodeAttributes {
             inode,
             attrs: load(EncryptedFile::open(
-                crate::open_direct(&ctrl.resolve_inode_path(inode), false)?,
+                File::open(ctrl.resolve_inode_path(inode))?,
                 ctrl.key(),
             )?)?,
         })

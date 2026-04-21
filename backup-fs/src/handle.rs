@@ -71,7 +71,12 @@ impl Handler {
             .and_then(Weak::upgrade)
             .is_some()
         {
-            return self.ctrl.save(attrs);
+            // Open inodes skip the dirty cache, but still go through
+            // the batched sync path — per-file sync_all on inode saves
+            // was a major small-file bottleneck on slow backing stores.
+            self.ctrl.save_fast(attrs)?;
+            self.ctrl.tick_save()?;
+            return Ok(());
         }
         self.dirty.insert(attrs.inode, attrs.clone());
         self.evict_dirty_overflow()
@@ -98,7 +103,8 @@ impl Handler {
                 break;
             };
             let attrs = self.dirty.remove(&inode).unwrap();
-            self.ctrl.save(&attrs)?;
+            self.ctrl.save_fast(&attrs)?;
+            self.ctrl.tick_save()?;
         }
         Ok(())
     }
@@ -108,9 +114,15 @@ impl Handler {
         let pending = std::mem::take(&mut self.dirty);
         let mut errs = Vec::new();
         for (_, attrs) in pending {
-            if let Err(e) = self.ctrl.save(&attrs) {
+            if let Err(e) = self.ctrl.save_fast(&attrs) {
                 errs.push(e);
             }
+        }
+        // Belt-and-braces durability on the final flush — unmount path
+        // has to leave every dirty inode on stable storage, not just
+        // in the page cache.
+        if let Err(e) = self.ctrl.syncfs() {
+            errs.push(e.into());
         }
         BkfsResult::multiple((), errs)
     }

@@ -20,10 +20,26 @@ use crate::error::{BkfsResult, BkfsResultExt};
 use crate::inode::{FileData, Inode, InodeAttributes};
 use crate::{FMODE_EXEC, MAX_NAME_LENGTH};
 
+/// Upper bound on in-memory unpersisted inode attributes before we start
+/// evicting oldest-first. The cap exists only so memory use is bounded
+/// on pathological workloads — for typical rsync traffic the set stays
+/// small because each release-on-close opens+removes the entry.
+const DIRTY_INODE_LIMIT: usize = 1024;
+
 pub struct Handler {
     ctrl: Controller,
     next_fh: FileHandleId,
     inodes: BTreeMap<Inode, Weak<RefCell<Contents>>>,
+    /// Inode attrs with unpersisted changes. Only non-open inodes go
+    /// here — for open inodes, Contents holds the authoritative copy and
+    /// will persist via Contents::fsync on release.
+    ///
+    /// rsync's typical per-file pattern is create → write → release →
+    /// utime → chmod → chown. The utime/chmod/chown trio all mutate the
+    /// same inode after release, and before this cache they each fired a
+    /// full AtomicFile::save barrier. Here they collapse into a single
+    /// save when the inode is evicted (or on destroy).
+    dirty: BTreeMap<Inode, InodeAttributes>,
     open_files: BTreeMap<FileHandleId, FileHandle>,
     open_dirs: BTreeMap<FileHandleId, DirHandle>,
 }
@@ -33,9 +49,85 @@ impl Handler {
             ctrl,
             next_fh: FileHandleId(1),
             inodes: BTreeMap::new(),
+            dirty: BTreeMap::new(),
             open_files: BTreeMap::new(),
             open_dirs: BTreeMap::new(),
         }
+    }
+
+    /// Queue an inode save. For non-open inodes the attrs go into the
+    /// dirty cache and get coalesced until eviction or destroy — this is
+    /// where rsync's post-close utime/chmod/chown trio collapses to one
+    /// disk write.
+    ///
+    /// For open inodes we save through immediately (same as the historical
+    /// behaviour). We can't mark Contents::changed from here without
+    /// re-borrowing — most callers are already inside a mutate_inode
+    /// closure that holds the RefCell borrow. Luckily the important
+    /// coalescing case (setattrs on closed files) is the one rsync uses.
+    pub fn save_inode(&mut self, attrs: &InodeAttributes) -> BkfsResult<()> {
+        if self
+            .inodes
+            .get(&attrs.inode)
+            .and_then(Weak::upgrade)
+            .is_some()
+        {
+            return self.ctrl.save(attrs);
+        }
+        self.dirty.insert(attrs.inode, attrs.clone());
+        self.evict_dirty_overflow()
+    }
+
+    /// Drop a dirty entry without saving — used when an inode is about
+    /// to be removed (unlink+gc path).
+    pub fn forget_dirty(&mut self, inode: Inode) {
+        self.dirty.remove(&inode);
+    }
+
+    /// Remove and return a dirty entry if present. Used by fopen so a
+    /// newly-opened Contents starts from the freshest unpersisted state.
+    pub fn take_dirty(&mut self, inode: Inode) -> Option<InodeAttributes> {
+        self.dirty.remove(&inode)
+    }
+
+    fn evict_dirty_overflow(&mut self) -> BkfsResult<()> {
+        while self.dirty.len() > DIRTY_INODE_LIMIT {
+            // BTreeMap's first key is the smallest Inode — roughly "oldest
+            // allocated," which correlates with "least recently rsync'd"
+            // for a sequential backup. Good enough as an eviction hint.
+            let Some((&inode, _)) = self.dirty.iter().next() else {
+                break;
+            };
+            let attrs = self.dirty.remove(&inode).unwrap();
+            self.ctrl.save(&attrs)?;
+        }
+        Ok(())
+    }
+
+    /// Persist all dirty entries. Called on destroy.
+    pub fn flush_all_dirty(&mut self) -> BkfsResult<()> {
+        let pending = std::mem::take(&mut self.dirty);
+        let mut errs = Vec::new();
+        for (_, attrs) in pending {
+            if let Err(e) = self.ctrl.save(&attrs) {
+                errs.push(e);
+            }
+        }
+        BkfsResult::multiple((), errs)
+    }
+
+    /// Load an inode, preferring the dirty cache and open Contents over
+    /// the disk copy. Direct `ctrl.load` bypasses both caches and would
+    /// return a stale version for any inode whose most recent mutation
+    /// hasn't been flushed.
+    pub fn load_inode(&self, inode: Inode) -> BkfsResult<InodeAttributes> {
+        if let Some(contents) = self.inodes.get(&inode).and_then(Weak::upgrade) {
+            return Ok(contents.borrow().inode.clone());
+        }
+        if let Some(attrs) = self.dirty.get(&inode) {
+            return Ok(attrs.clone());
+        }
+        self.ctrl.load::<InodeAttributes>(inode)
     }
     pub fn ctrl(&self) -> &Controller {
         &self.ctrl
@@ -48,6 +140,16 @@ impl Handler {
         access: impl FnOnce(&mut Self, &InodeAttributes) -> BkfsResult<()>,
     ) -> BkfsResult<FileHandleId> {
         let contents = if let Some(contents) = self.inodes.get(&inode).and_then(Weak::upgrade) {
+            contents
+        } else if let Some(dirty) = self.dirty.remove(&inode) {
+            // Fold any pending metadata-only changes into the fresh
+            // Contents so they persist via Contents::fsync on release.
+            let contents = Rc::new(RefCell::new(Contents::open_with_attrs(
+                self.ctrl.clone(),
+                dirty,
+                true,
+            )?));
+            self.inodes.insert(inode, Rc::downgrade(&contents));
             contents
         } else {
             let contents = Rc::new(RefCell::new(Contents::open(self.ctrl.clone(), inode)?));
@@ -95,6 +197,15 @@ impl Handler {
         if let Some(contents) = self.inodes.get(&inode).and_then(Weak::upgrade) {
             let mut contents = contents.borrow_mut();
             f(self, &mut contents.inode)
+        } else if let Some(mut attrs) = self.dirty.remove(&inode) {
+            // Mutate in place; re-insert unconditionally so accumulated
+            // in-memory state survives across closures that may error
+            // partway through. Worst case: we persist a slightly stale
+            // snapshot on the next flush — no more divergent than what
+            // ctrl.save would have written on a partial error today.
+            let result = f(self, &mut attrs);
+            self.dirty.insert(inode, attrs);
+            result
         } else {
             f(self, &mut self.ctrl().load::<InodeAttributes>(inode)?)
         }
@@ -108,6 +219,8 @@ impl Handler {
         if let Some(contents) = self.inodes.get(&inode).and_then(Weak::upgrade) {
             let contents = contents.borrow_mut();
             f(&contents.inode)
+        } else if let Some(attrs) = self.dirty.get(&inode) {
+            f(attrs)
         } else {
             f(&self.ctrl().load::<InodeAttributes>(inode)?)
         }
@@ -145,12 +258,24 @@ pub struct OverwriteOptions {
 
 impl Handler {
     pub fn close_all(&mut self) -> BkfsResult<()> {
-        std::mem::take(&mut self.inodes);
         let mut errs = Vec::new();
+        // Close all open files first — each FileHandle::close runs
+        // Contents::fsync which persists the inode+content file. This
+        // drops strong refs from self.inodes as a side effect (Weak
+        // upgrades start failing), but we still clear the map below.
         for (_, handle) in std::mem::take(&mut self.open_files) {
             if let Err(e) = handle.close(self) {
                 errs.push(e);
             }
+        }
+        std::mem::take(&mut self.inodes);
+        // Persist any metadata changes (setattr / xattr / link / unlink
+        // on non-open inodes) that are still sitting in the dirty cache.
+        // Without this, an unmount would drop those changes silently —
+        // which has been the behaviour the user hit when the daemon was
+        // killed mid-backup.
+        if let Err(e) = self.flush_all_dirty() {
+            errs.push(e);
         }
         BkfsResult::multiple((), errs)
     }
@@ -164,7 +289,7 @@ impl Handler {
         if name.len() > MAX_NAME_LENGTH as usize {
             return BkfsResult::errno(libc::ENAMETOOLONG);
         }
-        let parent = self.ctrl().load::<InodeAttributes>(parent)?;
+        let parent = self.load_inode(parent)?;
         parent.attrs.check_access(
             &self.ctrl().config().idmapped_root,
             req.uid(),
@@ -221,7 +346,7 @@ impl Handler {
                 flags,
             )?;
             if changed {
-                handler.ctrl().save(&*inode)?;
+                handler.save_inode(&*inode)?;
             }
             Ok(inode.clone())
         })?;
@@ -230,7 +355,7 @@ impl Handler {
 
     pub fn readlink(&mut self, req: &Request, inode: Inode) -> BkfsResult<PathBuf> {
         debug!("readlink() called on {:?}", inode);
-        let inode = self.ctrl().load::<InodeAttributes>(inode)?;
+        let inode = self.load_inode(inode)?;
         inode.attrs.check_access(
             &self.ctrl().config().idmapped_root,
             req.uid(),
@@ -264,7 +389,7 @@ impl Handler {
             return BkfsResult::errno(libc::ENOSYS);
         }
 
-        let mut parent = self.ctrl().load::<InodeAttributes>(parent)?;
+        let mut parent = self.load_inode(parent)?;
 
         parent.attrs.check_access(
             &self.ctrl().config().idmapped_root,
@@ -318,9 +443,9 @@ impl Handler {
             },
         );
 
-        self.ctrl().save(&new)?;
+        self.save_inode(&new)?;
 
-        self.ctrl().save(&parent)?;
+        self.save_inode(&parent)?;
 
         Ok(new)
     }
@@ -361,7 +486,7 @@ impl Handler {
     }
 
     pub fn unlink(&mut self, req: &Request, parent: Inode, name: &OsStr) -> BkfsResult<()> {
-        let mut parent = self.ctrl().load::<InodeAttributes>(parent)?;
+        let mut parent = self.load_inode(parent)?;
         parent.attrs.check_access(
             &self.ctrl().config().idmapped_root,
             req.uid(),
@@ -388,9 +513,9 @@ impl Handler {
 
             inode.attrs.parents.remove(&(parent.inode, name.to_owned()));
 
-            handler.ctrl().save(&parent)?;
+            handler.save_inode(&parent)?;
             if !handler.gc_inode(&*inode)? {
-                handler.ctrl().save(&*inode)?;
+                handler.save_inode(&*inode)?;
             }
 
             Ok(())
@@ -420,7 +545,7 @@ impl Handler {
                 })?;
             }
 
-            let mut new_parent = handler.ctrl().load::<InodeAttributes>(new_parent)?;
+            let mut new_parent = handler.load_inode(new_parent)?;
 
             new_parent.attrs.check_access(
                 &handler.ctrl().config().idmapped_root,
@@ -457,7 +582,7 @@ impl Handler {
                             .remove(&(new_parent.inode, new_name.to_owned()));
 
                         if !overwrite.gc || !handler.gc_inode(prev_inode)? {
-                            handler.ctrl().save(&*prev_inode)?;
+                            handler.save_inode(&*prev_inode)?;
                         }
                         Ok(())
                     })?;
@@ -473,8 +598,8 @@ impl Handler {
                 .parents
                 .insert((new_parent.inode, new_name.to_owned()));
 
-            handler.ctrl().save(&*inode)?;
-            handler.ctrl().save(&new_parent)?;
+            handler.save_inode(&*inode)?;
+            handler.save_inode(&new_parent)?;
 
             Ok(inode.clone())
         })
@@ -489,7 +614,7 @@ impl Handler {
         new_name: &OsStr,
         exchange: bool,
     ) -> BkfsResult<()> {
-        let parent = self.ctrl().load::<InodeAttributes>(parent)?;
+        let parent = self.load_inode(parent)?;
 
         parent.attrs.check_access(
             &self.ctrl().config().idmapped_root,
@@ -501,7 +626,7 @@ impl Handler {
         let inode = parent.lookup(name)?;
 
         if exchange {
-            let new_parent = self.ctrl().load::<InodeAttributes>(new_parent)?;
+            let new_parent = self.load_inode(new_parent)?;
 
             new_parent.attrs.check_access(
                 &self.ctrl().config().idmapped_root,
@@ -654,7 +779,7 @@ impl Handler {
     }
 
     pub fn opendir(&mut self, req: &Request, inode: Inode, flags: i32) -> BkfsResult<FileHandleId> {
-        let inode = self.ctrl().load::<InodeAttributes>(inode)?;
+        let inode = self.load_inode(inode)?;
         let (access_mask, _read, _) = match flags & libc::O_ACCMODE {
             libc::O_RDONLY => {
                 // Behavior is undefined, but most filesystems return EACCES
@@ -696,7 +821,7 @@ impl Handler {
         mut offset: i64,
         mut handle_entry: impl FnMut(&mut Self, &OsStr, &DirectoryEntry, i64) -> BkfsResult<bool>,
     ) -> BkfsResult<bool> {
-        let inode = self.ctrl().load::<InodeAttributes>(inode)?;
+        let inode = self.load_inode(inode)?;
         let Some(handle) = self.open_dirs.get_mut(&fh) else {
             return BkfsResult::errno(libc::EACCES); // opened without read perm
         };
@@ -773,7 +898,7 @@ impl Handler {
         let Some(ent) = self.open_dirs.remove(&fh) else {
             return BkfsResult::errno(libc::EBADF);
         };
-        self.gc_inode(&self.ctrl().load(ent.inode)?)?;
+        self.gc_inode(&self.load_inode(ent.inode)?)?;
 
         Ok(())
     }
@@ -795,7 +920,7 @@ impl Handler {
             )?;
             attrs.xattrs.insert(key.to_vec(), value.to_vec());
             attrs.changed();
-            handler.ctrl().save(&*inode)?;
+            handler.save_inode(&*inode)?;
             Ok(())
         })
     }
@@ -821,7 +946,7 @@ impl Handler {
         inode: Inode,
     ) -> BkfsResult<impl Iterator<Item = (Vec<u8>, Vec<u8>)> + 'r> {
         // TODO: peek_inode and serialize to bytes here
-        let inode = self.ctrl().load::<InodeAttributes>(inode)?;
+        let inode = self.load_inode(inode)?;
         let mut attrs = inode.attrs;
         let xattrs = std::mem::replace(&mut attrs.xattrs, Default::default());
         let idmap = self.ctrl().config().idmapped_root.clone();
@@ -841,7 +966,7 @@ impl Handler {
             )?;
             let value = attrs.xattrs.remove(key);
             attrs.changed();
-            handler.ctrl().save(&*inode)?;
+            handler.save_inode(&*inode)?;
             Ok(value)
         })?;
         match value {

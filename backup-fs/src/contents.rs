@@ -314,13 +314,26 @@ impl MergedFile {
 pub struct Contents {
     pub inode: InodeAttributes,
     content_id: ContentId,
-    changed: bool,
+    pub(crate) changed: bool,
     file: Option<Result<MergedFile, EncryptedFile>>,
     ctrl: Controller,
 }
 impl Contents {
     pub fn open(ctrl: Controller, inode: Inode) -> BkfsResult<Self> {
-        let inode: InodeAttributes = ctrl.load(inode)?;
+        let attrs: InodeAttributes = ctrl.load(inode)?;
+        Self::from_attrs(ctrl, attrs, false)
+    }
+    /// Open with attrs already in hand — e.g. taken from Handler's dirty
+    /// cache. `dirty` carries the unpersisted state forward so Contents::fsync
+    /// will eventually write it.
+    pub fn open_with_attrs(
+        ctrl: Controller,
+        attrs: InodeAttributes,
+        dirty: bool,
+    ) -> BkfsResult<Self> {
+        Self::from_attrs(ctrl, attrs, dirty)
+    }
+    fn from_attrs(ctrl: Controller, inode: InodeAttributes, changed: bool) -> BkfsResult<Self> {
         let content_id = match &inode.attrs.contents {
             FileData::File(a) => *a,
             FileData::Directory(_) => return BkfsResult::errno(libc::EISDIR),
@@ -329,7 +342,7 @@ impl Contents {
         Ok(Self {
             inode,
             content_id,
-            changed: false,
+            changed,
             file: None,
             ctrl,
         })

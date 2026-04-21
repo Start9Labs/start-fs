@@ -110,7 +110,7 @@ impl FromStr for IdMappedRoot {
 // Stores inode metadata data in "$data_dir/inodes" and file contents in "$data_dir/contents"
 // Directory data is stored in the file's contents, as a serialized DirectoryDescriptor
 pub struct BackupFS {
-    _lock: FdLock<File>,
+    lock: FdLock<File>,
     handler: Handler,
 }
 
@@ -175,7 +175,7 @@ impl BackupFS {
         ctrl.load_inode_pool()?;
 
         Ok(BackupFS {
-            _lock: lock,
+            lock,
             handler: Handler::new(ctrl),
         })
     }
@@ -201,6 +201,17 @@ impl Filesystem for BackupFS {
     fn destroy(&mut self) {
         if let Err(e) = self.handler.close_all() {
             error!("error closing FS: {e}");
+        }
+        // Every individual AtomicFile::save already calls sync_all
+        // before its rename, so data itself is durable. syncfs here is
+        // a belt-and-braces flush of the whole backing filesystem —
+        // ensures any last journal commits, CIFS writeback, etc. drain
+        // before we release the data_dir lock and exit.
+        use std::os::fd::AsRawFd;
+        let fd = self.lock.as_raw_fd();
+        // SAFETY: fd is a valid fd we own (held by the FdLock).
+        if unsafe { libc::syncfs(fd) } != 0 {
+            error!("syncfs on unmount failed: {}", io::Error::last_os_error());
         }
     }
 

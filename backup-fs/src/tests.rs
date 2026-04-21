@@ -337,6 +337,100 @@ fn write_many_files_async() {
     );
 }
 
+/// rm -rf should fully remove a tree from disk — no orphan inode files.
+///
+/// Suspected zombie-inode bug in the dirty-cache coalescing: unlink goes
+/// through mutate_inode, which takes the inode out of dirty, the closure
+/// calls gc_inode (which removes the disk file), but mutate_inode then
+/// unconditionally re-inserts the (now parent-less) attrs back into
+/// dirty. On unmount, flush_all_dirty writes the zombie back to disk as
+/// a resurrected orphan.
+///
+/// Also: after rm-rf of a subtree, re-creating a directory with the
+/// same path must work — which it won't if some intermediate ancestor
+/// is in a half-deleted state.
+#[test_log::test]
+fn rmrf_leaves_no_orphans() {
+    let data = TempDir::new("backupfs_data").unwrap();
+
+    // Phase 1: create nested tree + files
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::create_dir(mnt.join("backup")).unwrap();
+            fs::create_dir(mnt.join("backup/volumes")).unwrap();
+            fs::create_dir(mnt.join("backup/volumes/main")).unwrap();
+            for i in 0..10 {
+                fs::write(
+                    mnt.join(format!("backup/volumes/main/f{i:02}")),
+                    format!("payload {i}"),
+                )
+                .unwrap();
+            }
+        },
+        None,
+    );
+
+    // Snapshot inode-file count after creation.
+    let inode_files_after_create =
+        tree(data.path().join("inodes"), false).unwrap().len();
+    let content_files_after_create =
+        tree(data.path().join("contents"), false).unwrap().len();
+
+    // Phase 2: rm -rf the whole subtree
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::remove_dir_all(mnt.join("backup")).unwrap();
+        },
+        None,
+    );
+
+    // Phase 3: remount, verify state is clean
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            assert!(
+                !mnt.join("backup").exists(),
+                "backup/ should be gone after rm-rf"
+            );
+            // Re-create the exact path rsync would need.
+            fs::create_dir(mnt.join("backup")).unwrap();
+            fs::create_dir(mnt.join("backup/volumes")).unwrap();
+            fs::create_dir(mnt.join("backup/volumes/main")).unwrap();
+            assert!(
+                mnt.join("backup/volumes/main").is_dir(),
+                "could not recreate previously-rm-rf'd path"
+            );
+        },
+        None,
+    );
+
+    // After rm-rf we deleted 13 inodes (3 dirs + 10 files) and 10 content
+    // files. After the phase-3 re-creates we add 3 inodes (3 dirs) and 0
+    // content files. Net relative to phase 1: inodes -10, contents -10.
+    let inodes_now = tree(data.path().join("inodes"), false).unwrap();
+    let contents_now = tree(data.path().join("contents"), false).unwrap();
+    let expected_inodes = inode_files_after_create - 10;
+    let expected_contents = content_files_after_create - 10;
+    assert_eq!(
+        inodes_now.len(),
+        expected_inodes,
+        "orphan inode files left after rm-rf: expected {expected_inodes}, got {} — {:?}",
+        inodes_now.len(),
+        inodes_now
+    );
+    assert_eq!(
+        contents_now.len(),
+        expected_contents,
+        "orphan content files left after rm-rf: expected {expected_contents}, got {}",
+        contents_now.len()
+    );
+}
+
 /// `stat.st_blocks` must be in 512-byte units (POSIX). du-sh relies on this.
 /// Regression test for blocks being reported in 4096-byte units.
 #[test_log::test]

@@ -198,13 +198,15 @@ impl Handler {
             let mut contents = contents.borrow_mut();
             f(self, &mut contents.inode)
         } else if let Some(mut attrs) = self.dirty.remove(&inode) {
-            // Mutate in place; re-insert unconditionally so accumulated
-            // in-memory state survives across closures that may error
-            // partway through. Worst case: we persist a slightly stale
-            // snapshot on the next flush — no more divergent than what
-            // ctrl.save would have written on a partial error today.
             let result = f(self, &mut attrs);
-            self.dirty.insert(inode, attrs);
+            // An inode with no parents (and which isn't root) has been
+            // fully unlinked — the closure likely ran gc_inode which
+            // removed the disk file. Re-inserting the now-orphan attrs
+            // into dirty would let flush_all_dirty resurrect them as
+            // zombies on the next unmount.
+            if attrs.inode.0 == FUSE_ROOT_ID || !attrs.attrs.parents.is_empty() {
+                self.dirty.insert(inode, attrs);
+            }
             result
         } else {
             f(self, &mut self.ctrl().load::<InodeAttributes>(inode)?)
@@ -473,6 +475,10 @@ impl Handler {
 
         debug!("deleting inode {:?}", inode);
         self.inodes.remove(&inode.inode);
+        // Drop any pending metadata save for this inode — otherwise
+        // flush_all_dirty on the next unmount would re-create the disk
+        // file we're about to remove.
+        self.dirty.remove(&inode.inode);
 
         std::fs::remove_file(self.ctrl().resolve_inode_path(inode.inode))?;
         if let FileData::File(contents) = inode.attrs.contents {

@@ -6,6 +6,8 @@ use std::ops::Deref;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::FileExt;
 use std::ptr;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use crate::atomic_file::AtomicFile;
 use crate::error::BkfsResult;
@@ -24,6 +26,35 @@ const LOCAL_FLUSH_CHUNK: usize = BUF_CAP;
 
 /// Ring is sized for the worst case (most chunks per flush).
 const RING_ENTRIES: u32 = (BUF_CAP / NETFS_FLUSH_CHUNK) as u32;
+
+/// Maximum wall-clock time a single flush (all chunks) is allowed to take
+/// before we give up and bubble a TimedOut error. Prevents indefinite hangs
+/// when the backing store (CIFS, stuck USB, etc.) stops producing
+/// completions. Can be overridden via BACKUPFS_FLUSH_TIMEOUT_SECS.
+const DEFAULT_FLUSH_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn flush_timeout() -> Duration {
+    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        std::env::var("BACKUPFS_FLUSH_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_FLUSH_TIMEOUT)
+    })
+}
+
+/// If set, skip io_uring entirely and use a plain pwrite loop. Useful when
+/// io_uring interacts badly with a specific backing store (early CIFS
+/// kernels punt non-blocking writes to a workqueue that can wedge).
+fn uring_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("BACKUPFS_NO_URING")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
 
 /// Detect whether an fd lives on a network filesystem that needs small chunks.
 fn flush_chunk_for(fd: RawFd) -> usize {
@@ -102,25 +133,64 @@ fn pread_full<F: FileExt>(file: &F, buf: &mut [u8], offset: u64) -> io::Result<u
     Ok(pos)
 }
 
-// ── io_uring pipelined flush ──────────────────────────
+// ── Flush implementations ─────────────────────────────
 
-/// Submit all chunks as pwrite SQEs on a reused ring, then reap completions.
+/// Plain synchronous pwrite loop. Used as a fallback when io_uring is
+/// disabled or has been poisoned by a timeout.
+fn pwrite_all<F: FileExt>(
+    file: &F,
+    buf: &[u8],
+    offset: u64,
+    chunk_size: usize,
+) -> io::Result<()> {
+    for (i, chunk) in buf.chunks(chunk_size).enumerate() {
+        let base = offset + (i * chunk_size) as u64;
+        let mut pos = 0;
+        while pos < chunk.len() {
+            match file.write_at(&chunk[pos..], base + pos as u64) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "pwrite: short write",
+                    ))
+                }
+                Ok(n) => pos += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Result of a uring flush attempt. The ring is considered poisoned if we
+/// could not reap all submitted completions — callers must rebuild it
+/// before reusing.
+enum UringFlushOutcome {
+    Ok,
+    Poisoned(io::Error),
+}
+
+/// Submit all chunks as pwrite SQEs on a reused ring, then reap completions
+/// with a wall-clock timeout. If the timeout expires before all CQEs
+/// arrive, the ring is returned as Poisoned and the caller must recreate
+/// it — leftover pending SQEs would produce stale CQEs on the next flush
+/// and confuse user_data tracking.
 fn uring_pwrite_all(
     ring: &mut io_uring::IoUring,
     fd: RawFd,
     buf: &[u8],
     offset: u64,
     chunk_size: usize,
-) -> io::Result<()> {
+) -> UringFlushOutcome {
     use io_uring::{opcode, types};
 
     if buf.is_empty() {
-        return Ok(());
+        return UringFlushOutcome::Ok;
     }
 
     let n_chunks = (buf.len() + chunk_size - 1) / chunk_size;
 
-    // Submit all chunks
     {
         let mut sq = ring.submission();
         for (i, chunk) in buf.chunks(chunk_size).enumerate() {
@@ -130,15 +200,37 @@ fn uring_pwrite_all(
                 .build()
                 .user_data(i as u64);
             // SAFETY: the buffer is alive for the duration of this function,
-            // and we wait for all completions before returning.
-            unsafe { sq.push(&entry) }.map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "io_uring submission queue full")
-            })?;
+            // and we wait for all completions before returning. On timeout
+            // the ring is rebuilt so in-flight SQEs can't reference a
+            // dropped buffer.
+            if unsafe { sq.push(&entry) }.is_err() {
+                return UringFlushOutcome::Poisoned(io::Error::new(
+                    io::ErrorKind::Other,
+                    "io_uring submission queue full",
+                ));
+            }
         }
     }
-    ring.submit_and_wait(n_chunks)?;
 
-    // Reap completions and check for errors / short writes
+    let ts = types::Timespec::from(flush_timeout());
+    let args = types::SubmitArgs::new().timespec(&ts);
+    match ring.submitter().submit_with_args(n_chunks, &args) {
+        Ok(_) => {}
+        Err(e)
+            if e.raw_os_error() == Some(libc::ETIME)
+                || e.raw_os_error() == Some(libc::EINTR) =>
+        {
+            return UringFlushOutcome::Poisoned(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "io_uring flush exceeded {}s timeout",
+                    flush_timeout().as_secs()
+                ),
+            ));
+        }
+        Err(e) => return UringFlushOutcome::Poisoned(e),
+    }
+
     let mut errors: Option<io::Error> = None;
     let mut completed = 0;
     for cqe in ring.completion() {
@@ -158,15 +250,19 @@ fn uring_pwrite_all(
         }
     }
     if completed < n_chunks {
-        return Err(io::Error::new(
+        return UringFlushOutcome::Poisoned(io::Error::new(
             io::ErrorKind::Other,
-            "io_uring: not all writes completed",
+            format!("io_uring: {completed}/{n_chunks} writes completed"),
         ));
     }
     if let Some(e) = errors {
-        return Err(e);
+        return UringFlushOutcome::Poisoned(e);
     }
-    Ok(())
+    UringFlushOutcome::Ok
+}
+
+fn new_ring() -> io::Result<io_uring::IoUring> {
+    io_uring::IoUring::new(RING_ENTRIES)
 }
 
 // ── Buffered direct-I/O file ──────────────────────────
@@ -186,8 +282,10 @@ struct BufState {
     dirty_end: usize,
     /// Sequential read/write cursor (absolute file offset).
     pos: u64,
-    /// Reusable io_uring for flush_dirty.
-    ring: io_uring::IoUring,
+    /// Reusable io_uring for flush_dirty. None means fall back to a plain
+    /// pwrite loop — either because BACKUPFS_NO_URING is set or because
+    /// the ring was poisoned by a timeout and we haven't rebuilt it yet.
+    ring: Option<io_uring::IoUring>,
     /// Flush chunk size (selected per-filesystem at construction).
     flush_chunk: usize,
 }
@@ -205,6 +303,11 @@ pub struct BufferedDirectFile<F: FileExt + AsRawFd> {
 impl<F: FileExt + AsRawFd> BufferedDirectFile<F> {
     pub fn new(file: F) -> io::Result<Self> {
         let flush_chunk = flush_chunk_for(file.as_raw_fd());
+        let ring = if uring_disabled() {
+            None
+        } else {
+            Some(new_ring()?)
+        };
         Ok(Self {
             file: Some(file),
             state: RefCell::new(BufState {
@@ -215,7 +318,7 @@ impl<F: FileExt + AsRawFd> BufferedDirectFile<F> {
                 dirty_start: usize::MAX,
                 dirty_end: 0,
                 pos: 0,
-                ring: io_uring::IoUring::new(RING_ENTRIES)?,
+                ring,
                 flush_chunk,
             }),
         })
@@ -267,13 +370,28 @@ impl<F: FileExt + AsRawFd> BufferedDirectFile<F> {
 
         let buf = &state.buf.as_slice()[start..end];
         let chunk = state.flush_chunk;
-        uring_pwrite_all(
-            &mut state.ring,
-            file.as_raw_fd(),
-            buf,
-            state.base + start as u64,
-            chunk,
-        )?;
+        let file_offset = state.base + start as u64;
+
+        if let Some(ring) = state.ring.as_mut() {
+            match uring_pwrite_all(ring, file.as_raw_fd(), buf, file_offset, chunk) {
+                UringFlushOutcome::Ok => {}
+                UringFlushOutcome::Poisoned(err) => {
+                    // Ring may have pending SQEs referencing our buffer or
+                    // stale CQEs that would misalign user_data on the next
+                    // flush. Drop it — a fresh ring will be built lazily.
+                    state.ring = None;
+                    log::warn!("io_uring flush failed ({err}); falling back to pwrite");
+                    pwrite_all(file, buf, file_offset, chunk)?;
+                    // Try to restore the ring for subsequent flushes. If
+                    // the kernel is in bad shape, stay on pwrite until
+                    // we're reset.
+                    state.ring = new_ring().ok();
+                }
+            }
+        } else {
+            pwrite_all(file, buf, file_offset, chunk)?;
+        }
+
         state.dirty_start = usize::MAX;
         state.dirty_end = 0;
         Ok(())

@@ -431,6 +431,43 @@ fn rmrf_leaves_no_orphans() {
     );
 }
 
+/// Multiple sequential writes to the same file must land in order on
+/// disk, even though they're dispatched through the sharded worker
+/// pool. Each write targets its own aligned region; reading back must
+/// reproduce the exact pattern we wrote.
+///
+/// Regression guard against a pool design where different workers could
+/// race on the same file's mutex and clobber each other's state.
+#[test_log::test]
+fn sequential_writes_preserve_order() {
+    const WRITES: usize = 64;
+    const BLOCK: usize = 4096;
+    let data = TempDir::new("backupfs_data").unwrap();
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let path = mnt.join("file");
+            let mut f = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            for i in 0..WRITES {
+                let mut chunk = vec![0u8; BLOCK];
+                pattern_fill((i * BLOCK) as u64, &mut chunk);
+                f.write_all(&chunk).unwrap();
+            }
+            drop(f);
+            let read = fs::read(&path).unwrap();
+            assert_eq!(read.len(), WRITES * BLOCK);
+            pattern_check(0, &read);
+        },
+        None,
+    );
+}
+
 /// `stat.st_blocks` must be in 512-byte units (POSIX). du-sh relies on this.
 /// Regression test for blocks being reported in 4096-byte units.
 #[test_log::test]

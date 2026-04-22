@@ -491,7 +491,15 @@ impl Handler {
         // file we're about to remove.
         self.dirty.remove(&inode.inode);
 
-        std::fs::remove_file(self.ctrl().resolve_inode_path(inode.inode))?;
+        // An inode created and deleted within the same mount session
+        // may have lived only in the dirty cache and never been flushed
+        // to disk. NotFound here means the dirty-cache removal above
+        // was the whole story.
+        match std::fs::remove_file(self.ctrl().resolve_inode_path(inode.inode)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         if let FileData::File(contents) = inode.attrs.contents {
             let path = self.ctrl().resolve_contents_path(contents);
             if path.exists() {

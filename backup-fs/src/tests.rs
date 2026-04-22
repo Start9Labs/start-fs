@@ -431,6 +431,113 @@ fn rmrf_leaves_no_orphans() {
     );
 }
 
+/// Create a subtree in one mount session, then in a *fresh* mount
+/// session do the removal. Matches the pattern a user hits when they
+/// mount, delete, unmount — all inode files exist on disk from the
+/// prior session, so the failure mode differs from the same-session
+/// case: here gc_inode should find the disk file and remove it.
+#[test_log::test]
+fn rmdir_after_remount_updates_parent() {
+    let data = TempDir::new("backupfs_data").unwrap();
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::create_dir(mnt.join("parent")).unwrap();
+            fs::create_dir(mnt.join("parent/keep")).unwrap();
+            fs::create_dir(mnt.join("parent/remove")).unwrap();
+        },
+        None,
+    );
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::remove_dir(mnt.join("parent/remove")).unwrap();
+            let live: Vec<String> = fs::read_dir(mnt.join("parent"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                live,
+                vec!["keep".to_owned()],
+                "live listing contained removed child: {:?}",
+                live
+            );
+        },
+        None,
+    );
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let after: Vec<String> = fs::read_dir(mnt.join("parent"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                after,
+                vec!["keep".to_owned()],
+                "remount after removal still listed child: {:?}",
+                after
+            );
+        },
+        None,
+    );
+}
+
+/// Deleting a child must remove it from the parent's live directory
+/// listing AND from the persisted copy. Regression test for a batched
+/// dirty-cache save racing a stale parent snapshot.
+#[test_log::test]
+fn rmdir_updates_parent_listing() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::create_dir(mnt.join("parent")).unwrap();
+            fs::create_dir(mnt.join("parent/keep")).unwrap();
+            fs::create_dir(mnt.join("parent/remove")).unwrap();
+            fs::remove_dir(mnt.join("parent/remove")).unwrap();
+
+            let live: Vec<String> = fs::read_dir(mnt.join("parent"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                live,
+                vec!["keep".to_owned()],
+                "live listing contained removed child: {:?}",
+                live
+            );
+        },
+        None,
+    );
+
+    // Remount and verify the listing was persisted.
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let after: Vec<String> = fs::read_dir(mnt.join("parent"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                after,
+                vec!["keep".to_owned()],
+                "remounted listing contained removed child: {:?}",
+                after
+            );
+        },
+        None,
+    );
+}
+
 /// Multiple sequential writes to the same file must land in order on
 /// disk, even though they're dispatched through the sharded worker
 /// pool. Each write targets its own aligned region; reading back must

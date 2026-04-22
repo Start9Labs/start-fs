@@ -1,11 +1,12 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::cmp::min;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::ops::Bound;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::SystemTime;
 
 use fuser::consts::FUSE_WRITE_KILL_PRIV;
@@ -36,6 +37,86 @@ fn is_missing_inode(e: &BkfsError) -> bool {
 /// small because each release-on-close opens+removes the entry.
 const DIRTY_INODE_LIMIT: usize = 1024;
 
+/// Default entries kept in the clean-load read cache. rsync and
+/// similar tools re-stat the whole tree several times per run; caching
+/// a few thousand loaded inodes turns those passes from O(open+decrypt
+/// +deserialize) per entry into an in-memory clone.
+const DEFAULT_READ_CACHE_CAP: usize = 4096;
+
+fn read_cache_cap() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("BACKUPFS_READ_CACHE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_READ_CACHE_CAP)
+    })
+}
+
+/// Bounded LRU of InodeAttributes loaded from disk. Tracks access
+/// recency via a monotonically-increasing generation counter —
+/// O(log n) per op, no intrusive list bookkeeping.
+struct InodeReadCache {
+    entries: HashMap<Inode, (u64, InodeAttributes)>,
+    by_gen: BTreeMap<u64, Inode>,
+    next_gen: u64,
+    cap: usize,
+}
+
+impl InodeReadCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            by_gen: BTreeMap::new(),
+            next_gen: 0,
+            cap,
+        }
+    }
+
+    fn get(&mut self, inode: Inode) -> Option<InodeAttributes> {
+        // Bump generation on hit so hot entries stay resident.
+        let (old_gen, attrs) = self.entries.get(&inode)?;
+        let attrs = attrs.clone();
+        let old_gen = *old_gen;
+        let new_gen = self.next_gen;
+        self.next_gen += 1;
+        self.by_gen.remove(&old_gen);
+        self.by_gen.insert(new_gen, inode);
+        self.entries.get_mut(&inode).unwrap().0 = new_gen;
+        Some(attrs)
+    }
+
+    fn put(&mut self, inode: Inode, attrs: InodeAttributes) {
+        if self.cap == 0 {
+            return;
+        }
+        if let Some((old_gen, _)) = self.entries.get(&inode) {
+            self.by_gen.remove(&*old_gen);
+        }
+        let new_gen = self.next_gen;
+        self.next_gen += 1;
+        self.entries.insert(inode, (new_gen, attrs));
+        self.by_gen.insert(new_gen, inode);
+        while self.entries.len() > self.cap {
+            let Some((_, victim)) = self.by_gen.pop_first() else {
+                break;
+            };
+            self.entries.remove(&victim);
+        }
+    }
+
+    fn remove(&mut self, inode: Inode) {
+        if let Some((gen, _)) = self.entries.remove(&inode) {
+            self.by_gen.remove(&gen);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.by_gen.clear();
+    }
+}
+
 pub struct Handler {
     ctrl: Controller,
     next_fh: FileHandleId,
@@ -50,6 +131,11 @@ pub struct Handler {
     /// full AtomicFile::save barrier. Here they collapse into a single
     /// save when the inode is evicted (or on destroy).
     dirty: BTreeMap<Inode, InodeAttributes>,
+    /// Clean LRU cache of InodeAttributes loaded from disk. Covers
+    /// multi-pass read workloads (rsync's checksum / verify phases)
+    /// where the same inode is stat'd many times and the open+decrypt
+    /// cost dominates.
+    read_cache: RefCell<InodeReadCache>,
     open_files: BTreeMap<FileHandleId, FileHandle>,
     open_dirs: BTreeMap<FileHandleId, DirHandle>,
 }
@@ -60,6 +146,7 @@ impl Handler {
             next_fh: FileHandleId(1),
             inodes: BTreeMap::new(),
             dirty: BTreeMap::new(),
+            read_cache: RefCell::new(InodeReadCache::new(read_cache_cap())),
             open_files: BTreeMap::new(),
             open_dirs: BTreeMap::new(),
         }
@@ -76,6 +163,9 @@ impl Handler {
     /// closure that holds the RefCell borrow. Luckily the important
     /// coalescing case (setattrs on closed files) is the one rsync uses.
     pub fn save_inode(&mut self, attrs: &InodeAttributes) -> BkfsResult<()> {
+        // Any save invalidates the read cache — the cached copy is
+        // now stale relative to the authoritative state.
+        self.read_cache.borrow_mut().remove(attrs.inode);
         if self
             .inodes
             .get(&attrs.inode)
@@ -97,6 +187,7 @@ impl Handler {
     /// to be removed (unlink+gc path).
     pub fn forget_dirty(&mut self, inode: Inode) {
         self.dirty.remove(&inode);
+        self.read_cache.borrow_mut().remove(inode);
     }
 
     /// Remove and return a dirty entry if present. Used by fopen so a
@@ -129,6 +220,10 @@ impl Handler {
                 errs.push(e);
             }
         }
+        // The read cache may have stale copies of anything we just
+        // persisted — safest to clear the whole thing on the unmount
+        // path.
+        self.read_cache.borrow_mut().clear();
         // Belt-and-braces durability on the final flush — unmount path
         // has to leave every dirty inode on stable storage, not just
         // in the page cache.
@@ -149,7 +244,12 @@ impl Handler {
         if let Some(attrs) = self.dirty.get(&inode) {
             return Ok(attrs.clone());
         }
-        self.ctrl.load::<InodeAttributes>(inode)
+        if let Some(attrs) = self.read_cache.borrow_mut().get(inode) {
+            return Ok(attrs);
+        }
+        let attrs = self.ctrl.load::<InodeAttributes>(inode)?;
+        self.read_cache.borrow_mut().put(inode, attrs.clone());
+        Ok(attrs)
     }
     pub fn ctrl(&self) -> &Controller {
         &self.ctrl
@@ -170,6 +270,18 @@ impl Handler {
                 self.ctrl.clone(),
                 dirty,
                 true,
+            )?));
+            self.inodes.insert(inode, Arc::downgrade(&contents));
+            contents
+        } else if let Some(attrs) = self.read_cache.borrow_mut().get(inode) {
+            // Open-from-cache: drop the cache entry (the Contents will
+            // own the authoritative copy from here on) and skip the
+            // decrypt+deserialize hit.
+            self.read_cache.borrow_mut().remove(inode);
+            let contents = Arc::new(Mutex::new(Contents::open_with_attrs(
+                self.ctrl.clone(),
+                attrs,
+                false,
             )?));
             self.inodes.insert(inode, Arc::downgrade(&contents));
             contents
@@ -220,6 +332,10 @@ impl Handler {
             let mut contents = contents.lock().unwrap();
             f(self, &mut contents.inode)
         } else if let Some(mut attrs) = self.dirty.remove(&inode) {
+            // Any mutation path is about to produce a new authoritative
+            // state — drop the read cache entry now so a subsequent
+            // load_inode can't return a stale clone.
+            self.read_cache.borrow_mut().remove(inode);
             let result = f(self, &mut attrs);
             // An inode with no parents (and which isn't root) has been
             // fully unlinked — the closure likely ran gc_inode which
@@ -231,7 +347,16 @@ impl Handler {
             }
             result
         } else {
-            f(self, &mut self.ctrl().load::<InodeAttributes>(inode)?)
+            // Prefer the read cache over disk when seeding the
+            // mutation. load_inode populates this on miss, so a hot
+            // traversal stays in memory.
+            let cached = self.read_cache.borrow_mut().get(inode);
+            self.read_cache.borrow_mut().remove(inode);
+            let mut attrs = match cached {
+                Some(a) => a,
+                None => self.ctrl().load::<InodeAttributes>(inode)?,
+            };
+            f(self, &mut attrs)
         }
     }
 
@@ -245,8 +370,13 @@ impl Handler {
             f(&contents.inode)
         } else if let Some(attrs) = self.dirty.get(&inode) {
             f(attrs)
+        } else if let Some(attrs) = self.read_cache.borrow_mut().get(inode) {
+            f(&attrs)
         } else {
-            f(&self.ctrl().load::<InodeAttributes>(inode)?)
+            let attrs = self.ctrl().load::<InodeAttributes>(inode)?;
+            let result = f(&attrs);
+            self.read_cache.borrow_mut().put(inode, attrs);
+            result
         }
     }
 }
@@ -527,6 +657,7 @@ impl Handler {
         // flush_all_dirty on the next unmount would re-create the disk
         // file we're about to remove.
         self.dirty.remove(&inode.inode);
+        self.read_cache.borrow_mut().remove(inode.inode);
 
         // An inode created and deleted within the same mount session
         // may have lived only in the dirty cache and never been flushed

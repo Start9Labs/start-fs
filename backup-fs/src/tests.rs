@@ -431,6 +431,225 @@ fn rmrf_leaves_no_orphans() {
     );
 }
 
+/// Full backup-then-delete cycle across mount boundaries. Reproduces
+/// the exact shape a user sees when they run a backup, unmount,
+/// remount, and `rm -rf` the backup tree: every inode lives on disk
+/// from the prior session's flush.
+#[test_log::test]
+fn rmrf_after_remount_updates_root() {
+    let data = TempDir::new("backupfs_data").unwrap();
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::create_dir(mnt.join("backup")).unwrap();
+            fs::create_dir(mnt.join("backup/volumes")).unwrap();
+            fs::create_dir(mnt.join("backup/volumes/main")).unwrap();
+            for i in 0..5 {
+                fs::write(
+                    mnt.join(format!("backup/volumes/main/f{i:02}")),
+                    format!("payload {i}"),
+                )
+                .unwrap();
+            }
+        },
+        None,
+    );
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::remove_dir_all(mnt.join("backup")).unwrap();
+            let live: Vec<String> = fs::read_dir(mnt)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                !live.contains(&"backup".to_owned()),
+                "root listing still shows deleted subtree: {:?}",
+                live
+            );
+        },
+        None,
+    );
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let after: Vec<String> = fs::read_dir(mnt)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                !after.contains(&"backup".to_owned()),
+                "remount listing still shows deleted subtree: {:?}",
+                after
+            );
+            assert!(
+                !mnt.join("backup").exists(),
+                "backup/ survived remount after rm-rf"
+            );
+        },
+        None,
+    );
+}
+
+/// A crash or earlier bug can leave a parent directory whose entries
+/// reference an inode file that no longer exists. `rmdir`/`unlink` of
+/// the stale entry must not keep returning ENOENT forever — the user
+/// has no way to recover if cleanup is impossible.
+#[test_log::test]
+fn rmdir_heals_stale_parent_reference() {
+    let data = TempDir::new("backupfs_data").unwrap();
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::create_dir(mnt.join("parent")).unwrap();
+            fs::create_dir(mnt.join("parent/keep")).unwrap();
+            fs::create_dir(mnt.join("parent/stale")).unwrap();
+        },
+        None,
+    );
+
+    // Snapshot what's on disk, then corrupt: find the 'stale' inode's
+    // on-disk file and remove it. The parent dir still references it.
+    let before: std::collections::HashSet<String> = tree(data.path().join("inodes"), false)
+        .unwrap()
+        .into_iter()
+        .collect();
+
+    // Remove one inode file to simulate a lost write / torn unmount.
+    // We don't know which file corresponds to "stale" without digging
+    // into the encryption, so we open the FS and find the one whose
+    // removal produces the symptom.
+    //
+    // Simpler: mount, look up "stale" to get its inode number, then
+    // remove its inode file externally.
+    let stale_inode = {
+        let (tx, rx) = oneshot::channel::<Option<u64>>();
+        let data_path = data.path().to_owned();
+        std::thread::spawn(move || {
+            with_backupfs(
+                &data_path,
+                "ohea".to_owned(),
+                |mnt| {
+                    let meta = fs::metadata(mnt.join("parent/stale")).unwrap();
+                    let _ = tx.send(Some(meta.ino()));
+                },
+                None,
+            );
+        })
+        .join()
+        .unwrap();
+        rx.recv().unwrap().unwrap()
+    };
+
+    // Now find which inode file corresponds to that inode and remove
+    // it externally (this models an unclean shutdown where the
+    // parent's dir entry was saved but the child's inode wasn't).
+    let inode_dir = data.path().join("inodes");
+    let inodes_after: std::collections::HashSet<String> = tree(&inode_dir, false)
+        .unwrap()
+        .into_iter()
+        .collect();
+    // New inodes after the lookup session are exactly the candidates.
+    let _new_inodes: Vec<_> = inodes_after.difference(&before).collect();
+
+    // Deterministic approach: peel off the Controller and call
+    // resolve_inode_path directly.
+    let ctrl = crate::ctrl::Controller::new(BackupFSOptions {
+        data_dir: data.path().to_owned(),
+        setuid_support: false,
+        password: "ohea".to_owned(),
+        file_size_padding: None,
+        readonly: false,
+        idmapped_root: vec![],
+    })
+    .unwrap();
+    let path = ctrl.resolve_inode_path(crate::inode::Inode(stale_inode));
+    assert!(path.exists(), "expected stale inode file at {:?}", path);
+    fs::remove_file(&path).unwrap();
+    drop(ctrl);
+
+    // Now remount and try to clean up the stale entry.
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            // rmdir should succeed (or at worst give ENOENT, which we
+            // then want to be recoverable).
+            match fs::remove_dir(mnt.join("parent/stale")) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    // Recovery path: try to look up the parent and
+                    // confirm listing is clean.
+                }
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+            let live: Vec<String> = fs::read_dir(mnt.join("parent"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                !live.contains(&"stale".to_owned()),
+                "parent listing still shows stale entry: {:?}",
+                live
+            );
+        },
+        None,
+    );
+}
+
+/// Unlink a file after remount: make sure the file disappears from
+/// the parent's listing AND the content file is reaped.
+#[test_log::test]
+fn unlink_file_after_remount() {
+    let data = TempDir::new("backupfs_data").unwrap();
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::create_dir(mnt.join("d")).unwrap();
+            fs::write(mnt.join("d/keep"), b"keep").unwrap();
+            fs::write(mnt.join("d/kill"), b"kill").unwrap();
+        },
+        None,
+    );
+
+    let content_before = tree(data.path().join("contents"), false).unwrap().len();
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::remove_file(mnt.join("d/kill")).unwrap();
+            let live: Vec<String> = fs::read_dir(mnt.join("d"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                live,
+                vec!["keep".to_owned()],
+                "live listing contained unlinked file: {:?}",
+                live
+            );
+        },
+        None,
+    );
+
+    assert_eq!(
+        tree(data.path().join("contents"), false).unwrap().len(),
+        content_before - 1,
+        "unlinked file's content blob wasn't reaped"
+    );
+}
+
 /// Create a subtree in one mount session, then in a *fresh* mount
 /// session do the removal. Matches the pattern a user hits when they
 /// mount, delete, unmount — all inode files exist on disk from the

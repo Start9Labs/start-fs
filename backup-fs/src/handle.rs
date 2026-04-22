@@ -15,9 +15,20 @@ use log::{debug, warn};
 use crate::contents::Contents;
 use crate::ctrl::Controller;
 use crate::directory::{DirectoryContents, DirectoryEntry};
-use crate::error::{BkfsResult, BkfsResultExt};
+use crate::error::{BkfsError, BkfsErrorKind, BkfsResult, BkfsResultExt};
 use crate::inode::{FileData, Inode, InodeAttributes};
 use crate::{FMODE_EXEC, MAX_NAME_LENGTH};
+
+/// True if `e` is "the inode's backing file isn't on disk" — either
+/// from a same-session create+delete that never touched disk, or a
+/// stale parent dir entry left by an unclean shutdown. Distinguishes
+/// from other I/O errors which remain fatal.
+fn is_missing_inode(e: &BkfsError) -> bool {
+    match &e.kind {
+        BkfsErrorKind::Io(io) => io.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
+}
 
 /// Upper bound on in-memory unpersisted inode attributes before we start
 /// evicting oldest-first. The cap exists only so memory use is bounded
@@ -302,7 +313,7 @@ impl Handler {
         if name.len() > MAX_NAME_LENGTH as usize {
             return BkfsResult::errno(libc::ENAMETOOLONG);
         }
-        let parent = self.load_inode(parent)?;
+        let mut parent = self.load_inode(parent)?;
         parent.attrs.check_access(
             &self.ctrl().config().idmapped_root,
             req.uid(),
@@ -311,16 +322,42 @@ impl Handler {
         )?;
 
         let inode = parent.lookup(name)?;
-        self.mutate_inode(inode, |_, inode| {
-            if !inode
+        let result = self.mutate_inode(inode, |_, attrs| {
+            if !attrs
                 .attrs
                 .parents
                 .contains(&(parent.inode, name.to_owned()))
             {
                 return BkfsResult::errno_notrace(libc::ENOENT);
             }
-            Ok(inode.clone())
-        })
+            Ok(attrs.clone())
+        });
+
+        match result {
+            Ok(attrs) => Ok(attrs),
+            Err(e) if is_missing_inode(&e) => {
+                // Parent's dir entry references an inode whose backing
+                // file doesn't exist — a stale pointer from an unclean
+                // shutdown or an earlier bug. Without healing, every
+                // subsequent lookup returns ENOENT, which means rmdir
+                // never gets a chance to run (rm fails at the lookup
+                // step) and the phantom entry hangs around forever.
+                //
+                // Prune the entry from the parent now. Subsequent
+                // readdir will see a clean listing and userspace can
+                // proceed.
+                warn!(
+                    "lookup: pruning stale parent {:?}/{:?} → missing inode {:?}",
+                    parent.inode, name, inode
+                );
+                if let FileData::Directory(dir) = &mut parent.attrs.contents {
+                    dir.remove(name);
+                }
+                self.save_inode(&parent)?;
+                BkfsResult::errno_notrace(libc::ENOENT)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub fn setattr(
@@ -527,7 +564,7 @@ impl Handler {
             .remove(name)
             .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
 
-        self.mutate_inode(entry.inode, |handler, inode| {
+        let result = self.mutate_inode(entry.inode, |handler, inode| {
             if let FileData::Directory(dir) = &inode.attrs.contents {
                 if inode.attrs.parents.len() <= 1 && !dir.is_empty() {
                     return BkfsResult::errno(libc::ENOTEMPTY);
@@ -544,7 +581,27 @@ impl Handler {
             }
 
             Ok(())
-        })
+        });
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(e) if is_missing_inode(&e) => {
+                // Parent referenced a child whose inode file isn't on
+                // disk — a stale entry left by an unclean shutdown or
+                // an earlier bug. The parent's entry removal above was
+                // applied to our local copy only (the closure errored
+                // before its save_inode ran). Save the parent now so
+                // the dir listing reflects reality and the user can
+                // actually get rid of this phantom.
+                warn!(
+                    "unlink: healing stale parent {:?}/{:?} → missing inode {:?}",
+                    parent.inode, name, entry.inode
+                );
+                self.save_inode(&parent)?;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub fn link(

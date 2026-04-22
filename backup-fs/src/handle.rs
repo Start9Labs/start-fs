@@ -73,16 +73,29 @@ impl InodeReadCache {
         }
     }
 
-    fn get(&mut self, inode: Inode) -> Option<InodeAttributes> {
-        // Bump generation on hit so hot entries stay resident.
-        let (old_gen, attrs) = self.entries.get(&inode)?;
-        let attrs = attrs.clone();
-        let old_gen = *old_gen;
-        let new_gen = self.next_gen;
+    fn next_gen(&mut self) -> u64 {
+        let g = self.next_gen;
         self.next_gen += 1;
-        self.by_gen.remove(&old_gen);
-        self.by_gen.insert(new_gen, inode);
-        self.entries.get_mut(&inode).unwrap().0 = new_gen;
+        g
+    }
+
+    /// Clone the attrs and bump LRU order so hot entries stay resident.
+    fn get(&mut self, inode: Inode) -> Option<InodeAttributes> {
+        let (gen, attrs) = self.entries.get_mut(&inode)?;
+        let attrs = attrs.clone();
+        self.by_gen.remove(gen);
+        *gen = self.next_gen;
+        self.next_gen += 1;
+        self.by_gen.insert(*gen, inode);
+        Some(attrs)
+    }
+
+    /// Remove and return — caller owns the attrs and the cache forgets
+    /// this inode. Used by mutate paths where a stale cache entry would
+    /// be a correctness hazard.
+    fn take(&mut self, inode: Inode) -> Option<InodeAttributes> {
+        let (gen, attrs) = self.entries.remove(&inode)?;
+        self.by_gen.remove(&gen);
         Some(attrs)
     }
 
@@ -93,10 +106,9 @@ impl InodeReadCache {
         if let Some((old_gen, _)) = self.entries.get(&inode) {
             self.by_gen.remove(&*old_gen);
         }
-        let new_gen = self.next_gen;
-        self.next_gen += 1;
-        self.entries.insert(inode, (new_gen, attrs));
-        self.by_gen.insert(new_gen, inode);
+        let gen = self.next_gen();
+        self.entries.insert(inode, (gen, attrs));
+        self.by_gen.insert(gen, inode);
         while self.entries.len() > self.cap {
             let Some((_, victim)) = self.by_gen.pop_first() else {
                 break;
@@ -106,9 +118,7 @@ impl InodeReadCache {
     }
 
     fn remove(&mut self, inode: Inode) {
-        if let Some((gen, _)) = self.entries.remove(&inode) {
-            self.by_gen.remove(&gen);
-        }
+        self.take(inode);
     }
 
     fn clear(&mut self) {
@@ -233,6 +243,28 @@ impl Handler {
         BkfsResult::multiple((), errs)
     }
 
+    /// Cache-or-disk read. Populates the cache on miss. Used by paths
+    /// that only need to inspect the attrs — mutators go through
+    /// `take_cached_or_load` instead so stale cache entries can't
+    /// outlive the mutation.
+    fn fetch_cached(&self, inode: Inode) -> BkfsResult<InodeAttributes> {
+        if let Some(attrs) = self.read_cache.borrow_mut().get(inode) {
+            return Ok(attrs);
+        }
+        let attrs = self.ctrl.load::<InodeAttributes>(inode)?;
+        self.read_cache.borrow_mut().put(inode, attrs.clone());
+        Ok(attrs)
+    }
+
+    /// Fetch for mutation: take from the cache if present (dropping
+    /// the entry), else load from disk without populating the cache.
+    fn take_cached_or_load(&self, inode: Inode) -> BkfsResult<InodeAttributes> {
+        if let Some(attrs) = self.read_cache.borrow_mut().take(inode) {
+            return Ok(attrs);
+        }
+        self.ctrl.load::<InodeAttributes>(inode)
+    }
+
     /// Load an inode, preferring the dirty cache and open Contents over
     /// the disk copy. Direct `ctrl.load` bypasses both caches and would
     /// return a stale version for any inode whose most recent mutation
@@ -244,12 +276,7 @@ impl Handler {
         if let Some(attrs) = self.dirty.get(&inode) {
             return Ok(attrs.clone());
         }
-        if let Some(attrs) = self.read_cache.borrow_mut().get(inode) {
-            return Ok(attrs);
-        }
-        let attrs = self.ctrl.load::<InodeAttributes>(inode)?;
-        self.read_cache.borrow_mut().put(inode, attrs.clone());
-        Ok(attrs)
+        self.fetch_cached(inode)
     }
     pub fn ctrl(&self) -> &Controller {
         &self.ctrl
@@ -263,30 +290,22 @@ impl Handler {
     ) -> BkfsResult<FileHandleId> {
         let contents = if let Some(contents) = self.inodes.get(&inode).and_then(Weak::upgrade) {
             contents
-        } else if let Some(dirty) = self.dirty.remove(&inode) {
-            // Fold any pending metadata-only changes into the fresh
-            // Contents so they persist via Contents::fsync on release.
-            let contents = Arc::new(Mutex::new(Contents::open_with_attrs(
-                self.ctrl.clone(),
-                dirty,
-                true,
-            )?));
-            self.inodes.insert(inode, Arc::downgrade(&contents));
-            contents
-        } else if let Some(attrs) = self.read_cache.borrow_mut().get(inode) {
-            // Open-from-cache: drop the cache entry (the Contents will
-            // own the authoritative copy from here on) and skip the
-            // decrypt+deserialize hit.
-            self.read_cache.borrow_mut().remove(inode);
-            let contents = Arc::new(Mutex::new(Contents::open_with_attrs(
-                self.ctrl.clone(),
-                attrs,
-                false,
-            )?));
-            self.inodes.insert(inode, Arc::downgrade(&contents));
-            contents
         } else {
-            let contents = Arc::new(Mutex::new(Contents::open(self.ctrl.clone(), inode)?));
+            // Build a fresh Contents from whichever source has the
+            // freshest state. `dirty` carries forward unpersisted
+            // metadata changes (changed=true); `read_cache` is a clean
+            // load and doesn't.
+            let (attrs, changed) = if let Some(dirty) = self.dirty.remove(&inode) {
+                (Some(dirty), true)
+            } else if let Some(cached) = self.read_cache.borrow_mut().take(inode) {
+                (Some(cached), false)
+            } else {
+                (None, false)
+            };
+            let contents = Arc::new(Mutex::new(match attrs {
+                Some(a) => Contents::open_with_attrs(self.ctrl.clone(), a, changed)?,
+                None => Contents::open(self.ctrl.clone(), inode)?,
+            }));
             self.inodes.insert(inode, Arc::downgrade(&contents));
             contents
         };
@@ -330,11 +349,11 @@ impl Handler {
     ) -> BkfsResult<T> {
         if let Some(contents) = self.inodes.get(&inode).and_then(Weak::upgrade) {
             let mut contents = contents.lock().unwrap();
-            f(self, &mut contents.inode)
-        } else if let Some(mut attrs) = self.dirty.remove(&inode) {
-            // Any mutation path is about to produce a new authoritative
-            // state — drop the read cache entry now so a subsequent
-            // load_inode can't return a stale clone.
+            return f(self, &mut contents.inode);
+        }
+        if let Some(mut attrs) = self.dirty.remove(&inode) {
+            // Any mutation invalidates the read cache — clear it now
+            // so a subsequent load can't return a stale clone.
             self.read_cache.borrow_mut().remove(inode);
             let result = f(self, &mut attrs);
             // An inode with no parents (and which isn't root) has been
@@ -345,19 +364,10 @@ impl Handler {
             if attrs.inode.0 == FUSE_ROOT_ID || !attrs.attrs.parents.is_empty() {
                 self.dirty.insert(inode, attrs);
             }
-            result
-        } else {
-            // Prefer the read cache over disk when seeding the
-            // mutation. load_inode populates this on miss, so a hot
-            // traversal stays in memory.
-            let cached = self.read_cache.borrow_mut().get(inode);
-            self.read_cache.borrow_mut().remove(inode);
-            let mut attrs = match cached {
-                Some(a) => a,
-                None => self.ctrl().load::<InodeAttributes>(inode)?,
-            };
-            f(self, &mut attrs)
+            return result;
         }
+        let mut attrs = self.take_cached_or_load(inode)?;
+        f(self, &mut attrs)
     }
 
     pub fn peek_inode<F: FnOnce(&InodeAttributes) -> BkfsResult<T>, T>(
@@ -366,18 +376,12 @@ impl Handler {
         f: F,
     ) -> BkfsResult<T> {
         if let Some(contents) = self.inodes.get(&inode).and_then(Weak::upgrade) {
-            let contents = contents.lock().unwrap();
-            f(&contents.inode)
-        } else if let Some(attrs) = self.dirty.get(&inode) {
-            f(attrs)
-        } else if let Some(attrs) = self.read_cache.borrow_mut().get(inode) {
-            f(&attrs)
-        } else {
-            let attrs = self.ctrl().load::<InodeAttributes>(inode)?;
-            let result = f(&attrs);
-            self.read_cache.borrow_mut().put(inode, attrs);
-            result
+            return f(&contents.lock().unwrap().inode);
         }
+        if let Some(attrs) = self.dirty.get(&inode) {
+            return f(attrs);
+        }
+        f(&self.fetch_cached(inode)?)
     }
 }
 

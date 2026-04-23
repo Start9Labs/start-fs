@@ -38,6 +38,16 @@ fn pattern_check(offset: u64, buf: &[u8]) {
     }
 }
 
+/// Serializes the fusermount3 invocation across parallel tests.
+/// The helper talks to a per-user control socket and races with itself
+/// under `cargo test -j N`, yielding sporadic EPERM from Session::new.
+/// Holding the lock only through mount keeps the test bodies
+/// themselves parallel.
+fn mount_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 fn with_backupfs(
     data: &Path,
     password: String,
@@ -69,7 +79,10 @@ fn with_backupfs(
             idmapped_root: vec![],
         })
         .unwrap();
-        let mut fs = fuser::Session::new(fs, mnt_dir, &opt).unwrap();
+        let mut fs = {
+            let _guard = mount_lock().lock().unwrap_or_else(|e| e.into_inner());
+            fuser::Session::new(fs, mnt_dir, &opt).unwrap()
+        };
         ready_sender.send(Unmounter(fs.unmount_callable())).unwrap();
         fs.run().unwrap();
     });

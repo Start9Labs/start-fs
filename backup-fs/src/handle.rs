@@ -193,6 +193,30 @@ impl Handler {
         self.evict_dirty_overflow()
     }
 
+    /// Persist inode attrs durably (sync_all) to disk and keep the
+    /// in-memory caches in sync. Used where ordering against a
+    /// subsequent file removal (gc_inode) matters: a pointer update
+    /// that lands in the dirty cache but crashes before flush leaves
+    /// the on-disk parent referencing an already-deleted inode, which
+    /// the heal then prunes — destroying the user's new data.
+    pub fn save_inode_durable(&mut self, attrs: &InodeAttributes) -> BkfsResult<()> {
+        self.read_cache.borrow_mut().remove(attrs.inode);
+        self.ctrl.save(attrs)?;
+        if self
+            .inodes
+            .get(&attrs.inode)
+            .and_then(Weak::upgrade)
+            .is_none()
+        {
+            // Closed inode: keep dirty cache consistent with what we
+            // just wrote, so subsequent loads don't fetch the stale
+            // pre-modification clone that may still be sitting there.
+            self.dirty.insert(attrs.inode, attrs.clone());
+            self.evict_dirty_overflow()?;
+        }
+        Ok(())
+    }
+
     /// Drop a dirty entry without saving — used when an inode is about
     /// to be removed (unlink+gc path).
     pub fn forget_dirty(&mut self, inode: Inode) {
@@ -710,7 +734,13 @@ impl Handler {
 
             inode.attrs.parents.remove(&(parent.inode, name.to_owned()));
 
-            handler.save_inode(&parent)?;
+            // Durable parent save BEFORE gc — otherwise a crash between
+            // the on-disk file removal below and the dirty-cache flush
+            // on unmount leaves parent.dir pointing to a deleted inode.
+            // Subsequent lookups heal by pruning the entry, which is
+            // the data-loss path users hit when the daemon is killed
+            // mid-op.
+            handler.save_inode_durable(&parent)?;
             if !handler.gc_inode(&*inode)? {
                 handler.save_inode(&*inode)?;
             }
@@ -781,28 +811,44 @@ impl Handler {
                 ty: (&inode.attrs.contents).into(),
             };
             let entry = dir.entry(new_name.to_owned());
+            // Record which inode (if any) we need to gc after the new
+            // pointers are durable. Doing the gc inline — as the code
+            // used to — removed the prev inode's on-disk files before
+            // the parent's new dir entry reached disk. A crash in that
+            // window left the parent pointing to a deleted inode, which
+            // lookup then healed by pruning the entry (losing the new
+            // one the rename just wrote).
+            let mut prev_to_gc: Option<Inode> = None;
             match (entry, overwrite) {
                 (Occupied(_), None) => return BkfsResult::errno(libc::EEXIST),
                 (Occupied(mut prev_entry), Some(overwrite)) => {
-                    handler.mutate_inode(prev_entry.get().inode, |handler, prev_inode| {
-                        if let FileData::Directory(dir) = &prev_inode.attrs.contents {
-                            if prev_inode.attrs.parents.len() <= 1 && !dir.is_empty() {
-                                return BkfsResult::errno(libc::ENOTEMPTY);
+                    let prev_ino = prev_entry.get().inode;
+                    let should_gc =
+                        handler.mutate_inode(prev_ino, |handler, prev_inode| {
+                            if let FileData::Directory(dir) = &prev_inode.attrs.contents {
+                                if prev_inode.attrs.parents.len() <= 1 && !dir.is_empty() {
+                                    return BkfsResult::errno(libc::ENOTEMPTY);
+                                }
                             }
-                        }
 
-                        sticky_res?;
+                            sticky_res?;
 
-                        prev_inode
-                            .attrs
-                            .parents
-                            .remove(&(new_parent.inode, new_name.to_owned()));
+                            prev_inode
+                                .attrs
+                                .parents
+                                .remove(&(new_parent.inode, new_name.to_owned()));
 
-                        if !overwrite.gc || !handler.gc_inode(prev_inode)? {
+                            // Always save the prev inode's updated
+                            // state (may have other parents via hard
+                            // links). The actual gc — if parents went
+                            // to empty — is deferred to after the new
+                            // pointers below are durable.
                             handler.save_inode(&*prev_inode)?;
-                        }
-                        Ok(())
-                    })?;
+                            Ok(overwrite.gc && prev_inode.attrs.parents.is_empty())
+                        })?;
+                    if should_gc {
+                        prev_to_gc = Some(prev_ino);
+                    }
                     *prev_entry.get_mut() = new_entry;
                 }
                 (Vacant(e), _) => {
@@ -815,8 +861,24 @@ impl Handler {
                 .parents
                 .insert((new_parent.inode, new_name.to_owned()));
 
-            handler.save_inode(&*inode)?;
-            handler.save_inode(&new_parent)?;
+            if prev_to_gc.is_some() {
+                // Overwrite path: disk ordering matters. Make the new
+                // pointer + its target durable BEFORE removing the old
+                // target's files.
+                handler.save_inode_durable(&*inode)?;
+                handler.save_inode_durable(&new_parent)?;
+            } else {
+                handler.save_inode(&*inode)?;
+                handler.save_inode(&new_parent)?;
+            }
+
+            if let Some(prev_ino) = prev_to_gc {
+                // Reload so gc_inode sees the saved parents-empty state
+                // rather than a stale cache entry — the dirty cache was
+                // consumed by mutate_inode above.
+                let prev = handler.load_inode(prev_ino)?;
+                handler.gc_inode(&prev)?;
+            }
 
             Ok(inode.clone())
         })

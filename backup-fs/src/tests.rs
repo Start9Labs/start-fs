@@ -995,3 +995,317 @@ fn partial_overwrite_preserves_surrounding_data() {
         None,
     );
 }
+
+/// Regression test for the "rename-over-existing" pattern used by
+/// atomic save helpers: write to `.name.tmp`, then `rename(.name.tmp,
+/// name)` to atomically replace the destination. After the rename the
+/// new name must resolve — `ls` showing the entry while `cat` returns
+/// ENOENT was the reported symptom.
+#[test_log::test]
+fn rename_over_existing_resolves() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::write(mnt.join("os-backup.json"), b"old").unwrap();
+            fs::write(mnt.join(".os-backup.json.tmp"), b"new contents").unwrap();
+            fs::rename(
+                mnt.join(".os-backup.json.tmp"),
+                mnt.join("os-backup.json"),
+            )
+            .unwrap();
+
+            let live: Vec<String> = fs::read_dir(mnt)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                live.iter().any(|n| n == "os-backup.json"),
+                "listing missing os-backup.json: {live:?}"
+            );
+            assert!(
+                !live.iter().any(|n| n == ".os-backup.json.tmp"),
+                "listing still has tmp after rename: {live:?}"
+            );
+
+            assert_eq!(
+                fs::read(mnt.join("os-backup.json")).unwrap(),
+                b"new contents"
+            );
+        },
+        None,
+    );
+
+    // Same check after a remount — disk state has to be consistent.
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let live: Vec<String> = fs::read_dir(mnt)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                live.iter().any(|n| n == "os-backup.json"),
+                "post-remount listing missing os-backup.json: {live:?}"
+            );
+            assert_eq!(
+                fs::read(mnt.join("os-backup.json")).unwrap(),
+                b"new contents"
+            );
+        },
+        None,
+    );
+}
+
+/// Real-world pattern: a backup root that also holds several sibling
+/// directories (service subdirs) alongside `os-backup.json`. We write
+/// the atomic-save over it, then cleanly unmount and remount, then
+/// repeat the atomic save — cumulative cross-session state is what
+/// users actually run into.
+#[test_log::test]
+fn rename_over_existing_with_siblings_across_remounts() {
+    let data = TempDir::new("backupfs_data").unwrap();
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            for d in [
+                "actual-budget",
+                "bitcoind",
+                "btcpayserver",
+                "luks",
+                "vaultwarden",
+            ] {
+                fs::create_dir(mnt.join(d)).unwrap();
+            }
+            fs::write(mnt.join("os-backup.json"), b"first").unwrap();
+        },
+        None,
+    );
+
+    for round in 0..5 {
+        with_backupfs(
+            data.path(),
+            "ohea".to_owned(),
+            |mnt| {
+                let tmp = mnt.join(".os-backup.json.tmp");
+                {
+                    let mut f = fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&tmp)
+                        .unwrap();
+                    f.write_all(format!("round-{round}").as_bytes()).unwrap();
+                    f.sync_all().unwrap();
+                }
+                fs::rename(&tmp, mnt.join("os-backup.json")).unwrap();
+
+                let got = fs::read(mnt.join("os-backup.json")).unwrap();
+                assert_eq!(got, format!("round-{round}").as_bytes());
+            },
+            None,
+        );
+
+        // Fresh mount: must still see os-backup.json and be able to
+        // read it back. This is the exact pattern the user reported
+        // failing ("ls shows it, cat says ENOENT").
+        with_backupfs(
+            data.path(),
+            "ohea".to_owned(),
+            |mnt| {
+                let live: Vec<String> = fs::read_dir(mnt)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect();
+                assert!(
+                    live.iter().any(|n| n == "os-backup.json"),
+                    "round {round}: post-remount ls missing os-backup.json: {live:?}"
+                );
+                let got = fs::read(mnt.join("os-backup.json")).unwrap_or_else(|e| {
+                    panic!("round {round}: post-remount cat failed: {e}")
+                });
+                assert_eq!(got, format!("round-{round}").as_bytes());
+            },
+            None,
+        );
+    }
+}
+
+/// Repeated rename-over-existing (the "atomic save" pattern applied
+/// many times). Each round overwrites the previous version and must
+/// leave exactly one resolvable entry.
+#[test_log::test]
+fn rename_over_existing_many_rounds() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            for i in 0..20 {
+                let payload = format!("round-{i}");
+                let tmp = mnt.join(".os-backup.json.tmp");
+                {
+                    let mut f = fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&tmp)
+                        .unwrap();
+                    f.write_all(payload.as_bytes()).unwrap();
+                    f.sync_all().unwrap();
+                }
+                fs::rename(&tmp, mnt.join("os-backup.json")).unwrap();
+
+                let got = fs::read(mnt.join("os-backup.json")).unwrap();
+                assert_eq!(
+                    got,
+                    payload.as_bytes(),
+                    "round {i}: read back wrong bytes"
+                );
+                let live: Vec<String> = fs::read_dir(mnt)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect();
+                assert!(
+                    !live.iter().any(|n| n == ".os-backup.json.tmp"),
+                    "round {i}: tmp still visible: {live:?}"
+                );
+            }
+        },
+        None,
+    );
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            assert_eq!(
+                fs::read(mnt.join("os-backup.json")).unwrap(),
+                b"round-19",
+                "final round not persisted"
+            );
+        },
+        None,
+    );
+}
+
+/// Mirrors start-os's AtomicFile pattern exactly: create tmp, write,
+/// fsync, drop fd, rename, then immediately unmount. The user reports
+/// this sequence loses data on clean unmount.
+#[test_log::test]
+fn rename_immediately_before_unmount() {
+    let data = TempDir::new("backupfs_data").unwrap();
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::write(mnt.join("os-backup.json"), b"old").unwrap();
+        },
+        None,
+    );
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let tmp = mnt.join(".os-backup.json.tmp");
+            let dst = mnt.join("os-backup.json");
+            {
+                let mut f = fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&tmp)
+                    .unwrap();
+                f.write_all(b"new contents").unwrap();
+                f.sync_all().unwrap();
+            }
+            fs::rename(&tmp, &dst).unwrap();
+            // Do nothing else — let Drop trigger unmount right here.
+        },
+        None,
+    );
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let live: Vec<String> = fs::read_dir(mnt)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                live.iter().any(|n| n == "os-backup.json"),
+                "post-remount listing missing os-backup.json: {live:?}"
+            );
+            let got = fs::read(mnt.join("os-backup.json")).unwrap_or_else(|e| {
+                panic!("post-remount cat failed: {e} — listing was {live:?}")
+            });
+            assert_eq!(got, b"new contents");
+        },
+        None,
+    );
+}
+
+/// As above but across a remount between the create+write+tmp and the
+/// rename — models a backup process that is killed part-way through an
+/// atomic save and resumes in a fresh mount.
+#[test_log::test]
+fn rename_over_existing_across_remount() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::write(mnt.join("os-backup.json"), b"old").unwrap();
+            fs::write(mnt.join(".os-backup.json.tmp"), b"new contents").unwrap();
+        },
+        None,
+    );
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::rename(
+                mnt.join(".os-backup.json.tmp"),
+                mnt.join("os-backup.json"),
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read(mnt.join("os-backup.json")).unwrap(),
+                b"new contents"
+            );
+        },
+        None,
+    );
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let live: Vec<String> = fs::read_dir(mnt)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                live.iter().any(|n| n == "os-backup.json"),
+                "post-remount listing missing os-backup.json: {live:?}"
+            );
+            assert!(
+                !live.iter().any(|n| n == ".os-backup.json.tmp"),
+                "tmp name persisted after rename: {live:?}"
+            );
+            assert_eq!(
+                fs::read(mnt.join("os-backup.json")).unwrap(),
+                b"new contents"
+            );
+        },
+        None,
+    );
+}

@@ -1193,6 +1193,30 @@ fn rename_over_existing_many_rounds() {
     );
 }
 
+/// `sync -f <mountpoint>` (i.e. syncfs(2)) must reach backup-fs's
+/// dirty cache — otherwise a caller that wants a durability checkpoint
+/// short of unmount has no way to get one.
+#[test_log::test]
+fn sync_f_on_mount_flushes_dirty_cache() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::write(mnt.join("a"), b"hello").unwrap();
+            // sync -f hits FUSE_SYNCFS which our handler routes to
+            // flush_all_dirty. Success = exit code 0.
+            let status = std::process::Command::new("sync")
+                .arg("-f")
+                .arg(mnt)
+                .status()
+                .expect("run sync -f");
+            assert!(status.success(), "sync -f exited with {status}");
+        },
+        None,
+    );
+}
+
 /// Mirrors start-os's AtomicFile pattern exactly: create tmp, write,
 /// fsync, drop fd, rename, then immediately unmount. The user reports
 /// this sequence loses data on clean unmount.

@@ -640,6 +640,18 @@ impl Filesystem for BackupFS {
         reply.ok(); // directories are synced on write
     }
 
+    fn syncfs(&mut self, _req: &Request<'_>, reply: ReplyEmpty) {
+        // `sync -f <mountpoint>` / syncfs(2). flush_all_dirty persists
+        // every pending inode save via save_fast and finishes with a
+        // syncfs on the backing store, so this is a full whole-fs
+        // checkpoint the caller can rely on without going through
+        // unmount.
+        match self.handler.flush_all_dirty() {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e.to_errno_log()),
+        }
+    }
+
     fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
         let StatFs { files, ffree } = self.handler.ctrl().statfs();
         // TODO: real implementation of this

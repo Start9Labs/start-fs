@@ -332,7 +332,7 @@ checksum = "a06f77d526c1a601b7c4cdd98f54b5eaabffc14d5f2f0296febdc7f357c6d3ba"
 [[package]]
 name = "fuser"
 version = "0.14.0"
-source = "git+https://github.com/Start9Labs/fuser.git#b60f00a860ef5c1ac244279351abc5290c8bf9c2"
+source = "git+https://github.com/Start9Labs/fuser.git?rev=b6f91ac#b6f91ac6985310b1f4e3ff8075e9468b120e2fe0"
 dependencies = [
  "clap",
  "libc",

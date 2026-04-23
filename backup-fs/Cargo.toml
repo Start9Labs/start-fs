@@ -20,7 +20,7 @@ required-features = ["cli"]
 bincode = "1"
 chacha20 = { version = "0.9.1", features = ["zeroize"] }
 fd-lock-rs = "0.1.4"
-fuser = { git = "https://github.com/Start9Labs/fuser.git", features = [
+fuser = { git = "https://github.com/Start9Labs/fuser.git", rev = "b6f91ac", features = [
     "abi-7-31",
     "serializable",
     "clap",

@@ -40,6 +40,22 @@ impl AtomicFile {
         )
     }
 
+    /// Create a plain (non-O_DIRECT) atomic file. Intended for small
+    /// metadata files — inodes are usually well under 4 KiB, and the
+    /// O_DIRECT alignment dance + per-write device round-trips are pure
+    /// overhead at that size. Content goes through the page cache and
+    /// becomes durable on the next fsync/syncfs.
+    pub fn create_buffered(path: PathBuf) -> BkfsResult<Self> {
+        Self::new(
+            path,
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .truncate(true)
+                .create(true),
+        )
+    }
+
     #[allow(dead_code)]
     pub fn rollback(mut self) -> BkfsResult<()> {
         drop(self.file.take());
@@ -51,6 +67,20 @@ impl AtomicFile {
         if let Some(file) = self.file.as_mut() {
             file.flush()?;
             file.sync_all()?;
+        }
+        drop(self.file.take());
+        std::fs::rename(&self.tmp_path, &self.path)?;
+        Ok(())
+    }
+
+    /// Rename without sync_all. Data lives in the page cache (or was
+    /// pushed to the block layer via O_DIRECT) and is not guaranteed
+    /// durable until the caller issues a syncfs. Use this when a batch
+    /// of saves will be group-committed together — trades per-file
+    /// durability for throughput.
+    pub fn save_fast(mut self) -> BkfsResult<()> {
+        if let Some(file) = self.file.as_mut() {
+            file.flush()?;
         }
         drop(self.file.take());
         std::fs::rename(&self.tmp_path, &self.path)?;

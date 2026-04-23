@@ -1,12 +1,12 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::cmp::min;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::ops::Bound;
 use std::path::PathBuf;
-use std::rc::{Rc, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::SystemTime;
 
 use fuser::consts::FUSE_WRITE_KILL_PRIV;
@@ -16,14 +16,136 @@ use log::{debug, warn};
 use crate::contents::Contents;
 use crate::ctrl::Controller;
 use crate::directory::{DirectoryContents, DirectoryEntry};
-use crate::error::{BkfsResult, BkfsResultExt};
+use crate::error::{BkfsError, BkfsErrorKind, BkfsResult, BkfsResultExt};
 use crate::inode::{FileData, Inode, InodeAttributes};
 use crate::{FMODE_EXEC, MAX_NAME_LENGTH};
+
+/// True if `e` is "the inode's backing file isn't on disk" — either
+/// from a same-session create+delete that never touched disk, or a
+/// stale parent dir entry left by an unclean shutdown. Distinguishes
+/// from other I/O errors which remain fatal.
+fn is_missing_inode(e: &BkfsError) -> bool {
+    match &e.kind {
+        BkfsErrorKind::Io(io) => io.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
+}
+
+/// Upper bound on in-memory unpersisted inode attributes before we start
+/// evicting oldest-first. The cap exists only so memory use is bounded
+/// on pathological workloads — for typical rsync traffic the set stays
+/// small because each release-on-close opens+removes the entry.
+const DIRTY_INODE_LIMIT: usize = 1024;
+
+/// Default entries kept in the clean-load read cache. rsync and
+/// similar tools re-stat the whole tree several times per run; caching
+/// a few thousand loaded inodes turns those passes from O(open+decrypt
+/// +deserialize) per entry into an in-memory clone.
+const DEFAULT_READ_CACHE_CAP: usize = 4096;
+
+fn read_cache_cap() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("BACKUPFS_READ_CACHE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_READ_CACHE_CAP)
+    })
+}
+
+/// Bounded LRU of InodeAttributes loaded from disk. Tracks access
+/// recency via a monotonically-increasing generation counter —
+/// O(log n) per op, no intrusive list bookkeeping.
+struct InodeReadCache {
+    entries: HashMap<Inode, (u64, InodeAttributes)>,
+    by_gen: BTreeMap<u64, Inode>,
+    next_gen: u64,
+    cap: usize,
+}
+
+impl InodeReadCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            by_gen: BTreeMap::new(),
+            next_gen: 0,
+            cap,
+        }
+    }
+
+    fn next_gen(&mut self) -> u64 {
+        let g = self.next_gen;
+        self.next_gen += 1;
+        g
+    }
+
+    /// Clone the attrs and bump LRU order so hot entries stay resident.
+    fn get(&mut self, inode: Inode) -> Option<InodeAttributes> {
+        let (gen, attrs) = self.entries.get_mut(&inode)?;
+        let attrs = attrs.clone();
+        self.by_gen.remove(gen);
+        *gen = self.next_gen;
+        self.next_gen += 1;
+        self.by_gen.insert(*gen, inode);
+        Some(attrs)
+    }
+
+    /// Remove and return — caller owns the attrs and the cache forgets
+    /// this inode. Used by mutate paths where a stale cache entry would
+    /// be a correctness hazard.
+    fn take(&mut self, inode: Inode) -> Option<InodeAttributes> {
+        let (gen, attrs) = self.entries.remove(&inode)?;
+        self.by_gen.remove(&gen);
+        Some(attrs)
+    }
+
+    fn put(&mut self, inode: Inode, attrs: InodeAttributes) {
+        if self.cap == 0 {
+            return;
+        }
+        if let Some((old_gen, _)) = self.entries.get(&inode) {
+            self.by_gen.remove(&*old_gen);
+        }
+        let gen = self.next_gen();
+        self.entries.insert(inode, (gen, attrs));
+        self.by_gen.insert(gen, inode);
+        while self.entries.len() > self.cap {
+            let Some((_, victim)) = self.by_gen.pop_first() else {
+                break;
+            };
+            self.entries.remove(&victim);
+        }
+    }
+
+    fn remove(&mut self, inode: Inode) {
+        self.take(inode);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.by_gen.clear();
+    }
+}
 
 pub struct Handler {
     ctrl: Controller,
     next_fh: FileHandleId,
-    inodes: BTreeMap<Inode, Weak<RefCell<Contents>>>,
+    inodes: BTreeMap<Inode, Weak<Mutex<Contents>>>,
+    /// Inode attrs with unpersisted changes. Only non-open inodes go
+    /// here — for open inodes, Contents holds the authoritative copy and
+    /// will persist via Contents::fsync on release.
+    ///
+    /// rsync's typical per-file pattern is create → write → release →
+    /// utime → chmod → chown. The utime/chmod/chown trio all mutate the
+    /// same inode after release, and before this cache they each fired a
+    /// full AtomicFile::save barrier. Here they collapse into a single
+    /// save when the inode is evicted (or on destroy).
+    dirty: BTreeMap<Inode, InodeAttributes>,
+    /// Clean LRU cache of InodeAttributes loaded from disk. Covers
+    /// multi-pass read workloads (rsync's checksum / verify phases)
+    /// where the same inode is stat'd many times and the open+decrypt
+    /// cost dominates.
+    read_cache: RefCell<InodeReadCache>,
     open_files: BTreeMap<FileHandleId, FileHandle>,
     open_dirs: BTreeMap<FileHandleId, DirHandle>,
 }
@@ -33,9 +155,128 @@ impl Handler {
             ctrl,
             next_fh: FileHandleId(1),
             inodes: BTreeMap::new(),
+            dirty: BTreeMap::new(),
+            read_cache: RefCell::new(InodeReadCache::new(read_cache_cap())),
             open_files: BTreeMap::new(),
             open_dirs: BTreeMap::new(),
         }
+    }
+
+    /// Queue an inode save. For non-open inodes the attrs go into the
+    /// dirty cache and get coalesced until eviction or destroy — this is
+    /// where rsync's post-close utime/chmod/chown trio collapses to one
+    /// disk write.
+    ///
+    /// For open inodes we save through immediately (same as the historical
+    /// behaviour). We can't mark Contents::changed from here without
+    /// re-borrowing — most callers are already inside a mutate_inode
+    /// closure that holds the RefCell borrow. Luckily the important
+    /// coalescing case (setattrs on closed files) is the one rsync uses.
+    pub fn save_inode(&mut self, attrs: &InodeAttributes) -> BkfsResult<()> {
+        // Any save invalidates the read cache — the cached copy is
+        // now stale relative to the authoritative state.
+        self.read_cache.borrow_mut().remove(attrs.inode);
+        if self
+            .inodes
+            .get(&attrs.inode)
+            .and_then(Weak::upgrade)
+            .is_some()
+        {
+            // Open inodes skip the dirty cache, but still go through
+            // the batched sync path — per-file sync_all on inode saves
+            // was a major small-file bottleneck on slow backing stores.
+            self.ctrl.save_fast(attrs)?;
+            self.ctrl.tick_save()?;
+            return Ok(());
+        }
+        self.dirty.insert(attrs.inode, attrs.clone());
+        self.evict_dirty_overflow()
+    }
+
+    /// Drop a dirty entry without saving — used when an inode is about
+    /// to be removed (unlink+gc path).
+    pub fn forget_dirty(&mut self, inode: Inode) {
+        self.dirty.remove(&inode);
+        self.read_cache.borrow_mut().remove(inode);
+    }
+
+    /// Remove and return a dirty entry if present. Used by fopen so a
+    /// newly-opened Contents starts from the freshest unpersisted state.
+    pub fn take_dirty(&mut self, inode: Inode) -> Option<InodeAttributes> {
+        self.dirty.remove(&inode)
+    }
+
+    fn evict_dirty_overflow(&mut self) -> BkfsResult<()> {
+        while self.dirty.len() > DIRTY_INODE_LIMIT {
+            // BTreeMap's first key is the smallest Inode — roughly "oldest
+            // allocated," which correlates with "least recently rsync'd"
+            // for a sequential backup. Good enough as an eviction hint.
+            let Some((&inode, _)) = self.dirty.iter().next() else {
+                break;
+            };
+            let attrs = self.dirty.remove(&inode).unwrap();
+            self.ctrl.save_fast(&attrs)?;
+            self.ctrl.tick_save()?;
+        }
+        Ok(())
+    }
+
+    /// Persist all dirty entries. Called on destroy.
+    pub fn flush_all_dirty(&mut self) -> BkfsResult<()> {
+        let pending = std::mem::take(&mut self.dirty);
+        let mut errs = Vec::new();
+        for (_, attrs) in pending {
+            if let Err(e) = self.ctrl.save_fast(&attrs) {
+                errs.push(e);
+            }
+        }
+        // The read cache may have stale copies of anything we just
+        // persisted — safest to clear the whole thing on the unmount
+        // path.
+        self.read_cache.borrow_mut().clear();
+        // Belt-and-braces durability on the final flush — unmount path
+        // has to leave every dirty inode on stable storage, not just
+        // in the page cache.
+        if let Err(e) = self.ctrl.syncfs() {
+            errs.push(e.into());
+        }
+        BkfsResult::multiple((), errs)
+    }
+
+    /// Cache-or-disk read. Populates the cache on miss. Used by paths
+    /// that only need to inspect the attrs — mutators go through
+    /// `take_cached_or_load` instead so stale cache entries can't
+    /// outlive the mutation.
+    fn fetch_cached(&self, inode: Inode) -> BkfsResult<InodeAttributes> {
+        if let Some(attrs) = self.read_cache.borrow_mut().get(inode) {
+            return Ok(attrs);
+        }
+        let attrs = self.ctrl.load::<InodeAttributes>(inode)?;
+        self.read_cache.borrow_mut().put(inode, attrs.clone());
+        Ok(attrs)
+    }
+
+    /// Fetch for mutation: take from the cache if present (dropping
+    /// the entry), else load from disk without populating the cache.
+    fn take_cached_or_load(&self, inode: Inode) -> BkfsResult<InodeAttributes> {
+        if let Some(attrs) = self.read_cache.borrow_mut().take(inode) {
+            return Ok(attrs);
+        }
+        self.ctrl.load::<InodeAttributes>(inode)
+    }
+
+    /// Load an inode, preferring the dirty cache and open Contents over
+    /// the disk copy. Direct `ctrl.load` bypasses both caches and would
+    /// return a stale version for any inode whose most recent mutation
+    /// hasn't been flushed.
+    pub fn load_inode(&self, inode: Inode) -> BkfsResult<InodeAttributes> {
+        if let Some(contents) = self.inodes.get(&inode).and_then(Weak::upgrade) {
+            return Ok(contents.lock().unwrap().inode.clone());
+        }
+        if let Some(attrs) = self.dirty.get(&inode) {
+            return Ok(attrs.clone());
+        }
+        self.fetch_cached(inode)
     }
     pub fn ctrl(&self) -> &Controller {
         &self.ctrl
@@ -50,11 +291,25 @@ impl Handler {
         let contents = if let Some(contents) = self.inodes.get(&inode).and_then(Weak::upgrade) {
             contents
         } else {
-            let contents = Rc::new(RefCell::new(Contents::open(self.ctrl.clone(), inode)?));
-            self.inodes.insert(inode, Rc::downgrade(&contents));
+            // Build a fresh Contents from whichever source has the
+            // freshest state. `dirty` carries forward unpersisted
+            // metadata changes (changed=true); `read_cache` is a clean
+            // load and doesn't.
+            let (attrs, changed) = if let Some(dirty) = self.dirty.remove(&inode) {
+                (Some(dirty), true)
+            } else if let Some(cached) = self.read_cache.borrow_mut().take(inode) {
+                (Some(cached), false)
+            } else {
+                (None, false)
+            };
+            let contents = Arc::new(Mutex::new(match attrs {
+                Some(a) => Contents::open_with_attrs(self.ctrl.clone(), a, changed)?,
+                None => Contents::open(self.ctrl.clone(), inode)?,
+            }));
+            self.inodes.insert(inode, Arc::downgrade(&contents));
             contents
         };
-        access(self, &RefCell::borrow(&*contents).inode)?;
+        access(self, &contents.lock().unwrap().inode)?;
         let fh = self.next_fh;
         self.next_fh.0 += 1;
         self.open_files.insert(
@@ -93,11 +348,26 @@ impl Handler {
         f: F,
     ) -> BkfsResult<T> {
         if let Some(contents) = self.inodes.get(&inode).and_then(Weak::upgrade) {
-            let mut contents = contents.borrow_mut();
-            f(self, &mut contents.inode)
-        } else {
-            f(self, &mut self.ctrl().load::<InodeAttributes>(inode)?)
+            let mut contents = contents.lock().unwrap();
+            return f(self, &mut contents.inode);
         }
+        if let Some(mut attrs) = self.dirty.remove(&inode) {
+            // Any mutation invalidates the read cache — clear it now
+            // so a subsequent load can't return a stale clone.
+            self.read_cache.borrow_mut().remove(inode);
+            let result = f(self, &mut attrs);
+            // An inode with no parents (and which isn't root) has been
+            // fully unlinked — the closure likely ran gc_inode which
+            // removed the disk file. Re-inserting the now-orphan attrs
+            // into dirty would let flush_all_dirty resurrect them as
+            // zombies on the next unmount.
+            if attrs.inode.0 == FUSE_ROOT_ID || !attrs.attrs.parents.is_empty() {
+                self.dirty.insert(inode, attrs);
+            }
+            return result;
+        }
+        let mut attrs = self.take_cached_or_load(inode)?;
+        f(self, &mut attrs)
     }
 
     pub fn peek_inode<F: FnOnce(&InodeAttributes) -> BkfsResult<T>, T>(
@@ -106,11 +376,12 @@ impl Handler {
         f: F,
     ) -> BkfsResult<T> {
         if let Some(contents) = self.inodes.get(&inode).and_then(Weak::upgrade) {
-            let contents = contents.borrow_mut();
-            f(&contents.inode)
-        } else {
-            f(&self.ctrl().load::<InodeAttributes>(inode)?)
+            return f(&contents.lock().unwrap().inode);
         }
+        if let Some(attrs) = self.dirty.get(&inode) {
+            return f(attrs);
+        }
+        f(&self.fetch_cached(inode)?)
     }
 }
 
@@ -122,13 +393,13 @@ pub struct FileHandle {
     pub inode: Inode,
     pub read: bool,
     pub write: bool,
-    pub contents: Rc<RefCell<Contents>>,
+    pub contents: Arc<Mutex<Contents>>,
 }
 impl FileHandle {
     pub fn close(self, handler: &mut Handler) -> BkfsResult<()> {
-        match Rc::try_unwrap(self.contents) {
-            Ok(contents) => contents.into_inner().close(handler)?,
-            Err(contents) => contents.borrow_mut().fsync()?,
+        match Arc::try_unwrap(self.contents) {
+            Ok(contents) => contents.into_inner().unwrap().close(handler)?,
+            Err(contents) => contents.lock().unwrap().fsync()?,
         }
         Ok(())
     }
@@ -145,12 +416,24 @@ pub struct OverwriteOptions {
 
 impl Handler {
     pub fn close_all(&mut self) -> BkfsResult<()> {
-        std::mem::take(&mut self.inodes);
         let mut errs = Vec::new();
+        // Close all open files first — each FileHandle::close runs
+        // Contents::fsync which persists the inode+content file. This
+        // drops strong refs from self.inodes as a side effect (Weak
+        // upgrades start failing), but we still clear the map below.
         for (_, handle) in std::mem::take(&mut self.open_files) {
             if let Err(e) = handle.close(self) {
                 errs.push(e);
             }
+        }
+        std::mem::take(&mut self.inodes);
+        // Persist any metadata changes (setattr / xattr / link / unlink
+        // on non-open inodes) that are still sitting in the dirty cache.
+        // Without this, an unmount would drop those changes silently —
+        // which has been the behaviour the user hit when the daemon was
+        // killed mid-backup.
+        if let Err(e) = self.flush_all_dirty() {
+            errs.push(e);
         }
         BkfsResult::multiple((), errs)
     }
@@ -164,7 +447,7 @@ impl Handler {
         if name.len() > MAX_NAME_LENGTH as usize {
             return BkfsResult::errno(libc::ENAMETOOLONG);
         }
-        let parent = self.ctrl().load::<InodeAttributes>(parent)?;
+        let mut parent = self.load_inode(parent)?;
         parent.attrs.check_access(
             &self.ctrl().config().idmapped_root,
             req.uid(),
@@ -173,16 +456,42 @@ impl Handler {
         )?;
 
         let inode = parent.lookup(name)?;
-        self.mutate_inode(inode, |_, inode| {
-            if !inode
+        let result = self.mutate_inode(inode, |_, attrs| {
+            if !attrs
                 .attrs
                 .parents
                 .contains(&(parent.inode, name.to_owned()))
             {
                 return BkfsResult::errno_notrace(libc::ENOENT);
             }
-            Ok(inode.clone())
-        })
+            Ok(attrs.clone())
+        });
+
+        match result {
+            Ok(attrs) => Ok(attrs),
+            Err(e) if is_missing_inode(&e) => {
+                // Parent's dir entry references an inode whose backing
+                // file doesn't exist — a stale pointer from an unclean
+                // shutdown or an earlier bug. Without healing, every
+                // subsequent lookup returns ENOENT, which means rmdir
+                // never gets a chance to run (rm fails at the lookup
+                // step) and the phantom entry hangs around forever.
+                //
+                // Prune the entry from the parent now. Subsequent
+                // readdir will see a clean listing and userspace can
+                // proceed.
+                warn!(
+                    "lookup: pruning stale parent {:?}/{:?} → missing inode {:?}",
+                    parent.inode, name, inode
+                );
+                if let FileData::Directory(dir) = &mut parent.attrs.contents {
+                    dir.remove(name);
+                }
+                self.save_inode(&parent)?;
+                BkfsResult::errno_notrace(libc::ENOENT)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub fn setattr(
@@ -221,7 +530,7 @@ impl Handler {
                 flags,
             )?;
             if changed {
-                handler.ctrl().save(&*inode)?;
+                handler.save_inode(&*inode)?;
             }
             Ok(inode.clone())
         })?;
@@ -230,7 +539,7 @@ impl Handler {
 
     pub fn readlink(&mut self, req: &Request, inode: Inode) -> BkfsResult<PathBuf> {
         debug!("readlink() called on {:?}", inode);
-        let inode = self.ctrl().load::<InodeAttributes>(inode)?;
+        let inode = self.load_inode(inode)?;
         inode.attrs.check_access(
             &self.ctrl().config().idmapped_root,
             req.uid(),
@@ -264,7 +573,7 @@ impl Handler {
             return BkfsResult::errno(libc::ENOSYS);
         }
 
-        let mut parent = self.ctrl().load::<InodeAttributes>(parent)?;
+        let mut parent = self.load_inode(parent)?;
 
         parent.attrs.check_access(
             &self.ctrl().config().idmapped_root,
@@ -318,9 +627,9 @@ impl Handler {
             },
         );
 
-        self.ctrl().save(&new)?;
+        self.save_inode(&new)?;
 
-        self.ctrl().save(&parent)?;
+        self.save_inode(&parent)?;
 
         Ok(new)
     }
@@ -348,8 +657,21 @@ impl Handler {
 
         debug!("deleting inode {:?}", inode);
         self.inodes.remove(&inode.inode);
+        // Drop any pending metadata save for this inode — otherwise
+        // flush_all_dirty on the next unmount would re-create the disk
+        // file we're about to remove.
+        self.dirty.remove(&inode.inode);
+        self.read_cache.borrow_mut().remove(inode.inode);
 
-        std::fs::remove_file(self.ctrl().resolve_inode_path(inode.inode))?;
+        // An inode created and deleted within the same mount session
+        // may have lived only in the dirty cache and never been flushed
+        // to disk. NotFound here means the dirty-cache removal above
+        // was the whole story.
+        match std::fs::remove_file(self.ctrl().resolve_inode_path(inode.inode)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         if let FileData::File(contents) = inode.attrs.contents {
             let path = self.ctrl().resolve_contents_path(contents);
             if path.exists() {
@@ -361,7 +683,7 @@ impl Handler {
     }
 
     pub fn unlink(&mut self, req: &Request, parent: Inode, name: &OsStr) -> BkfsResult<()> {
-        let mut parent = self.ctrl().load::<InodeAttributes>(parent)?;
+        let mut parent = self.load_inode(parent)?;
         parent.attrs.check_access(
             &self.ctrl().config().idmapped_root,
             req.uid(),
@@ -377,7 +699,7 @@ impl Handler {
             .remove(name)
             .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
 
-        self.mutate_inode(entry.inode, |handler, inode| {
+        let result = self.mutate_inode(entry.inode, |handler, inode| {
             if let FileData::Directory(dir) = &inode.attrs.contents {
                 if inode.attrs.parents.len() <= 1 && !dir.is_empty() {
                     return BkfsResult::errno(libc::ENOTEMPTY);
@@ -388,13 +710,33 @@ impl Handler {
 
             inode.attrs.parents.remove(&(parent.inode, name.to_owned()));
 
-            handler.ctrl().save(&parent)?;
+            handler.save_inode(&parent)?;
             if !handler.gc_inode(&*inode)? {
-                handler.ctrl().save(&*inode)?;
+                handler.save_inode(&*inode)?;
             }
 
             Ok(())
-        })
+        });
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(e) if is_missing_inode(&e) => {
+                // Parent referenced a child whose inode file isn't on
+                // disk — a stale entry left by an unclean shutdown or
+                // an earlier bug. The parent's entry removal above was
+                // applied to our local copy only (the closure errored
+                // before its save_inode ran). Save the parent now so
+                // the dir listing reflects reality and the user can
+                // actually get rid of this phantom.
+                warn!(
+                    "unlink: healing stale parent {:?}/{:?} → missing inode {:?}",
+                    parent.inode, name, entry.inode
+                );
+                self.save_inode(&parent)?;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub fn link(
@@ -420,7 +762,7 @@ impl Handler {
                 })?;
             }
 
-            let mut new_parent = handler.ctrl().load::<InodeAttributes>(new_parent)?;
+            let mut new_parent = handler.load_inode(new_parent)?;
 
             new_parent.attrs.check_access(
                 &handler.ctrl().config().idmapped_root,
@@ -457,7 +799,7 @@ impl Handler {
                             .remove(&(new_parent.inode, new_name.to_owned()));
 
                         if !overwrite.gc || !handler.gc_inode(prev_inode)? {
-                            handler.ctrl().save(&*prev_inode)?;
+                            handler.save_inode(&*prev_inode)?;
                         }
                         Ok(())
                     })?;
@@ -473,8 +815,8 @@ impl Handler {
                 .parents
                 .insert((new_parent.inode, new_name.to_owned()));
 
-            handler.ctrl().save(&*inode)?;
-            handler.ctrl().save(&new_parent)?;
+            handler.save_inode(&*inode)?;
+            handler.save_inode(&new_parent)?;
 
             Ok(inode.clone())
         })
@@ -489,7 +831,7 @@ impl Handler {
         new_name: &OsStr,
         exchange: bool,
     ) -> BkfsResult<()> {
-        let parent = self.ctrl().load::<InodeAttributes>(parent)?;
+        let parent = self.load_inode(parent)?;
 
         parent.attrs.check_access(
             &self.ctrl().config().idmapped_root,
@@ -501,7 +843,7 @@ impl Handler {
         let inode = parent.lookup(name)?;
 
         if exchange {
-            let new_parent = self.ctrl().load::<InodeAttributes>(new_parent)?;
+            let new_parent = self.load_inode(new_parent)?;
 
             new_parent.attrs.check_access(
                 &self.ctrl().config().idmapped_root,
@@ -596,7 +938,7 @@ impl Handler {
             return BkfsResult::errno(libc::EACCES);
         }
 
-        let mut contents = fh.contents.borrow_mut();
+        let mut contents = fh.contents.lock().unwrap();
 
         let size = min(size, (contents.inode.attrs.size - offset) as usize);
 
@@ -626,7 +968,7 @@ impl Handler {
             return BkfsResult::errno(libc::EACCES);
         }
 
-        let mut contents = fh.contents.borrow_mut();
+        let mut contents = fh.contents.lock().unwrap();
 
         let mut buf = data.to_vec();
 
@@ -649,12 +991,12 @@ impl Handler {
             .handle(fh)
             .ok_or(libc::EBADF)
             .map_err(io::Error::from_raw_os_error)?;
-        fh.contents.borrow_mut().fsync()?;
+        fh.contents.lock().unwrap().fsync()?;
         Ok(())
     }
 
     pub fn opendir(&mut self, req: &Request, inode: Inode, flags: i32) -> BkfsResult<FileHandleId> {
-        let inode = self.ctrl().load::<InodeAttributes>(inode)?;
+        let inode = self.load_inode(inode)?;
         let (access_mask, _read, _) = match flags & libc::O_ACCMODE {
             libc::O_RDONLY => {
                 // Behavior is undefined, but most filesystems return EACCES
@@ -696,7 +1038,7 @@ impl Handler {
         mut offset: i64,
         mut handle_entry: impl FnMut(&mut Self, &OsStr, &DirectoryEntry, i64) -> BkfsResult<bool>,
     ) -> BkfsResult<bool> {
-        let inode = self.ctrl().load::<InodeAttributes>(inode)?;
+        let inode = self.load_inode(inode)?;
         let Some(handle) = self.open_dirs.get_mut(&fh) else {
             return BkfsResult::errno(libc::EACCES); // opened without read perm
         };
@@ -773,7 +1115,7 @@ impl Handler {
         let Some(ent) = self.open_dirs.remove(&fh) else {
             return BkfsResult::errno(libc::EBADF);
         };
-        self.gc_inode(&self.ctrl().load(ent.inode)?)?;
+        self.gc_inode(&self.load_inode(ent.inode)?)?;
 
         Ok(())
     }
@@ -795,7 +1137,7 @@ impl Handler {
             )?;
             attrs.xattrs.insert(key.to_vec(), value.to_vec());
             attrs.changed();
-            handler.ctrl().save(&*inode)?;
+            handler.save_inode(&*inode)?;
             Ok(())
         })
     }
@@ -821,7 +1163,7 @@ impl Handler {
         inode: Inode,
     ) -> BkfsResult<impl Iterator<Item = (Vec<u8>, Vec<u8>)> + 'r> {
         // TODO: peek_inode and serialize to bytes here
-        let inode = self.ctrl().load::<InodeAttributes>(inode)?;
+        let inode = self.load_inode(inode)?;
         let mut attrs = inode.attrs;
         let xattrs = std::mem::replace(&mut attrs.xattrs, Default::default());
         let idmap = self.ctrl().config().idmapped_root.clone();
@@ -841,7 +1183,7 @@ impl Handler {
             )?;
             let value = attrs.xattrs.remove(key);
             attrs.changed();
-            handler.ctrl().save(&*inode)?;
+            handler.save_inode(&*inode)?;
             Ok(value)
         })?;
         match value {
@@ -911,7 +1253,7 @@ impl Handler {
             return BkfsResult::errno(libc::EACCES);
         }
 
-        let mut contents = fh.contents.borrow_mut();
+        let mut contents = fh.contents.lock().unwrap();
         contents.fallocate(offset, length, mode, mode & libc::FALLOC_FL_KEEP_SIZE != 0)?;
         Ok(())
     }

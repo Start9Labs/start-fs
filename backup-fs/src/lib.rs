@@ -44,6 +44,7 @@ mod directory;
 pub mod error;
 mod handle;
 mod inode;
+mod pool;
 mod serde;
 #[cfg(test)]
 mod tests;
@@ -63,7 +64,8 @@ pub(crate) fn open_direct(path: &Path, create: bool) -> io::Result<aligned_io::B
     if create {
         opts.write(true).create(true).truncate(true);
     }
-    Ok(aligned_io::BufferedDirectFile::new(opts.open(path)?))
+    aligned_io::BufferedDirectFile::new(opts.open(path)?)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 }
 
 #[cfg_attr(feature = "cli", derive(clap::Parser))]
@@ -109,7 +111,7 @@ impl FromStr for IdMappedRoot {
 // Stores inode metadata data in "$data_dir/inodes" and file contents in "$data_dir/contents"
 // Directory data is stored in the file's contents, as a serialized DirectoryDescriptor
 pub struct BackupFS {
-    _lock: FdLock<File>,
+    lock: FdLock<File>,
     handler: Handler,
 }
 
@@ -132,7 +134,7 @@ impl CryptInfo {
     }
     pub fn load(path: &Path, password: &str) -> BkfsResult<Self> {
         load(EncryptedFile::open_pbkdf2(
-            aligned_io::BufferedDirectFile::new(File::open(path)?),
+            aligned_io::BufferedDirectFile::new(File::open(path)?)?,
             password,
         )?)
     }
@@ -140,7 +142,7 @@ impl CryptInfo {
         save(
             self,
             EncryptedFile::create_pbkdf2(
-                aligned_io::BufferedDirectFile::new(AtomicFile::create(path)?),
+                aligned_io::BufferedDirectFile::new(AtomicFile::create(path)?)?,
                 password,
             )?,
         )
@@ -174,7 +176,7 @@ impl BackupFS {
         ctrl.load_inode_pool()?;
 
         Ok(BackupFS {
-            _lock: lock,
+            lock,
             handler: Handler::new(ctrl),
         })
     }
@@ -200,6 +202,17 @@ impl Filesystem for BackupFS {
     fn destroy(&mut self) {
         if let Err(e) = self.handler.close_all() {
             error!("error closing FS: {e}");
+        }
+        // Every individual AtomicFile::save already calls sync_all
+        // before its rename, so data itself is durable. syncfs here is
+        // a belt-and-braces flush of the whole backing filesystem —
+        // ensures any last journal commits, CIFS writeback, etc. drain
+        // before we release the data_dir lock and exit.
+        use std::os::fd::AsRawFd;
+        let fd = self.lock.as_raw_fd();
+        // SAFETY: fd is a valid fd we own (held by the FdLock).
+        if unsafe { libc::syncfs(fd) } != 0 {
+            error!("syncfs on unmount failed: {}", io::Error::last_os_error());
         }
     }
 
@@ -394,13 +407,13 @@ impl Filesystem for BackupFS {
 
     fn read(
         &mut self,
-        req: &Request,
+        _req: &Request,
         inode: u64,
         fh: u64,
         offset: i64,
         size: u32,
-        flags: i32,
-        lock_owner: Option<u64>,
+        _flags: i32,
+        _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
         debug!(
@@ -411,49 +424,70 @@ impl Filesystem for BackupFS {
             reply.error(libc::EINVAL);
             return;
         }
-        match self.handler.read(
-            req,
-            Inode(inode),
-            FileHandleId(fh),
-            offset as u64,
-            size as usize,
-            flags,
-            lock_owner,
-        ) {
-            Ok(buf) => reply.data(&buf),
-            Err(e) => reply.error(e.to_errno_log()),
+        let Some(handle) = self.handler.handle(FileHandleId(fh)).cloned() else {
+            reply.error(libc::EBADF);
+            return;
+        };
+        if !handle.read {
+            reply.error(libc::EACCES);
+            return;
         }
+        // Offload the actual disk I/O — a stuck CIFS read must not
+        // block unrelated FUSE ops from other clients. Route by inode
+        // so reads and writes on the same file stay in order.
+        let key = handle.inode.0;
+        pool::global().submit_for(key, move || {
+            let mut contents = handle.contents.lock().unwrap();
+            let available = contents.inode.attrs.size.saturating_sub(offset as u64) as usize;
+            let size = (size as usize).min(available);
+            let mut buf = vec![0_u8; size];
+            match contents.read_exact_at(&mut buf, offset as u64) {
+                Ok(()) => reply.data(&buf),
+                Err(e) => reply.error(e.to_errno_log()),
+            }
+        });
     }
 
     fn write(
         &mut self,
-        req: &Request,
-        inode: u64,
+        _req: &Request,
+        _inode: u64,
         fh: u64,
         offset: i64,
         data: &[u8],
-        write_flags: u32,
+        _write_flags: u32,
         flags: i32,
-        lock_owner: Option<u64>,
+        _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
         if offset < 0 {
             reply.error(libc::EINVAL);
             return;
         }
-        match self.handler.write(
-            req,
-            Inode(inode),
-            FileHandleId(fh),
-            offset as u64,
-            data,
-            write_flags,
-            flags,
-            lock_owner,
-        ) {
-            Ok(n) => reply.written(n as u32),
-            Err(e) => reply.error(e.to_errno_log()),
+        let Some(handle) = self.handler.handle(FileHandleId(fh)).cloned() else {
+            reply.error(libc::EBADF);
+            return;
+        };
+        if !handle.write {
+            reply.error(libc::EACCES);
+            return;
         }
+        // Copy the bytes now (the kernel's buffer is reused after
+        // return) and move ownership into the worker.
+        let mut buf = data.to_vec();
+        let key = handle.inode.0;
+        pool::global().submit_for(key, move || {
+            let mut contents = handle.contents.lock().unwrap();
+            match contents.write_all_at(&mut buf, offset as u64) {
+                Ok(()) => {
+                    if flags & fuser::consts::FUSE_WRITE_KILL_PRIV as i32 != 0 {
+                        contents.inode.attrs.clear_suid_sgid();
+                    }
+                    reply.written(buf.len() as u32);
+                }
+                Err(e) => reply.error(e.to_errno_log()),
+            }
+        });
     }
 
     fn flush(
@@ -483,14 +517,22 @@ impl Filesystem for BackupFS {
         }
     }
 
-    fn fsync(&mut self, req: &Request, inode: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
-        match self
-            .handler
-            .fsync(req, Inode(inode), FileHandleId(fh))
-        {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(e.to_errno_log()),
-        }
+    fn fsync(&mut self, _req: &Request, _inode: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
+        let Some(handle) = self.handler.handle(FileHandleId(fh)).cloned() else {
+            reply.error(libc::EBADF);
+            return;
+        };
+        // fsync drives the content-file atomic save + inode save —
+        // both hit the backing store and can stall on CIFS / slow USB.
+        // Route by inode so fsync observes prior write jobs for the
+        // same file (shard FIFO order).
+        let key = handle.inode.0;
+        pool::global().submit_for(key, move || {
+            match handle.contents.lock().unwrap().fsync() {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e.to_errno_log()),
+            }
+        });
     }
 
     fn opendir(&mut self, req: &Request, inode: u64, flags: i32, reply: ReplyOpen) {
@@ -686,18 +728,17 @@ impl Filesystem for BackupFS {
     }
 
     fn access(&mut self, req: &Request, inode: u64, mask: i32, reply: ReplyEmpty) {
-        match self
-            .handler
-            .ctrl()
-            .load::<InodeAttributes>(Inode(inode))
-            .and_then(|inode| {
-                inode.attrs.check_access(
-                    &self.handler.ctrl().config().idmapped_root,
-                    req.uid(),
-                    req.gid(),
-                    mask,
-                )
-            }) {
+        // peek_inode consults open Contents and the dirty cache before
+        // disk; ctrl.load alone returns ENOENT for inodes that have only
+        // ever lived in the dirty cache (e.g. a just-mkdir'd directory),
+        // which the kernel would then propagate to path-walk callers like
+        // chdir — breaking rsync --mkpath into a fresh mount.
+        let idmap = self.handler.ctrl().config().idmapped_root.clone();
+        match self.handler.peek_inode(Inode(inode), |inode| {
+            inode
+                .attrs
+                .check_access(&idmap, req.uid(), req.gid(), mask)
+        }) {
             Ok(_) => reply.ok(),
             Err(e) => reply.error(e.to_errno()),
         }

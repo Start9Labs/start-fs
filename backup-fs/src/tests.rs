@@ -1193,6 +1193,89 @@ fn rename_over_existing_many_rounds() {
     );
 }
 
+/// Recovery path: a rename over an entry whose target inode file is
+/// already gone from disk (legacy damage from the pre-fix crash
+/// window) must succeed — otherwise the bad name is unrecoverable and
+/// no future backup can write to it.
+#[test_log::test]
+fn rename_over_stale_parent_reference_recovers() {
+    let data = TempDir::new("backupfs_data").unwrap();
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::write(mnt.join("os-backup.json"), b"old").unwrap();
+        },
+        None,
+    );
+
+    // Capture the inode number for os-backup.json.
+    let stale_inode = {
+        let (tx, rx) = oneshot::channel::<u64>();
+        let data_path = data.path().to_owned();
+        std::thread::spawn(move || {
+            with_backupfs(
+                &data_path,
+                "ohea".to_owned(),
+                |mnt| {
+                    let meta = fs::metadata(mnt.join("os-backup.json")).unwrap();
+                    let _ = tx.send(meta.ino());
+                },
+                None,
+            );
+        })
+        .join()
+        .unwrap();
+        rx.recv().unwrap()
+    };
+
+    // Simulate the post-crash state: the parent's dir entry still
+    // references os-backup.json → stale_inode, but stale_inode's
+    // backing file is gone (as if gc_inode ran but parent's new
+    // state was lost to lazy unmount).
+    let ctrl = crate::ctrl::Controller::new(BackupFSOptions {
+        data_dir: data.path().to_owned(),
+        setuid_support: false,
+        password: "ohea".to_owned(),
+        file_size_padding: None,
+        readonly: false,
+        idmapped_root: vec![],
+    })
+    .unwrap();
+    let path = ctrl.resolve_inode_path(crate::inode::Inode(stale_inode));
+    assert!(path.exists(), "expected stale inode file at {path:?}");
+    fs::remove_file(&path).unwrap();
+    drop(ctrl);
+
+    // Now do the backup pattern: write .tmp, rename over the ghost.
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let tmp = mnt.join(".os-backup.json.tmp");
+            let dst = mnt.join("os-backup.json");
+            fs::write(&tmp, b"new contents").unwrap();
+            fs::rename(&tmp, &dst).expect("rename over stale entry must succeed");
+            assert_eq!(fs::read(&dst).unwrap(), b"new contents");
+        },
+        None,
+    );
+
+    // And it should persist across a remount.
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            assert_eq!(
+                fs::read(mnt.join("os-backup.json")).unwrap(),
+                b"new contents"
+            );
+        },
+        None,
+    );
+}
+
 /// `sync -f <mountpoint>` (i.e. syncfs(2)) must reach backup-fs's
 /// dirty cache — otherwise a caller that wants a durability checkpoint
 /// short of unmount has no way to get one.

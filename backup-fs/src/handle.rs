@@ -823,29 +823,45 @@ impl Handler {
                 (Occupied(_), None) => return BkfsResult::errno(libc::EEXIST),
                 (Occupied(mut prev_entry), Some(overwrite)) => {
                     let prev_ino = prev_entry.get().inode;
-                    let should_gc =
-                        handler.mutate_inode(prev_ino, |handler, prev_inode| {
-                            if let FileData::Directory(dir) = &prev_inode.attrs.contents {
-                                if prev_inode.attrs.parents.len() <= 1 && !dir.is_empty() {
-                                    return BkfsResult::errno(libc::ENOTEMPTY);
-                                }
+                    let result = handler.mutate_inode(prev_ino, |handler, prev_inode| {
+                        if let FileData::Directory(dir) = &prev_inode.attrs.contents {
+                            if prev_inode.attrs.parents.len() <= 1 && !dir.is_empty() {
+                                return BkfsResult::errno(libc::ENOTEMPTY);
                             }
+                        }
 
-                            sticky_res?;
+                        sticky_res?;
 
-                            prev_inode
-                                .attrs
-                                .parents
-                                .remove(&(new_parent.inode, new_name.to_owned()));
+                        prev_inode
+                            .attrs
+                            .parents
+                            .remove(&(new_parent.inode, new_name.to_owned()));
 
-                            // Always save the prev inode's updated
-                            // state (may have other parents via hard
-                            // links). The actual gc — if parents went
-                            // to empty — is deferred to after the new
-                            // pointers below are durable.
-                            handler.save_inode(&*prev_inode)?;
-                            Ok(overwrite.gc && prev_inode.attrs.parents.is_empty())
-                        })?;
+                        // Always save the prev inode's updated
+                        // state (may have other parents via hard
+                        // links). The actual gc — if parents went
+                        // to empty — is deferred to after the new
+                        // pointers below are durable.
+                        handler.save_inode(&*prev_inode)?;
+                        Ok(overwrite.gc && prev_inode.attrs.parents.is_empty())
+                    });
+                    let should_gc = match result {
+                        Ok(v) => v,
+                        Err(e) if is_missing_inode(&e) => {
+                            // Stale dir entry left by a previous
+                            // crash-window bug: parent.dir references
+                            // an inode whose file is no longer on disk.
+                            // Without this branch, every rename over
+                            // the ghost name fails with NotFound and
+                            // the name can never be reclaimed.
+                            warn!(
+                                "link: overwriting stale parent {:?}/{:?} → missing inode {:?}",
+                                new_parent.inode, new_name, prev_ino
+                            );
+                            false
+                        }
+                        Err(e) => return Err(e),
+                    };
                     if should_gc {
                         prev_to_gc = Some(prev_ino);
                     }

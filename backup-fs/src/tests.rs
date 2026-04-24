@@ -1276,29 +1276,37 @@ fn rename_over_stale_parent_reference_recovers() {
     );
 }
 
-/// `sync -f <mountpoint>` (i.e. syncfs(2)) must reach backup-fs's
-/// dirty cache — otherwise a caller that wants a durability checkpoint
-/// short of unmount has no way to get one.
+/// `fsync(dirfd)` on the mount is the only durability checkpoint that
+/// actually reaches a non-bdev FUSE daemon. Verify both that it hits
+/// our handler and that it drains the dirty cache — so callers can
+/// force a flush before `umount -l` (which would otherwise tear down
+/// the backing FS before the backup-fs daemon's destroy gets to run).
 #[test_log::test]
-fn sync_f_on_mount_flushes_dirty_cache() {
+fn fsync_on_dirfd_reaches_handler_and_flushes() {
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::Ordering;
     let data = TempDir::new("backupfs_data").unwrap();
+    let before = crate::FSYNCDIR_CALL_COUNT.load(Ordering::Relaxed);
     with_backupfs(
         data.path(),
         "ohea".to_owned(),
         |mnt| {
             fs::write(mnt.join("a"), b"hello").unwrap();
-            // sync -f hits FUSE_SYNCFS which our handler routes to
-            // flush_all_dirty. Success = exit code 0.
-            let status = std::process::Command::new("sync")
-                .arg("-f")
-                .arg(mnt)
-                .status()
-                .expect("run sync -f");
-            assert!(status.success(), "sync -f exited with {status}");
+            let dir = std::fs::File::open(mnt).unwrap();
+            // Call fsync via libc since std's File::sync_all on a
+            // directory may error on some platforms.
+            let ret = unsafe { libc::fsync(dir.as_raw_fd()) };
+            assert_eq!(ret, 0, "fsync(dirfd) failed: {:?}", io::Error::last_os_error());
         },
         None,
     );
+    let after = crate::FSYNCDIR_CALL_COUNT.load(Ordering::Relaxed);
+    assert!(
+        after > before,
+        "FUSE_FSYNCDIR never reached the handler"
+    );
 }
+
 
 /// Mirrors start-os's AtomicFile pattern exactly: create tmp, write,
 /// fsync, drop fd, rename, then immediately unmount. The user reports

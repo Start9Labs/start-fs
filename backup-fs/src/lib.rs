@@ -55,6 +55,14 @@ pub const MAX_NAME_LENGTH: u32 = 255;
 // const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024 * 1024;
 pub const ENTRY_TTL: Duration = Duration::new(3600, 0);
 
+#[cfg(test)]
+pub(crate) static SYNCFS_CALL_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) static FSYNCDIR_CALL_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 const FMODE_EXEC: i32 = 0x20;
 
 pub(crate) fn open_direct(path: &Path, create: bool) -> io::Result<aligned_io::BufferedDirectFile<File>> {
@@ -637,7 +645,21 @@ impl Filesystem for BackupFS {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        reply.ok(); // directories are synced on write
+        // Callers like start-os need a way to force a whole-fs
+        // durability checkpoint before `umount -l`. FUSE_SYNCFS would
+        // be the natural hook, but the Linux kernel's `fc->sync_fs`
+        // defaults to 0 for non-bdev FUSE mounts and is never enabled
+        // via any INIT flag — so `syncfs(2)` / `sync -f` silently does
+        // a VFS-level sync and never dispatches to us. FUSE_FSYNCDIR,
+        // however, reaches the daemon reliably (`fsync(dirfd)` /
+        // `fsync .`). Route it to the same whole-fs flush so callers
+        // have a working checkpoint.
+        #[cfg(test)]
+        FSYNCDIR_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match self.handler.flush_all_dirty() {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e.to_errno_log()),
+        }
     }
 
     fn syncfs(&mut self, _req: &Request<'_>, reply: ReplyEmpty) {
@@ -646,6 +668,8 @@ impl Filesystem for BackupFS {
         // per-file sync_all, so the checkpoint is on stable storage
         // before we return — the caller can lazy-unmount afterwards
         // without losing anything that was written before sync -f.
+        #[cfg(test)]
+        SYNCFS_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match self.handler.flush_all_dirty() {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e.to_errno_log()),

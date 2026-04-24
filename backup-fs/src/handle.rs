@@ -245,22 +245,51 @@ impl Handler {
         Ok(())
     }
 
-    /// Persist all dirty entries. Called on destroy.
+    /// Persist all pending state to disk durably. Called on destroy
+    /// and on FUSE_SYNCFS (`sync -f <mountpoint>`).
+    ///
+    /// Uses per-file `ctrl.save` (sync_all) instead of `save_fast`
+    /// so durability does not depend on the trailing `syncfs` being
+    /// effective — which it isn't under start-os's `umount -l` on a
+    /// backing FS whose teardown has already begun.
     pub fn flush_all_dirty(&mut self) -> BkfsResult<()> {
-        let pending = std::mem::take(&mut self.dirty);
         let mut errs = Vec::new();
-        for (_, attrs) in pending {
-            if let Err(e) = self.ctrl.save_fast(&attrs) {
+
+        // Flush open Contents first — their in-memory state is
+        // authoritative for the inode, and its post-rename parents
+        // may differ from whatever save_fast last wrote to disk.
+        // Taking a snapshot of the inode set avoids holding a borrow
+        // across the save, since each save may mutate caches.
+        let open: Vec<_> = self
+            .inodes
+            .iter()
+            .filter_map(|(ino, weak)| weak.upgrade().map(|arc| (*ino, arc)))
+            .collect();
+        for (_, contents) in open {
+            let mut contents = contents.lock().unwrap();
+            if let Err(e) = contents.flush() {
+                errs.push(e);
+            }
+            // Now also durably re-save the inode attrs — contents.flush
+            // uses save_fast, same reason as above.
+            if let Err(e) = self.ctrl.save(&contents.inode) {
                 errs.push(e);
             }
         }
-        // The read cache may have stale copies of anything we just
-        // persisted — safest to clear the whole thing on the unmount
-        // path.
+
+        let pending = std::mem::take(&mut self.dirty);
+        for (_, attrs) in pending {
+            if let Err(e) = self.ctrl.save(&attrs) {
+                errs.push(e);
+            }
+        }
+        // Dirty-cache entries that shared an inode number with an open
+        // file were cleared into `dirty` before this call or handled
+        // via the open path above.
         self.read_cache.borrow_mut().clear();
-        // Belt-and-braces durability on the final flush — unmount path
-        // has to leave every dirty inode on stable storage, not just
-        // in the page cache.
+        // Best-effort trailing syncfs — durability is already on the
+        // platter from the per-file sync_all, so a failure here is
+        // only an early warning of backing-FS issues.
         if let Err(e) = self.ctrl.syncfs() {
             errs.push(e.into());
         }

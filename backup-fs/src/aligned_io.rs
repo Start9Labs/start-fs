@@ -341,31 +341,77 @@ impl<F: FileExt + AsRawFd> BufferedDirectFile<F> {
         let start = state.dirty_start & !ALIGN_MASK;
         let end = ((state.dirty_end + ALIGN_MASK) & !ALIGN_MASK).min(state.buf.len());
 
-        // Fill partial-block gaps from disk. Only read the non-dirty portion
-        // of each partial block to avoid clobbering the user's writes.
+        // Fill partial-block edges from disk so the upcoming aligned write
+        // doesn't clobber on-disk bytes outside the dirty range.
         //
-        // Head gap: bytes [start..dirty_start) — the prefix of the first block
-        // that rounds down past the dirty range.
-        if start < state.dirty_start && state.loaded < state.dirty_start {
-            let gap_start = state.loaded.max(start);
-            let head = &mut state.buf.as_mut_slice()[gap_start..state.dirty_start];
-            let n = pread_full(file, head, state.base + gap_start as u64)?;
-            if n < head.len() {
-                head[n..].fill(0);
-            }
-            state.loaded = state.loaded.max(gap_start + n);
-        }
+        // O_DIRECT requires the buffer address, file offset, AND length to
+        // each be a multiple of the device's logical block size. Reading a
+        // sub-block range (e.g. [dirty_end..end)) directly into the window
+        // buffer violates all three on strict backends like ext4/vfat/exfat
+        // and fails with EINVAL — silently breaking the flush. We side-step
+        // that by reading the entire edge BLOCK into an aligned scratch and
+        // copying only the non-dirty bytes back into the window buffer; the
+        // pread is fully aligned and the dirty bytes already in the window
+        // are preserved.
+        //
+        // `state.loaded` tracks the prefix that's already current with disk,
+        // so a previously-loaded edge can skip the pread.
+        let head_needs_read =
+            start < state.dirty_start && state.loaded < state.dirty_start;
+        let tail_needs_read = end > state.dirty_end && state.loaded < end;
+        if head_needs_read || tail_needs_read {
+            let head_block_start = start;
+            let tail_block_start = end - BLOCK_SIZE;
+            let mut scratch = AlignedBuf::new(BLOCK_SIZE);
+            // Tracks which block, if any, is currently cached in scratch.
+            // Re-used across head+tail when both edges land in the same
+            // block (dirty range fits in a single block).
+            let mut scratch_block: Option<usize> = None;
 
-        // Tail gap: bytes [dirty_end..end) — the suffix of the last block
-        // that rounds up past the dirty range.
-        if end > state.dirty_end && state.loaded < end {
-            let gap_start = state.loaded.max(state.dirty_end);
-            let tail = &mut state.buf.as_mut_slice()[gap_start..end];
-            let n = pread_full(file, tail, state.base + gap_start as u64)?;
-            if n < tail.len() {
-                tail[n..].fill(0);
+            if head_needs_read {
+                let n = pread_full(
+                    file,
+                    scratch.as_mut_slice(),
+                    state.base + head_block_start as u64,
+                )?;
+                if n < BLOCK_SIZE {
+                    scratch.as_mut_slice()[n..].fill(0);
+                }
+                scratch_block = Some(head_block_start);
+                let copy_start = state.loaded.max(start);
+                let copy_end = state.dirty_start;
+                if copy_start < copy_end {
+                    let off = copy_start - head_block_start;
+                    let len = copy_end - copy_start;
+                    state.buf.as_mut_slice()[copy_start..copy_end]
+                        .copy_from_slice(&scratch.as_slice()[off..off + len]);
+                }
+                state.loaded = state.loaded.max(head_block_start + BLOCK_SIZE);
             }
-            state.loaded = state.loaded.max(gap_start + n);
+
+            if tail_needs_read {
+                if scratch_block != Some(tail_block_start) {
+                    let n = pread_full(
+                        file,
+                        scratch.as_mut_slice(),
+                        state.base + tail_block_start as u64,
+                    )?;
+                    if n < BLOCK_SIZE {
+                        scratch.as_mut_slice()[n..].fill(0);
+                    }
+                    scratch_block = Some(tail_block_start);
+                }
+                debug_assert_eq!(scratch_block, Some(tail_block_start));
+                let copy_start = state.dirty_end.max(tail_block_start);
+                let copy_end = end;
+                if copy_start < copy_end {
+                    let off = copy_start - tail_block_start;
+                    let len = copy_end - copy_start;
+                    state.buf.as_mut_slice()[copy_start..copy_end]
+                        .copy_from_slice(&scratch.as_slice()[off..off + len]);
+                }
+                state.loaded = state.loaded.max(end);
+            }
         }
 
         let buf = &state.buf.as_slice()[start..end];
@@ -443,7 +489,13 @@ impl<F: FileExt + AsRawFd> Drop for BufferedDirectFile<F> {
     fn drop(&mut self) {
         if let Some(file) = &self.file {
             let state = self.state.get_mut();
-            let _ = Self::flush_dirty(state, file);
+            // Surface the error so the cause isn't lost. The real
+            // save paths flush explicitly via save/save_fast and
+            // propagate errors; this is the last-ditch backstop for
+            // an unwind path where there's no caller to return to.
+            if let Err(e) = Self::flush_dirty(state, file) {
+                log::error!("BufferedDirectFile::drop: flush_dirty failed: {e}");
+            }
         }
     }
 }

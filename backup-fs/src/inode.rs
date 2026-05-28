@@ -10,6 +10,7 @@ use log::debug;
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_file::AtomicFile;
+use crate::chunk::FileContents;
 use crate::contents::EncryptedFile;
 use crate::ctrl::{Controller, Exists, Load, Save};
 use crate::directory::DirectoryContents;
@@ -23,20 +24,18 @@ pub const BLOCK_SIZE: u64 = 4096;
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 pub struct Inode(pub u64);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
-pub struct ContentId(pub u64);
-
-impl From<Inode> for ContentId {
-    fn from(value: Inode) -> Self {
-        Self(value.0)
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum FileData {
-    File(ContentId),
+    /// Regular file data is an immutable-chunk manifest. Each referenced
+    /// chunk is a small encrypted+ECC object under `contents/`, giving
+    /// rsync/rclone a stable incremental unit without requiring random writes
+    /// into a large encrypted blob.
+    File(FileContents),
     Directory(DirectoryContents),
     Symlink(PathBuf),
+    /// FIFO, socket, block device, or character device. The exact kind is
+    /// stored here; device major/minor are in Attributes::rdev.
+    Special(fuser::FileType),
 }
 impl FileData {
     fn nlink(&self) -> usize {
@@ -60,6 +59,7 @@ impl From<&FileData> for fuser::FileType {
             FileData::File(_) => fuser::FileType::RegularFile,
             FileData::Directory(_) => fuser::FileType::Directory,
             FileData::Symlink(_) => fuser::FileType::Symlink,
+            FileData::Special(ty) => *ty,
         }
     }
 }
@@ -85,6 +85,12 @@ pub struct Attributes {
     pub parents: OrdSet<(Inode, OsString)>,
     pub uid: u32,
     pub gid: u32,
+    /// st_rdev for character/block devices. Zero for other inode kinds.
+    pub rdev: u32,
+    /// Linux statx/st_flags-style bits exposed through fuser::FileAttr.
+    pub flags: u32,
+    /// Extended attributes, including POSIX ACLs (`system.posix_acl_*`) and
+    /// Linux security labels. Values are preserved byte-for-byte.
     pub xattrs: OrdMap<Vec<u8>, Vec<u8>>,
 }
 
@@ -110,6 +116,8 @@ impl InodeAttributes {
                 parents: parent.into_iter().collect(),
                 uid: 0,
                 gid: 0,
+                rdev: 0,
+                flags: 0,
                 xattrs: Default::default(),
             },
         }
@@ -181,9 +189,9 @@ impl From<&InodeAttributes> for fuser::FileAttr {
             },
             uid: attrs.uid,
             gid: attrs.gid,
-            rdev: 0,
+            rdev: attrs.rdev,
             blksize: BLOCK_SIZE as u32,
-            flags: 0,
+            flags: attrs.flags,
         }
     }
 }
@@ -281,7 +289,7 @@ impl Attributes {
         crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
+        flags: Option<u32>,
     ) -> BkfsResult<bool> {
         let mut changed = false;
         let mut now_cell = None;
@@ -371,6 +379,9 @@ impl Attributes {
                 )?;
             }
             self.size = size;
+            if let FileData::File(contents) = &mut self.contents {
+                contents.truncate_to_size(size);
+            }
             changed = true;
         }
 
@@ -452,6 +463,16 @@ impl Attributes {
             changed = true;
         }
 
+        if let Some(flags) = flags {
+            if self.uid != req.uid()
+                && !self.is_root_for(&handler.ctrl().config().idmapped_root, req.uid(), [])
+            {
+                return BkfsResult::errno(libc::EPERM);
+            }
+            self.flags = flags;
+            changed = true;
+        }
+
         if changed && ctime.is_none() {
             self.ctime = lazy_now();
         }
@@ -498,7 +519,9 @@ impl Attributes {
             };
         }
 
-        if uid == self.uid {
+        if let Some(acl_perms) = self.acl_access_perms(uid, gid) {
+            access_mask -= access_mask & i32::from(acl_perms);
+        } else if uid == self.uid {
             access_mask -= access_mask & (file_mode >> 6);
         } else if gid == self.gid {
             access_mask -= access_mask & (file_mode >> 3);
@@ -511,6 +534,62 @@ impl Attributes {
         } else {
             BkfsResult::errno(libc::EACCES)
         }
+    }
+
+    fn acl_access_perms(&self, uid: u32, gid: u32) -> Option<u16> {
+        const ACL_VERSION: u32 = 0x0002;
+        const ACL_USER_OBJ: u16 = 0x01;
+        const ACL_USER: u16 = 0x02;
+        const ACL_GROUP_OBJ: u16 = 0x04;
+        const ACL_GROUP: u16 = 0x08;
+        const ACL_MASK: u16 = 0x10;
+        const ACL_OTHER: u16 = 0x20;
+
+        let bytes = self.xattrs.get(b"system.posix_acl_access".as_slice())?;
+        if bytes.len() < 4 || (bytes.len() - 4) % 8 != 0 {
+            return None;
+        }
+        if u32::from_le_bytes(bytes[0..4].try_into().ok()?) != ACL_VERSION {
+            return None;
+        }
+
+        let mut user_obj = None;
+        let mut named_user = None;
+        let mut group_obj = None;
+        let mut named_group = Vec::new();
+        let mut mask = None;
+        let mut other = None;
+
+        for entry in bytes[4..].chunks_exact(8) {
+            let tag = u16::from_le_bytes(entry[0..2].try_into().ok()?);
+            let perm = u16::from_le_bytes(entry[2..4].try_into().ok()?) & 0o7;
+            let id = u32::from_le_bytes(entry[4..8].try_into().ok()?);
+            match tag {
+                ACL_USER_OBJ => user_obj = Some(perm),
+                ACL_USER if id == uid => named_user = Some(perm),
+                ACL_GROUP_OBJ => group_obj = Some(perm),
+                ACL_GROUP if id == gid => named_group.push(perm),
+                ACL_MASK => mask = Some(perm),
+                ACL_OTHER => other = Some(perm),
+                _ => {}
+            }
+        }
+
+        if uid == self.uid {
+            return user_obj;
+        }
+        let mask = mask.unwrap_or(0o7);
+        if let Some(perm) = named_user {
+            return Some(perm & mask);
+        }
+        let mut best_group = None;
+        if gid == self.gid {
+            best_group = group_obj.map(|p| p & mask);
+        }
+        for perm in named_group {
+            best_group = Some(best_group.unwrap_or(0) | (perm & mask));
+        }
+        best_group.or(other)
     }
 
     pub fn check_sticky(&self, child: &Self, uid: u32) -> BkfsResult<()> {
@@ -558,17 +637,17 @@ impl Attributes {
             }
             XattrNamespace::System => {
                 if value.is_some() {
-                    if key.eq(b"system.posix_acl_access")
-                        && self.uid != request.uid()
-                        && !self.is_root_for(idmap, request.uid(), [])
-                    {
-                        return BkfsResult::errno(libc::EPERM);
-                    } else if key.eq(b"system.posix_acl_access")
-                        && request.uid() != 0
-                        && !self.is_root_for(idmap, request.uid(), [])
-                    {
-                        return BkfsResult::errno(libc::EPERM);
-                    } else if request.uid() != 0 {
+                    let is_acl_access = key.eq(b"system.posix_acl_access");
+                    let is_acl_default = key.eq(b"system.posix_acl_default");
+                    if is_acl_access || is_acl_default {
+                        if is_acl_default && !self.contents.is_dir() {
+                            return BkfsResult::errno(libc::EACCES);
+                        }
+                        if self.uid != request.uid() && !self.is_root_for(idmap, request.uid(), [])
+                        {
+                            return BkfsResult::errno(libc::EPERM);
+                        }
+                    } else if request.uid() != 0 && !self.is_root_for(idmap, request.uid(), []) {
                         return BkfsResult::errno(libc::EPERM);
                     }
                 }

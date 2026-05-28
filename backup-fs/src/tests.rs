@@ -1,9 +1,11 @@
 use crate::error::BkfsErrorKind;
 use crate::{BackupFS, BackupFSOptions};
 use fuser::MountOption;
+use std::ffi::CString;
 use std::future::Future;
 use std::io::{Seek, SeekFrom, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::PathBuf;
 use std::{fs, io, path::Path};
 use tempdir::TempDir;
@@ -25,11 +27,74 @@ fn pattern_fill(offset: u64, buf: &mut [u8]) {
     }
 }
 
+fn acl_xattr(user_obj: u16, group_obj: u16, mask: u16, other: u16) -> Vec<u8> {
+    const ACL_VERSION: u32 = 0x0002;
+    const ACL_USER_OBJ: u16 = 0x01;
+    const ACL_GROUP_OBJ: u16 = 0x04;
+    const ACL_MASK: u16 = 0x10;
+    const ACL_OTHER: u16 = 0x20;
+    let mut out = ACL_VERSION.to_le_bytes().to_vec();
+    for (tag, perm, id) in [
+        (ACL_USER_OBJ, user_obj, u32::MAX),
+        (ACL_GROUP_OBJ, group_obj, u32::MAX),
+        (ACL_MASK, mask, u32::MAX),
+        (ACL_OTHER, other, u32::MAX),
+    ] {
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&(perm & 0o7).to_le_bytes());
+        out.extend_from_slice(&id.to_le_bytes());
+    }
+    out
+}
+
+fn set_xattr(path: &Path, key: &str, value: &[u8]) {
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let key = CString::new(key).unwrap();
+    let ret = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            key.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    assert_eq!(ret, 0, "setxattr failed: {:?}", io::Error::last_os_error());
+}
+
+fn get_xattr(path: &Path, key: &str) -> Vec<u8> {
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let key = CString::new(key).unwrap();
+    let size = unsafe { libc::getxattr(path.as_ptr(), key.as_ptr(), std::ptr::null_mut(), 0) };
+    assert!(
+        size >= 0,
+        "getxattr size failed: {:?}",
+        io::Error::last_os_error()
+    );
+    let mut out = vec![0_u8; size as usize];
+    let got = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            key.as_ptr(),
+            out.as_mut_ptr().cast(),
+            out.len(),
+        )
+    };
+    assert_eq!(
+        got,
+        size,
+        "getxattr failed: {:?}",
+        io::Error::last_os_error()
+    );
+    out
+}
+
 fn pattern_check(offset: u64, buf: &[u8]) {
     for (i, &b) in buf.iter().enumerate() {
         let expected = pattern_byte(offset + i as u64);
         assert_eq!(
-            b, expected,
+            b,
+            expected,
             "byte mismatch at offset {}: got {:#04x}, want {:#04x}",
             offset + i as u64,
             b,
@@ -386,10 +451,8 @@ fn rmrf_leaves_no_orphans() {
     );
 
     // Snapshot inode-file count after creation.
-    let inode_files_after_create =
-        tree(data.path().join("inodes"), false).unwrap().len();
-    let content_files_after_create =
-        tree(data.path().join("contents"), false).unwrap().len();
+    let inode_files_after_create = tree(data.path().join("inodes"), false).unwrap().len();
+    let content_files_after_create = tree(data.path().join("contents"), false).unwrap().len();
 
     // Phase 2: rm -rf the whole subtree
     with_backupfs(
@@ -566,10 +629,8 @@ fn rmdir_heals_stale_parent_reference() {
     // it externally (this models an unclean shutdown where the
     // parent's dir entry was saved but the child's inode wasn't).
     let inode_dir = data.path().join("inodes");
-    let inodes_after: std::collections::HashSet<String> = tree(&inode_dir, false)
-        .unwrap()
-        .into_iter()
-        .collect();
+    let inodes_after: std::collections::HashSet<String> =
+        tree(&inode_dir, false).unwrap().into_iter().collect();
     // New inodes after the lookup session are exactly the candidates.
     let _new_inodes: Vec<_> = inodes_after.difference(&before).collect();
 
@@ -895,11 +956,11 @@ fn random_access_writes() {
             // Write in an order that forces multiple window evictions.
             // Ranges must partition [0, size) — every byte covered exactly once.
             let ranges: &[(u64, usize)] = &[
-                (1_500_000, 600_000),                     // crosses window 1→2
-                (0, 100_000),                             // early in window 0
-                (2_100_000, size as usize - 2_100_000),   // tail
-                (500_000, 1_000_000),                     // spans window 0→1
-                (100_000, 400_000),                       // fills gap in window 0
+                (1_500_000, 600_000),                   // crosses window 1→2
+                (0, 100_000),                           // early in window 0
+                (2_100_000, size as usize - 2_100_000), // tail
+                (500_000, 1_000_000),                   // spans window 0→1
+                (100_000, 400_000),                     // fills gap in window 0
             ];
             for &(offset, len) in ranges {
                 let mut buf = vec![0u8; len];
@@ -1010,11 +1071,7 @@ fn rename_over_existing_resolves() {
         |mnt| {
             fs::write(mnt.join("os-backup.json"), b"old").unwrap();
             fs::write(mnt.join(".os-backup.json.tmp"), b"new contents").unwrap();
-            fs::rename(
-                mnt.join(".os-backup.json.tmp"),
-                mnt.join("os-backup.json"),
-            )
-            .unwrap();
+            fs::rename(mnt.join(".os-backup.json.tmp"), mnt.join("os-backup.json")).unwrap();
 
             let live: Vec<String> = fs::read_dir(mnt)
                 .unwrap()
@@ -1125,9 +1182,8 @@ fn rename_over_existing_with_siblings_across_remounts() {
                     live.iter().any(|n| n == "os-backup.json"),
                     "round {round}: post-remount ls missing os-backup.json: {live:?}"
                 );
-                let got = fs::read(mnt.join("os-backup.json")).unwrap_or_else(|e| {
-                    panic!("round {round}: post-remount cat failed: {e}")
-                });
+                let got = fs::read(mnt.join("os-backup.json"))
+                    .unwrap_or_else(|e| panic!("round {round}: post-remount cat failed: {e}"));
                 assert_eq!(got, format!("round-{round}").as_bytes());
             },
             None,
@@ -1161,11 +1217,7 @@ fn rename_over_existing_many_rounds() {
                 fs::rename(&tmp, mnt.join("os-backup.json")).unwrap();
 
                 let got = fs::read(mnt.join("os-backup.json")).unwrap();
-                assert_eq!(
-                    got,
-                    payload.as_bytes(),
-                    "round {i}: read back wrong bytes"
-                );
+                assert_eq!(got, payload.as_bytes(), "round {i}: read back wrong bytes");
                 let live: Vec<String> = fs::read_dir(mnt)
                     .unwrap()
                     .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -1296,17 +1348,18 @@ fn fsync_on_dirfd_reaches_handler_and_flushes() {
             // Call fsync via libc since std's File::sync_all on a
             // directory may error on some platforms.
             let ret = unsafe { libc::fsync(dir.as_raw_fd()) };
-            assert_eq!(ret, 0, "fsync(dirfd) failed: {:?}", io::Error::last_os_error());
+            assert_eq!(
+                ret,
+                0,
+                "fsync(dirfd) failed: {:?}",
+                io::Error::last_os_error()
+            );
         },
         None,
     );
     let after = crate::FSYNCDIR_CALL_COUNT.load(Ordering::Relaxed);
-    assert!(
-        after > before,
-        "FUSE_FSYNCDIR never reached the handler"
-    );
+    assert!(after > before, "FUSE_FSYNCDIR never reached the handler");
 }
-
 
 /// Mirrors start-os's AtomicFile pattern exactly: create tmp, write,
 /// fsync, drop fd, rename, then immediately unmount. The user reports
@@ -1358,9 +1411,8 @@ fn rename_immediately_before_unmount() {
                 live.iter().any(|n| n == "os-backup.json"),
                 "post-remount listing missing os-backup.json: {live:?}"
             );
-            let got = fs::read(mnt.join("os-backup.json")).unwrap_or_else(|e| {
-                panic!("post-remount cat failed: {e} — listing was {live:?}")
-            });
+            let got = fs::read(mnt.join("os-backup.json"))
+                .unwrap_or_else(|e| panic!("post-remount cat failed: {e} — listing was {live:?}"));
             assert_eq!(got, b"new contents");
         },
         None,
@@ -1387,11 +1439,7 @@ fn rename_over_existing_across_remount() {
         data.path(),
         "ohea".to_owned(),
         |mnt| {
-            fs::rename(
-                mnt.join(".os-backup.json.tmp"),
-                mnt.join("os-backup.json"),
-            )
-            .unwrap();
+            fs::rename(mnt.join(".os-backup.json.tmp"), mnt.join("os-backup.json")).unwrap();
             assert_eq!(
                 fs::read(mnt.join("os-backup.json")).unwrap(),
                 b"new contents"
@@ -1422,5 +1470,157 @@ fn rename_over_existing_across_remount() {
             );
         },
         None,
+    );
+}
+
+#[test_log::test]
+fn chunked_large_file_uses_incremental_objects() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let size = 3 * 1024 * 1024 + 123;
+            let mut buf = vec![0_u8; size];
+            pattern_fill(0, &mut buf);
+            fs::write(mnt.join("large"), &buf).unwrap();
+            assert_eq!(fs::read(mnt.join("large")).unwrap(), buf);
+        },
+        None,
+    );
+
+    let chunks = tree(data.path().join("contents"), false).unwrap();
+    assert_eq!(
+        chunks.len(),
+        4,
+        "expected 4 immutable chunk objects: {chunks:?}"
+    );
+}
+
+#[test_log::test]
+fn truncate_then_extend_does_not_reveal_old_tail() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let path = mnt.join("sparse");
+            let mut f = fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            f.seek(SeekFrom::Start(1024 * 1024 + 100)).unwrap();
+            f.write_all(b"secret tail").unwrap();
+            f.set_len(1024 * 1024 + 10).unwrap();
+            f.set_len(1024 * 1024 + 200).unwrap();
+            drop(f);
+
+            let bytes = fs::read(&path).unwrap();
+            assert_eq!(bytes.len(), 1024 * 1024 + 200);
+            assert!(bytes[1024 * 1024 + 10..].iter().all(|&b| b == 0));
+        },
+        None,
+    );
+}
+
+#[test_log::test]
+fn posix_acl_xattr_round_trips_across_remount() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    let acl = acl_xattr(0o6, 0o0, 0o6, 0o0);
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let path = mnt.join("acl-file");
+            fs::write(&path, b"acl").unwrap();
+            set_xattr(&path, "system.posix_acl_access", &acl);
+            assert_eq!(get_xattr(&path, "system.posix_acl_access"), acl);
+        },
+        None,
+    );
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            assert_eq!(
+                get_xattr(&mnt.join("acl-file"), "system.posix_acl_access"),
+                acl
+            );
+        },
+        None,
+    );
+}
+
+#[test_log::test]
+fn fifo_inode_type_is_preserved() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let path = mnt.join("pipe");
+            let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            let ret = unsafe { libc::mkfifo(c_path.as_ptr(), 0o640) };
+            assert_eq!(ret, 0, "mkfifo failed: {:?}", io::Error::last_os_error());
+            assert!(fs::symlink_metadata(&path).unwrap().file_type().is_fifo());
+        },
+        None,
+    );
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            assert!(fs::symlink_metadata(mnt.join("pipe"))
+                .unwrap()
+                .file_type()
+                .is_fifo());
+        },
+        None,
+    );
+}
+
+#[test_log::test]
+#[ignore = "benchmark: run manually with --ignored --nocapture"]
+fn benchmark_chunk_codec() {
+    use crate::chunk::{read_chunk_file, write_chunk_file, ChunkId};
+    use chacha20::Key;
+    use std::time::Instant;
+
+    let dir = TempDir::new("backupfs_bench").unwrap();
+    let key = Key::clone_from_slice(&[3_u8; 32]);
+    let mut payload = vec![0_u8; 64 * 1024 * 1024];
+    pattern_fill(0, &mut payload);
+
+    let start = Instant::now();
+    for (i, chunk) in payload.chunks(1024 * 1024).enumerate() {
+        let mut id = [0_u8; 16];
+        id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        write_chunk_file(
+            crate::chunk::chunk_path(dir.path(), ChunkId(id)),
+            &key,
+            chunk,
+        )
+        .unwrap();
+    }
+    let write_elapsed = start.elapsed();
+
+    let start = Instant::now();
+    for i in 0..64_u64 {
+        let mut id = [0_u8; 16];
+        id[..8].copy_from_slice(&i.to_le_bytes());
+        let chunk =
+            read_chunk_file(&crate::chunk::chunk_path(dir.path(), ChunkId(id)), &key).unwrap();
+        pattern_check(i * 1024 * 1024, &chunk);
+    }
+    let read_elapsed = start.elapsed();
+
+    eprintln!(
+        "chunk codec benchmark: write {:.1} MiB/s, read {:.1} MiB/s (64 MiB)",
+        64.0 / write_elapsed.as_secs_f64(),
+        64.0 / read_elapsed.as_secs_f64()
     );
 }

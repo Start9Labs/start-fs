@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io;
@@ -6,20 +7,19 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::atomic_file::AtomicFile;
+use crate::chunk::{self, ChunkId, ChunkRef, FileContents};
+use crate::contents::EncryptedFile;
+use crate::directory::{DirectoryContents, DirectoryEntry};
+use crate::error::{BkfsError, BkfsResult, BkfsResultExt};
+use crate::inode::{FileData, Inode, InodeAttributes};
+use crate::serde::{load, save};
+use crate::util::IdPool;
+use crate::{BackupFSOptions, CryptInfo};
 use chacha20::cipher::{Iv, KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20::{ChaCha20, Key};
 use fuser::{FileType, FUSE_ROOT_ID};
 use log::error;
-use rand::Rng;
-
-use crate::atomic_file::AtomicFile;
-use crate::contents::EncryptedFile;
-use crate::directory::{DirectoryContents, DirectoryEntry};
-use crate::error::{BkfsError, BkfsResult, BkfsResultExt};
-use crate::inode::{ContentId, FileData, Inode, InodeAttributes};
-use crate::serde::{load, save};
-use crate::util::IdPool;
-use crate::{BackupFSOptions, CryptInfo};
 
 #[derive(Clone)]
 pub struct Controller(Arc<ControllerSeed>);
@@ -40,7 +40,6 @@ pub struct ControllerSeed {
     cryptinfo: CryptInfo,
     key: Key,
     inode_cipher: Mutex<ChaCha20>,
-    contents_cipher: Mutex<ChaCha20>,
     inode_dir: PathBuf,
     contents_dir: PathBuf,
     inode_pool_path: PathBuf,
@@ -100,6 +99,17 @@ fn resolve_path(base: &PathBuf, encrypted: [u8; 8]) -> PathBuf {
     path
 }
 
+fn parse_chunk_hex(name: &str) -> Option<ChunkId> {
+    if name.len() != 32 {
+        return None;
+    }
+    let mut out = [0_u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&name[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(ChunkId(out))
+}
+
 impl Controller {
     pub fn new(config: BackupFSOptions) -> BkfsResult<Self> {
         let cryptinfo_path = config.data_dir.join("cryptinfo");
@@ -115,10 +125,8 @@ impl Controller {
         };
         let key = Key::clone_from_slice(&*cryptinfo.key);
         let inode_iv = Iv::<ChaCha20>::clone_from_slice(&cryptinfo.inode_iv);
-        let contents_iv = Iv::<ChaCha20>::clone_from_slice(&cryptinfo.inode_iv);
         Ok(Self(Arc::new(ControllerSeed {
             inode_cipher: Mutex::new(ChaCha20::new(&key, &inode_iv)),
-            contents_cipher: Mutex::new(ChaCha20::new(&key, &contents_iv)),
             key,
             inode_dir: config.data_dir.join("inodes"),
             contents_dir: config.data_dir.join("contents"),
@@ -193,12 +201,11 @@ impl Controller {
                         match entry.ty {
                             FileType::Directory => FileData::Directory(DirectoryContents::new()),
                             FileType::Symlink => FileData::Symlink(PathBuf::new()),
-                            FileType::RegularFile => FileData::File(ContentId(inode.0)),
-                            _ => {
-                                return Err(
-                                    io::Error::other("unsupported filetype in directory").into()
-                                )
-                            }
+                            FileType::RegularFile => FileData::File(FileContents::new()),
+                            FileType::NamedPipe
+                            | FileType::CharDevice
+                            | FileType::BlockDevice
+                            | FileType::Socket => FileData::Special(entry.ty),
                         },
                     )
                 } else {
@@ -227,7 +234,63 @@ impl Controller {
     }
 
     fn find_orphans(&self) -> BkfsResult<()> {
-        // TODO
+        self.check_rw()?;
+        let mut live = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        self.collect_live_chunks(Inode(FUSE_ROOT_ID), &mut visited, &mut live)?;
+
+        if !self.0.contents_dir.exists() {
+            return Ok(());
+        }
+
+        for l1 in std::fs::read_dir(&self.0.contents_dir)? {
+            let l1 = l1?;
+            if !l1.file_type()?.is_dir() {
+                continue;
+            }
+            for l2 in std::fs::read_dir(l1.path())? {
+                let l2 = l2?;
+                if !l2.file_type()?.is_dir() {
+                    continue;
+                }
+                for entry in std::fs::read_dir(l2.path())? {
+                    let entry = entry?;
+                    if !entry.file_type()?.is_file() {
+                        continue;
+                    }
+                    let name = entry.file_name();
+                    let Some(name) = name.to_str() else { continue };
+                    let Some(id) = parse_chunk_hex(name) else {
+                        continue;
+                    };
+                    if !live.contains(&id) {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_live_chunks(
+        &self,
+        inode: Inode,
+        visited: &mut BTreeSet<Inode>,
+        live: &mut BTreeSet<ChunkId>,
+    ) -> BkfsResult<()> {
+        if !visited.insert(inode) {
+            return Ok(());
+        }
+        let inode = self.load::<InodeAttributes>(inode)?;
+        match &inode.attrs.contents {
+            FileData::File(contents) => contents.live_chunk_ids(live),
+            FileData::Directory(dir) => {
+                for (_, entry) in dir.iter() {
+                    self.collect_live_chunks(entry.inode, visited, live)?;
+                }
+            }
+            FileData::Symlink(_) | FileData::Special(_) => {}
+        }
         Ok(())
     }
 
@@ -253,11 +316,30 @@ impl Controller {
         current_path(&self.0.inode_dir, encrypted)
     }
 
-    /// Returns the current (2-level) path for writing. Cleans up legacy (5-level) copy.
-    pub fn contents_path(&self, contents: ContentId) -> PathBuf {
-        let encrypted = encrypt_u64(&self.0.contents_cipher, contents.0);
-        self.cleanup_legacy(&self.0.contents_dir, encrypted);
-        current_path(&self.0.contents_dir, encrypted)
+    pub fn chunk_path(&self, chunk: ChunkId) -> PathBuf {
+        chunk::chunk_path(&self.0.contents_dir, chunk)
+    }
+
+    pub fn write_chunk(&self, chunk: ChunkId, data: &[u8]) -> BkfsResult<()> {
+        self.check_rw()?;
+        chunk::write_chunk_file(self.chunk_path(chunk), self.key(), data)
+    }
+
+    pub fn read_chunk(&self, reference: &ChunkRef) -> BkfsResult<Vec<u8>> {
+        let data = chunk::read_chunk_file(&self.chunk_path(reference.id), self.key())?;
+        if data.len() != reference.stored_len as usize
+            || chunk::plaintext_hash(&data) != reference.hash
+        {
+            return Err(crate::error::BkfsError {
+                kind: crate::error::BkfsErrorKind::BadChecksum,
+                backtrace: None,
+            });
+        }
+        Ok(data)
+    }
+
+    pub fn remove_chunk_best_effort(&self, chunk: ChunkId) {
+        let _ = std::fs::remove_file(self.chunk_path(chunk));
     }
 
     fn cleanup_legacy(&self, base: &PathBuf, encrypted: [u8; 8]) {
@@ -274,13 +356,6 @@ impl Controller {
         )
     }
 
-    pub fn resolve_contents_path(&self, contents: ContentId) -> PathBuf {
-        resolve_path(
-            &self.0.contents_dir,
-            encrypt_u64(&self.0.contents_cipher, contents.0),
-        )
-    }
-
     pub fn next_inode(&self) -> BkfsResult<Inode> {
         self.check_rw()?;
         let mut pool = self.0.inode_pool.lock().unwrap();
@@ -291,24 +366,13 @@ impl Controller {
         save(
             &*pool,
             EncryptedFile::create(
-                crate::aligned_io::BufferedDirectFile::new(
-                    AtomicFile::create(self.0.inode_pool_path.clone())?,
-                )?,
+                crate::aligned_io::BufferedDirectFile::new(AtomicFile::create_buffered(
+                    self.0.inode_pool_path.clone(),
+                )?)?,
                 self.key(),
             )?,
         )?;
         Ok(Inode(res))
-    }
-
-    pub fn file_pad(&self, size: u64) -> u64 {
-        size + (self
-            .0
-            .config
-            .file_size_padding
-            .map(|p| p * size as f64)
-            .map(|p| p * rand::rng().random_range(0_f64..=1_f64))
-            .map(|p| p as u64)
-            .unwrap_or(0))
     }
 
     pub fn key(&self) -> &Key {

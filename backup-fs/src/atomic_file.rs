@@ -28,6 +28,7 @@ impl AtomicFile {
         })
     }
 
+    #[allow(dead_code)]
     pub fn create(path: PathBuf) -> BkfsResult<Self> {
         Self::new(
             path,

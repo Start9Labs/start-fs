@@ -13,6 +13,7 @@ use fuser::consts::FUSE_WRITE_KILL_PRIV;
 use fuser::{FileType, Request, TimeOrNow, FUSE_ROOT_ID};
 use log::{debug, warn};
 
+use crate::chunk::FileContents;
 use crate::contents::Contents;
 use crate::ctrl::Controller;
 use crate::directory::{DirectoryContents, DirectoryEntry};
@@ -564,6 +565,36 @@ impl Handler {
         bkuptime: Option<SystemTime>,
         flags: Option<u32>,
     ) -> BkfsResult<InodeAttributes> {
+        if let (Some(new_size), Some(contents)) =
+            (size, self.inodes.get(&inode).and_then(Weak::upgrade))
+        {
+            let mut contents = contents.lock().unwrap();
+            let ino = contents.inode.inode;
+            let changed = contents.inode.attrs.setattr(
+                self,
+                req,
+                ino,
+                mode,
+                uid,
+                gid,
+                Some(new_size),
+                atime,
+                mtime,
+                ctime,
+                fh,
+                crtime,
+                chgtime,
+                bkuptime,
+                flags,
+            )?;
+            contents.truncate(new_size);
+            contents.changed = true;
+            if changed {
+                self.save_inode(&contents.inode)?;
+            }
+            return Ok(contents.inode.clone());
+        }
+
         let inode = self.mutate_inode(inode, |handler, inode| {
             let changed = inode.attrs.setattr(
                 handler,
@@ -612,7 +643,7 @@ impl Handler {
         name: &OsStr,
         mut mode: u32,
         umask: u32,
-        _rdev: u32,
+        rdev: u32,
         contents: Option<F>,
     ) -> BkfsResult<InodeAttributes> {
         let file_type = mode & libc::S_IFMT as u32;
@@ -620,9 +651,15 @@ impl Handler {
         if file_type != libc::S_IFREG as u32
             && file_type != libc::S_IFLNK as u32
             && file_type != libc::S_IFDIR as u32
+            && file_type != libc::S_IFIFO as u32
+            && file_type != libc::S_IFSOCK as u32
+            && file_type != libc::S_IFCHR as u32
+            && file_type != libc::S_IFBLK as u32
         {
-            // TODO
-            warn!("mknod() implementation is incomplete. Only supports regular files, symlinks, and directories. Got {:o}", mode);
+            warn!(
+                "mknod() implementation is incomplete. Unsupported file type {:o}",
+                mode
+            );
             return BkfsResult::errno(libc::ENOSYS);
         }
 
@@ -657,11 +694,19 @@ impl Handler {
             let mode = mode & libc::S_IFMT as u32;
 
             if mode == libc::S_IFREG as u32 {
-                FileData::File(inode.into())
+                FileData::File(FileContents::new())
             } else if mode == libc::S_IFLNK as u32 {
                 FileData::Symlink(PathBuf::new())
             } else if mode == libc::S_IFDIR as u32 {
                 FileData::Directory(DirectoryContents::new())
+            } else if mode == libc::S_IFIFO as u32 {
+                FileData::Special(FileType::NamedPipe)
+            } else if mode == libc::S_IFSOCK as u32 {
+                FileData::Special(FileType::Socket)
+            } else if mode == libc::S_IFCHR as u32 {
+                FileData::Special(FileType::CharDevice)
+            } else if mode == libc::S_IFBLK as u32 {
+                FileData::Special(FileType::BlockDevice)
             } else {
                 return BkfsResult::errno(libc::ENOSYS);
             }
@@ -670,7 +715,8 @@ impl Handler {
         let mut new = InodeAttributes::new(inode, Some((parent.inode, name.to_owned())), contents);
         new.attrs.uid = req.uid();
         new.attrs.gid = gid;
-        new.attrs.mode = self.creation_mode(mode & !umask);
+        new.attrs.mode = self.creation_mode((mode & !umask) & !(libc::S_IFMT as u32));
+        new.attrs.rdev = rdev;
 
         dir.insert(
             name.to_owned(),
@@ -725,10 +771,9 @@ impl Handler {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
-        if let FileData::File(contents) = inode.attrs.contents {
-            let path = self.ctrl().resolve_contents_path(contents);
-            if path.exists() {
-                std::fs::remove_file(path)?;
+        if let FileData::File(contents) = &inode.attrs.contents {
+            for chunk in contents.iter_chunks() {
+                self.ctrl().remove_chunk_best_effort(chunk.id);
             }
         }
 
@@ -1047,6 +1092,9 @@ impl Handler {
 
         let mut contents = fh.contents.lock().unwrap();
 
+        if offset >= contents.inode.attrs.size {
+            return Ok(Vec::new());
+        }
         let size = min(size, (contents.inode.attrs.size - offset) as usize);
 
         let mut buf = vec![0_u8; size];
@@ -1088,12 +1136,7 @@ impl Handler {
         Ok(buf.len())
     }
 
-    pub fn fsync(
-        &mut self,
-        _req: &Request,
-        _inode: Inode,
-        fh: FileHandleId,
-    ) -> BkfsResult<()> {
+    pub fn fsync(&mut self, _req: &Request, _inode: Inode, fh: FileHandleId) -> BkfsResult<()> {
         let fh = self
             .handle(fh)
             .ok_or(libc::EBADF)
@@ -1233,6 +1276,7 @@ impl Handler {
         inode: Inode,
         key: &[u8],
         value: &[u8],
+        flags: i32,
     ) -> BkfsResult<()> {
         self.mutate_inode(inode, |handler, inode| {
             let attrs = &mut inode.attrs;
@@ -1242,6 +1286,16 @@ impl Handler {
                 Some(Some(value)),
                 req,
             )?;
+            let exists = attrs.xattrs.contains_key(key);
+            if flags & libc::XATTR_CREATE != 0 && exists {
+                return BkfsResult::errno(libc::EEXIST);
+            }
+            if flags & libc::XATTR_REPLACE != 0 && !exists {
+                #[cfg(target_os = "linux")]
+                return BkfsResult::errno(libc::ENODATA);
+                #[cfg(not(target_os = "linux"))]
+                return BkfsResult::errno(libc::ENOATTR);
+            }
             attrs.xattrs.insert(key.to_vec(), value.to_vec());
             attrs.changed();
             handler.save_inode(&*inode)?;
@@ -1269,12 +1323,12 @@ impl Handler {
         req: &'r Request,
         inode: Inode,
     ) -> BkfsResult<impl Iterator<Item = (Vec<u8>, Vec<u8>)> + 'r> {
-        // TODO: peek_inode and serialize to bytes here
         let inode = self.load_inode(inode)?;
-        let mut attrs = inode.attrs;
-        let xattrs = std::mem::replace(&mut attrs.xattrs, Default::default());
+        let attrs = inode.attrs;
         let idmap = self.ctrl().config().idmapped_root.clone();
-        Ok(xattrs
+        Ok(attrs
+            .xattrs
+            .clone()
             .into_iter()
             .filter(move |(key, _)| attrs.xattr_access_check(&idmap, key, None, req).is_ok()))
     }

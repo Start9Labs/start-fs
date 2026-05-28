@@ -38,6 +38,7 @@ use crate::serde::save;
 
 mod aligned_io;
 mod atomic_file;
+mod chunk;
 mod contents;
 mod ctrl;
 mod directory;
@@ -65,15 +66,41 @@ pub(crate) static FSYNCDIR_CALL_COUNT: std::sync::atomic::AtomicU64 =
 
 const FMODE_EXEC: i32 = 0x20;
 
-pub(crate) fn open_direct(path: &Path, create: bool) -> io::Result<aligned_io::BufferedDirectFile<File>> {
+pub(crate) fn open_direct(
+    path: &Path,
+    create: bool,
+) -> io::Result<aligned_io::BufferedDirectFile<File>> {
     use std::os::unix::fs::OpenOptionsExt;
-    let mut opts = File::options();
-    opts.read(true).custom_flags(libc::O_DIRECT);
+
+    let mut direct = File::options();
+    direct.read(true).custom_flags(libc::O_DIRECT);
     if create {
-        opts.write(true).create(true).truncate(true);
+        direct.write(true).create(true).truncate(true);
     }
-    aligned_io::BufferedDirectFile::new(opts.open(path)?)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+
+    let file = match direct.open(path) {
+        Ok(file) => file,
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOTTY)
+            ) =>
+        {
+            // Some rclone/FUSE backends and USB filesystems reject O_DIRECT.
+            // Fall back to a normal fd; BufferedDirectFile still bounds our
+            // userspace buffering, and the chunk store uses POSIX_FADV_DONTNEED
+            // after streaming I/O to keep the kernel cache from ballooning.
+            let mut buffered = File::options();
+            buffered.read(true);
+            if create {
+                buffered.write(true).create(true).truncate(true);
+            }
+            buffered.open(path)?
+        }
+        Err(e) => return Err(e),
+    };
+
+    aligned_io::BufferedDirectFile::new(file).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 }
 
 #[cfg_attr(feature = "cli", derive(clap::Parser))]
@@ -116,8 +143,9 @@ impl FromStr for IdMappedRoot {
     }
 }
 
-// Stores inode metadata data in "$data_dir/inodes" and file contents in "$data_dir/contents"
-// Directory data is stored in the file's contents, as a serialized DirectoryDescriptor
+// Stores inode metadata in "$data_dir/inodes" and encrypted/ECC file chunks in
+// "$data_dir/contents". Directory data and regular-file chunk manifests live in
+// the inode metadata so metadata-only rsync passes touch small, bounded files.
 pub struct BackupFS {
     lock: FdLock<File>,
     handler: Handler,
@@ -150,7 +178,7 @@ impl CryptInfo {
         save(
             self,
             EncryptedFile::create_pbkdf2(
-                aligned_io::BufferedDirectFile::new(AtomicFile::create(path)?)?,
+                aligned_io::BufferedDirectFile::new(AtomicFile::create_buffered(path)?)?,
                 password,
             )?,
         )
@@ -190,7 +218,7 @@ impl BackupFS {
     }
 
     pub fn fsck(&mut self) -> BkfsResult<()> {
-        self.handler.ctrl().fsck(false)
+        self.handler.ctrl().fsck(true)
     }
 
     pub fn change_password(&mut self, password: &str) -> BkfsResult<()> {
@@ -211,11 +239,10 @@ impl Filesystem for BackupFS {
         if let Err(e) = self.handler.close_all() {
             error!("error closing FS: {e}");
         }
-        // Every individual AtomicFile::save already calls sync_all
-        // before its rename, so data itself is durable. syncfs here is
-        // a belt-and-braces flush of the whole backing filesystem —
-        // ensures any last journal commits, CIFS writeback, etc. drain
-        // before we release the data_dir lock and exit.
+        // close_all durably flushes dirty inodes/chunks; syncfs here is a
+        // belt-and-braces flush of the whole backing filesystem so any last
+        // journal commits, CIFS writeback, etc. drain before we release the
+        // data_dir lock and exit.
         use std::os::fd::AsRawFd;
         let fd = self.lock.as_raw_fd();
         // SAFETY: fd is a valid fd we own (held by the FdLock).
@@ -535,11 +562,9 @@ impl Filesystem for BackupFS {
         // Route by inode so fsync observes prior write jobs for the
         // same file (shard FIFO order).
         let key = handle.inode.0;
-        pool::global().submit_for(key, move || {
-            match handle.contents.lock().unwrap().fsync() {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(e.to_errno_log()),
-            }
+        pool::global().submit_for(key, move || match handle.contents.lock().unwrap().fsync() {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e.to_errno_log()),
         });
     }
 
@@ -703,7 +728,7 @@ impl Filesystem for BackupFS {
     ) {
         match self
             .handler
-            .setxattr(request, Inode(inode), key.as_bytes(), value)
+            .setxattr(request, Inode(inode), key.as_bytes(), value, _flags)
         {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e.to_errno_log()),
@@ -771,9 +796,7 @@ impl Filesystem for BackupFS {
         // chdir — breaking rsync --mkpath into a fresh mount.
         let idmap = self.handler.ctrl().config().idmapped_root.clone();
         match self.handler.peek_inode(Inode(inode), |inode| {
-            inode
-                .attrs
-                .check_access(&idmap, req.uid(), req.gid(), mask)
+            inode.attrs.check_access(&idmap, req.uid(), req.gid(), mask)
         }) {
             Ok(_) => reply.ok(),
             Err(e) => reply.error(e.to_errno()),

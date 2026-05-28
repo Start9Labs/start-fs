@@ -86,6 +86,13 @@ pub struct Attributes {
     pub uid: u32,
     pub gid: u32,
     pub xattrs: OrdMap<Vec<u8>, Vec<u8>>,
+    /// Content-addressed chunk hashes for deduplicated storage.
+    /// When set, the file's data is stored as a sequence of 64KB
+    /// encrypted blocks in `$data_dir/blocks/`, indexed by these
+    /// SHA-256 hashes. When empty, falls back to the legacy
+    /// single-file `contents` storage.
+    #[serde(default)]
+    pub chunk_hashes: Vec<[u8; 32]>,
 }
 
 #[derive(Clone, Debug)]
@@ -111,6 +118,7 @@ impl InodeAttributes {
                 uid: 0,
                 gid: 0,
                 xattrs: Default::default(),
+                chunk_hashes: Vec::new(),
             },
         }
     }

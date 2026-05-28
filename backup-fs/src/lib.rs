@@ -28,7 +28,8 @@ use crate::atomic_file::AtomicFile;
 use crate::contents::EncryptedFile;
 use crate::ctrl::{Controller, StatFs};
 use crate::directory::DirectoryContents;
-use crate::error::{BkfsError, BkfsResult};
+use crate::ecc::EccBlock;
+use crate::error::{BkfsError, BkfsResult, BkfsResultExt};
 use crate::handle::{FileHandleId, Handler};
 use crate::inode::FileData;
 use crate::inode::BLOCK_SIZE;
@@ -36,11 +37,14 @@ use crate::inode::{Inode, InodeAttributes};
 use crate::serde::load;
 use crate::serde::save;
 
+mod acl;
 mod aligned_io;
 mod atomic_file;
+mod chunked;
 mod contents;
 mod ctrl;
 mod directory;
+mod ecc;
 pub mod error;
 mod handle;
 mod inode;
@@ -141,19 +145,134 @@ impl CryptInfo {
         }
     }
     pub fn load(path: &Path, password: &str) -> BkfsResult<Self> {
-        load(EncryptedFile::open_pbkdf2(
-            aligned_io::BufferedDirectFile::new(File::open(path)?)?,
-            password,
-        )?)
+        // Try the traditional single-file first
+        let primary_result: BkfsResult<Self> = if path.exists() {
+            let file_result: BkfsResult<File> = File::open(path).map_err(|e| e.into());
+            match file_result {
+                Err(e) => Err(e),
+                Ok(file) => {
+                    let buffered_result: BkfsResult<aligned_io::BufferedDirectFile<File>> = 
+                        aligned_io::BufferedDirectFile::new(file).map_err(|e| e.into());
+                    match buffered_result {
+                        Err(e) => Err(e),
+                        Ok(buffered) => {
+                            let open_result: BkfsResult<EncryptedFile> = 
+                                EncryptedFile::open_pbkdf2(buffered, password);
+                            match open_result {
+                                Ok(ef) => load(ef),
+                                Err(e) => Err(e),
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            BkfsResult::errno(libc::ENOENT)
+        };
+
+        match primary_result {
+            Ok(ci) => Ok(ci),
+            Err(primary_err) => {
+                // Primary file corrupted or missing — try ECC recovery
+                let ecc_path = path.with_extension("ecc");
+                // ECC shards are stored as multiple files alongside the path:
+                //   <path>.ecc.meta (metadata), <path>.ecc.0 through <path>.ecc.5 (shards)
+                let ecc_has_shards = ecc_path.with_extension("ecc.meta").exists()
+                    || ecc_path.with_extension("ecc.0").exists();
+                if ecc_has_shards {
+                    log::warn!(
+                        "primary cryptinfo failed ({}); attempting ECC shard recovery",
+                        primary_err
+                    );
+                    match ecc::load_ecc_block(&ecc_path) {
+                        Ok(encrypted_data) => {
+                            // The ECC payload is the PBKDF2-encrypted file bytes.
+                            let tmp_path = path.with_extension("ecc.decrypt");
+                            std::fs::write(&tmp_path, &encrypted_data)?;
+                            
+                            let result: BkfsResult<Self> = {
+                                let file_result: BkfsResult<File> = 
+                                    File::open(&tmp_path).map_err(|e| e.into());
+                                match file_result {
+                                    Err(e) => Err(e),
+                                    Ok(file) => {
+                                        let buffered_result: BkfsResult<aligned_io::BufferedDirectFile<File>> = 
+                                            aligned_io::BufferedDirectFile::new(file).map_err(|e| e.into());
+                                        match buffered_result {
+                                            Err(e) => Err(e),
+                                            Ok(buffered) => {
+                                                let open_result: BkfsResult<EncryptedFile> = 
+                                                    EncryptedFile::open_pbkdf2(buffered, password);
+                                                match open_result {
+                                                    Ok(ef) => load(ef),
+                                                    Err(e) => Err(e),
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            };
+                            
+                            let _ = std::fs::remove_file(&tmp_path);
+                            match result {
+                                Ok(ci) => {
+                                    log::info!("cryptinfo recovered from ECC shards");
+                                    Ok(ci)
+                                }
+                                Err(e) => {
+                                    // Propagate the underlying error directly — 
+                                    // if it's a BadChecksum from wrong password, 
+                                    // the caller needs to see that, not a generic
+                                    // ECC wrapper.
+                                    Err(e)
+                                }
+                            }
+                        }
+                        Err(ecc_err) => {
+                            Err(BkfsError::ecc_error(&format!(
+                                "ECC recovery failed: {}; original error: {}",
+                                ecc_err, primary_err
+                            )))
+                        }
+                    }
+                } else {
+                    // No ECC shards either — bubble the original error
+                    Err(primary_err)
+                }
+            }
+        }
     }
     pub fn save(&self, path: PathBuf, password: &str) -> BkfsResult<()> {
+        // Save the traditional single-file (backward compat) — uses
+        // serde::save which writes data + trailing SHA-256 hash.
         save(
             self,
             EncryptedFile::create_pbkdf2(
-                aligned_io::BufferedDirectFile::new(AtomicFile::create(path)?)?,
+                aligned_io::BufferedDirectFile::new(AtomicFile::create(path.clone())?)?,
                 password,
             )?,
-        )
+        )?;
+
+        // Also save ECC-protected shards for recovery.
+        // Write encrypted file to a temp location (with trailing hash),
+        // then read the raw bytes and encode into RS shards.
+        let tmp_ecc = path.with_extension("ecc.src");
+        save(
+            self,
+            EncryptedFile::create_pbkdf2(
+                aligned_io::BufferedDirectFile::new(AtomicFile::create(tmp_ecc.clone())?)?,
+                password,
+            )?,
+        )?;
+
+        // Read the complete encrypted file (IV + ciphertext + hash)
+        let encrypted_bytes = std::fs::read(&tmp_ecc)?;
+        let _ = std::fs::remove_file(&tmp_ecc);
+
+        let block = EccBlock::encode(&encrypted_bytes)?;
+        let ecc_path = path.with_extension("ecc");
+        ecc::store_ecc_block(&ecc_path, &block)?;
+        Ok(())
     }
 }
 

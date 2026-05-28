@@ -13,6 +13,7 @@ use fuser::consts::FUSE_WRITE_KILL_PRIV;
 use fuser::{FileType, Request, TimeOrNow, FUSE_ROOT_ID};
 use log::{debug, warn};
 
+use crate::acl;
 use crate::contents::Contents;
 use crate::ctrl::Controller;
 use crate::directory::{DirectoryContents, DirectoryEntry};
@@ -1234,6 +1235,16 @@ impl Handler {
         key: &[u8],
         value: &[u8],
     ) -> BkfsResult<()> {
+        // Validate POSIX ACL if this is an ACL xattr
+        if key.starts_with(b"system.posix_acl_") {
+            if let Some(entries) = acl::parse_posix_acl(value) {
+                if let Err(msg) = acl::validate_acl(&entries) {
+                    warn!("setxattr: invalid ACL: {}", msg);
+                    return BkfsResult::errno(libc::EINVAL);
+                }
+            }
+        }
+        
         self.mutate_inode(inode, |handler, inode| {
             let attrs = &mut inode.attrs;
             attrs.xattr_access_check(

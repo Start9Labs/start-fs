@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["cli"]
+default = ["cli", "ecc"]
 cli = ["clap", "env_logger"]
+ecc = ["dep:reed-solomon-simd"]
 
 [lib]
 name = "backupfs"
@@ -44,9 +45,14 @@ env_logger = { version = "0.11", optional = true }
 ctrlc = "3.4.4"
 io-uring = "0.7.11"
 crossbeam-channel = "0.5"
+reed-solomon-simd = { version = "3.1", optional = true }
+blake3 = "1"
+hex = "0.4"
 
 [dev-dependencies]
 tempdir = "0.3.7"
 oneshot = "0.1.8"
 test-log = "0.2.16"
 tokio = { version = "1.38.0", features = ["fs", "rt", "macros"] }
+xattr = "1"
+filetime = "0.2"

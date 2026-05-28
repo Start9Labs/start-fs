@@ -38,9 +38,11 @@ use crate::serde::save;
 
 mod aligned_io;
 mod atomic_file;
+mod block_store;
 mod contents;
 mod ctrl;
 mod directory;
+pub mod ecc;
 pub mod error;
 mod handle;
 mod inode;
@@ -50,6 +52,8 @@ mod serde;
 mod tests;
 #[allow(dead_code)]
 mod util;
+#[cfg(test)]
+mod benchmarks;
 
 pub const MAX_NAME_LENGTH: u32 = 255;
 // const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024 * 1024;

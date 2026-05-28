@@ -1424,3 +1424,219 @@ fn rename_over_existing_across_remount() {
         None,
     );
 }
+
+/// chmod preserves mode bits across remount.
+#[test_log::test]
+fn preserves_chmod_across_remount() {
+    use std::os::unix::fs::PermissionsExt;
+    let data = TempDir::new("backupfs_data").unwrap();
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::write(mnt.join("f"), b"x").unwrap();
+            let mode = 0o600u32;
+            let mut perms = fs::metadata(mnt.join("f")).unwrap().permissions();
+            perms.set_mode(mode);
+            fs::set_permissions(mnt.join("f"), perms).unwrap();
+            let meta = fs::metadata(mnt.join("f")).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, mode);
+        },
+        None,
+    );
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let meta = fs::metadata(mnt.join("f")).unwrap();
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600u32, "chmod not preserved: got {mode:o}");
+            assert_eq!(fs::read(mnt.join("f")).unwrap(), b"x");
+        },
+        None,
+    );
+}
+
+/// Inode timestamps survive a remount.
+#[test_log::test]
+fn preserves_timestamps_across_remount() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::write(mnt.join("ts"), b"timestamps").unwrap();
+            // Set mtime to a known value
+            let past = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1000);
+            filetime::set_file_mtime(mnt.join("ts"), past.into()).unwrap();
+        },
+        None,
+    );
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let meta = fs::metadata(mnt.join("ts")).unwrap();
+            let mtime = meta.modified().unwrap();
+            // mtime should be ~1000 sec since epoch
+            let mtime_secs = mtime
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            assert!(
+                mtime_secs >= 999 && mtime_secs <= 1001,
+                "mtime not preserved: got {mtime_secs}s"
+            );
+        },
+        None,
+    );
+}
+
+/// Extended attributes (user namespace) survive remount.
+#[test_log::test]
+fn preserves_xattr_across_remount() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::write(mnt.join("xattr"), b"xattr test").unwrap();
+            let path = mnt.join("xattr");
+            xattr::set(&path, "user.test-key", b"test-value").expect("setxattr");
+            let val = xattr::get(&path, "user.test-key").unwrap().unwrap();
+            assert_eq!(val, b"test-value");
+        },
+        None,
+    );
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let path = mnt.join("xattr");
+            let val = xattr::get(&path, "user.test-key").unwrap().unwrap();
+            assert_eq!(val, b"test-value", "xattr not preserved across remount");
+            assert_eq!(fs::read(mnt.join("xattr")).unwrap(), b"xattr test");
+        },
+        None,
+    );
+}
+
+/// Multiple xattrs survive remount.
+#[test_log::test]
+fn preserves_multiple_xattrs_across_remount() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::write(mnt.join("many"), b"many xattrs").unwrap();
+            let path = mnt.join("many");
+            for i in 0..5 {
+                xattr::set(&path, format!("user.attr{i}"), format!("value{i}").as_bytes())
+                    .unwrap();
+            }
+        },
+        None,
+    );
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let path = mnt.join("many");
+            for i in 0..5 {
+                let val = xattr::get(&path, format!("user.attr{i}")).unwrap().unwrap();
+                assert_eq!(
+                    val,
+                    format!("value{i}").as_bytes(),
+                    "xattr user.attr{i} not preserved"
+                );
+            }
+            // Check we can list xattrs
+            let list = xattr::list(&path).unwrap();
+            let count = list
+                .filter(|n| {
+                    n.to_str()
+                        .map(|s| s.starts_with("user.attr"))
+                        .unwrap_or(false)
+                })
+                .count();
+            assert_eq!(count, 5, "not all xattrs listed");
+        },
+        None,
+    );
+}
+
+/// Symlink target is preserved across remount.
+#[test_log::test]
+fn preserves_symlink_across_remount() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            std::os::unix::fs::symlink("/some/target", mnt.join("link")).unwrap();
+            let target = fs::read_link(mnt.join("link")).unwrap();
+            assert_eq!(target, PathBuf::from("/some/target"));
+        },
+        None,
+    );
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let target = fs::read_link(mnt.join("link")).unwrap();
+            assert_eq!(
+                target,
+                PathBuf::from("/some/target"),
+                "symlink target not preserved"
+            );
+        },
+        None,
+    );
+}
+
+/// Write many small files — validates metadata overhead is acceptable.
+#[test_log::test]
+fn write_many_small_files() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    const COUNT: usize = 500;
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            for i in 0..COUNT {
+                fs::write(
+                    mnt.join(format!("small{i:04}")),
+                    format!("payload {i}"),
+                )
+                .unwrap();
+            }
+        },
+        None,
+    );
+
+    // Verify all persist
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            for i in 0..COUNT {
+                let content = fs::read(mnt.join(format!("small{i:04}"))).unwrap();
+                assert_eq!(content, format!("payload {i}").as_bytes());
+            }
+        },
+        None,
+    );
+
+    // Check disk usage: inodes + content files
+    let inode_count = tree(data.path().join("inodes"), false).unwrap().len();
+    let content_count = tree(data.path().join("contents"), false).unwrap().len();
+    assert_eq!(inode_count, COUNT + 1, "wrong number of inode files");
+    assert_eq!(content_count, COUNT, "wrong number of content files");
+}

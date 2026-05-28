@@ -274,11 +274,21 @@ impl Controller {
         )
     }
 
+    pub fn contents_dir(&self) -> &PathBuf {
+        &self.0.contents_dir
+    }
+
     pub fn resolve_contents_path(&self, contents: ContentId) -> PathBuf {
         resolve_path(
             &self.0.contents_dir,
             encrypt_u64(&self.0.contents_cipher, contents.0),
         )
+    }
+
+    /// Return the directory path for a content ID (for block store use).
+    pub fn contents_dir_path(&self, contents: ContentId) -> PathBuf {
+        let encrypted = encrypt_u64(&self.0.contents_cipher, contents.0);
+        current_path(&self.0.contents_dir, encrypted)
     }
 
     pub fn next_inode(&self) -> BkfsResult<Inode> {

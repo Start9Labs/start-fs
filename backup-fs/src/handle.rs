@@ -461,6 +461,11 @@ impl FileHandle {
 pub struct DirHandle {
     pub inode: Inode,
     pub cursors: BTreeMap<i64, OsString>,
+    /// Snapshot of the directory's entries taken at opendir. Paging over a
+    /// stable snapshot (rather than re-reading buckets each readdir call)
+    /// keeps a spilled directory's listing consistent across the readdir
+    /// sequence; the persistent OrdMap clones in O(1).
+    pub entries: crate::directory::Bucket,
 }
 
 pub struct OverwriteOptions {
@@ -508,7 +513,7 @@ impl Handler {
             libc::X_OK,
         )?;
 
-        let inode = parent.lookup(name)?;
+        let inode = parent.lookup(self.ctrl(), name)?;
         let result = self.mutate_inode(inode, |_, attrs| {
             if !attrs
                 .attrs
@@ -537,8 +542,10 @@ impl Handler {
                     "lookup: pruning stale parent {:?}/{:?} → missing inode {:?}",
                     parent.inode, name, inode
                 );
+                let ctrl = self.ctrl().clone();
+                let parent_inode = parent.inode;
                 if let FileData::Directory(dir) = &mut parent.attrs.contents {
-                    dir.remove(name);
+                    dir.remove(&ctrl, parent_inode, name, false)?;
                 }
                 self.save_inode(&parent)?;
                 BkfsResult::errno_notrace(libc::ENOENT)
@@ -642,12 +649,14 @@ impl Handler {
         )?;
 
         let gid = parent.attrs.creation_gid(req.gid());
+        let parent_inode = parent.inode;
+        let ctrl = self.ctrl().clone();
 
         let FileData::Directory(dir) = &mut parent.attrs.contents else {
             return BkfsResult::errno(libc::ENOTDIR);
         };
 
-        if dir.get(name).is_some() {
+        if dir.get(&ctrl, parent_inode, name)?.is_some() {
             return BkfsResult::errno(libc::EEXIST);
         }
 
@@ -686,17 +695,27 @@ impl Handler {
         new.attrs.gid = gid;
         new.attrs.mode = self.creation_mode(mode & !umask);
 
-        dir.insert(
+        let reap = dir.insert(
+            &ctrl,
+            parent_inode,
             name.to_owned(),
             DirectoryEntry {
                 inode: new.inode,
                 ty: (&new.attrs.contents).into(),
             },
-        );
+            false,
+        )?;
 
         self.save_inode(&new)?;
 
-        self.save_inode(&parent)?;
+        if let Some((gen, buckets)) = reap {
+            // A reshard produced a superseded bucket generation: the new
+            // marker must be durable BEFORE the old generation is deleted.
+            self.save_inode_durable(&parent)?;
+            DirectoryContents::reap_generation(&ctrl, parent_inode, gen, buckets)?;
+        } else {
+            self.save_inode(&parent)?;
+        }
 
         Ok(new)
     }
@@ -739,8 +758,15 @@ impl Handler {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
-        if let FileData::File(contents) = inode.attrs.contents {
-            crate::blockstore::remove_all_blocks(self.ctrl(), contents, inode.attrs.size)?;
+        match &inode.attrs.contents {
+            FileData::File(contents) => {
+                crate::blockstore::remove_all_blocks(self.ctrl(), *contents, inode.attrs.size)?;
+            }
+            FileData::Directory(dir) => {
+                // Reap any spilled-directory bucket files.
+                dir.gc(self.ctrl(), inode.inode)?;
+            }
+            _ => {}
         }
 
         Ok(true)
@@ -755,17 +781,27 @@ impl Handler {
             libc::W_OK,
         )?;
 
-        let FileData::Directory(dir) = &mut parent.attrs.contents else {
-            return BkfsResult::errno(libc::ENOTDIR);
-        };
+        let ctrl = self.ctrl().clone();
+        let parent_inode = parent.inode;
 
-        let entry = dir
-            .remove(name)
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        // Look the entry up WITHOUT removing it yet: a spilled-directory
+        // removal hits the backing store immediately, so it must not be
+        // applied until the ENOTEMPTY/sticky checks pass (an inline
+        // directory's in-memory removal could be discarded on error, but a
+        // bucket write cannot).
+        let entry = {
+            let FileData::Directory(dir) = &parent.attrs.contents else {
+                return BkfsResult::errno(libc::ENOTDIR);
+            };
+            dir.get(&ctrl, parent_inode, name)?
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?
+        };
 
         let result = self.mutate_inode(entry.inode, |handler, inode| {
             if let FileData::Directory(dir) = &inode.attrs.contents {
-                if inode.attrs.parents.len() <= 1 && !dir.is_empty() {
+                if inode.attrs.parents.len() <= 1
+                    && !dir.is_empty_exact(&ctrl, inode.inode)?
+                {
                     return BkfsResult::errno(libc::ENOTEMPTY);
                 }
             }
@@ -774,12 +810,15 @@ impl Handler {
 
             inode.attrs.parents.remove(&(parent.inode, name.to_owned()));
 
-            // Durable parent save BEFORE gc — otherwise a crash between
-            // the on-disk file removal below and the dirty-cache flush
-            // on unmount leaves parent.dir pointing to a deleted inode.
-            // Subsequent lookups heal by pruning the entry, which is
-            // the data-loss path users hit when the daemon is killed
-            // mid-op.
+            // Checks passed — now remove the directory entry durably, then
+            // make the parent durable BEFORE gc. A crash between the entry
+            // removal and the child file removal below leaves parent.dir
+            // pointing at a deleted inode, which subsequent lookups heal by
+            // pruning — the data-loss path users hit when the daemon is
+            // killed mid-op, so the ordering matters.
+            if let FileData::Directory(dir) = &mut parent.attrs.contents {
+                dir.remove(&ctrl, parent_inode, name, true)?;
+            }
             handler.save_inode_durable(&parent)?;
             if !handler.gc_inode(&*inode)? {
                 handler.save_inode(&*inode)?;
@@ -792,16 +831,18 @@ impl Handler {
             Ok(()) => Ok(()),
             Err(e) if is_missing_inode(&e) => {
                 // Parent referenced a child whose inode file isn't on
-                // disk — a stale entry left by an unclean shutdown or
-                // an earlier bug. The parent's entry removal above was
-                // applied to our local copy only (the closure errored
-                // before its save_inode ran). Save the parent now so
-                // the dir listing reflects reality and the user can
-                // actually get rid of this phantom.
+                // disk — a stale entry left by an unclean shutdown or an
+                // earlier bug. The closure errored before removing the
+                // entry, so prune it now and persist the parent so the dir
+                // listing reflects reality and the user can get rid of the
+                // phantom.
                 warn!(
                     "unlink: healing stale parent {:?}/{:?} → missing inode {:?}",
                     parent.inode, name, entry.inode
                 );
+                if let FileData::Directory(dir) = &mut parent.attrs.contents {
+                    dir.remove(&ctrl, parent_inode, name, false)?;
+                }
                 self.save_inode(&parent)?;
                 Ok(())
             }
@@ -817,8 +858,8 @@ impl Handler {
         new_name: &OsStr,
         overwrite: Option<OverwriteOptions>,
     ) -> BkfsResult<InodeAttributes> {
-        use imbl::ordmap::Entry::*;
         self.mutate_inode(inode, |handler, inode| {
+            let ctrl = handler.ctrl().clone();
             let mut ancestor_queue = vec![new_parent];
             while let Some(ancestor) = ancestor_queue.pop() {
                 if ancestor == inode.inode {
@@ -833,6 +874,7 @@ impl Handler {
             }
 
             let mut new_parent = handler.load_inode(new_parent)?;
+            let new_parent_inode = new_parent.inode;
 
             new_parent.attrs.check_access(
                 &handler.ctrl().config().idmapped_root,
@@ -842,30 +884,35 @@ impl Handler {
             )?;
 
             let sticky_res = new_parent.attrs.check_sticky(&inode.attrs, req.uid());
-            let FileData::Directory(dir) = &mut new_parent.attrs.contents else {
-                return BkfsResult::errno(libc::ENOTDIR);
-            };
 
             let new_entry = DirectoryEntry {
                 inode: inode.inode,
                 ty: (&inode.attrs.contents).into(),
             };
-            let entry = dir.entry(new_name.to_owned());
-            // Record which inode (if any) we need to gc after the new
-            // pointers are durable. Doing the gc inline — as the code
-            // used to — removed the prev inode's on-disk files before
-            // the parent's new dir entry reached disk. A crash in that
-            // window left the parent pointing to a deleted inode, which
-            // lookup then healed by pruning the entry (losing the new
-            // one the rename just wrote).
+
+            // Look up any existing occupant of new_name (single bucket).
+            let prev = {
+                let FileData::Directory(dir) = &new_parent.attrs.contents else {
+                    return BkfsResult::errno(libc::ENOTDIR);
+                };
+                dir.get(&ctrl, new_parent_inode, new_name)?
+            };
+            // Record which inode (if any) to gc after the new pointers are
+            // durable. Doing the gc inline removed the prev inode's files
+            // before the parent's new entry reached disk; a crash there left
+            // the parent pointing to a deleted inode, which lookup then
+            // healed by pruning the entry (losing the new one).
             let mut prev_to_gc: Option<Inode> = None;
-            match (entry, overwrite) {
-                (Occupied(_), None) => return BkfsResult::errno(libc::EEXIST),
-                (Occupied(mut prev_entry), Some(overwrite)) => {
-                    let prev_ino = prev_entry.get().inode;
+            let mut reap_gen: Option<(u64, u32)> = None;
+            match (prev, overwrite) {
+                (Some(_), None) => return BkfsResult::errno(libc::EEXIST),
+                (Some(prev_entry), Some(overwrite)) => {
+                    let prev_ino = prev_entry.inode;
                     let result = handler.mutate_inode(prev_ino, |handler, prev_inode| {
                         if let FileData::Directory(dir) = &prev_inode.attrs.contents {
-                            if prev_inode.attrs.parents.len() <= 1 && !dir.is_empty() {
+                            if prev_inode.attrs.parents.len() <= 1
+                                && !dir.is_empty_exact(&ctrl, prev_inode.inode)?
+                            {
                                 return BkfsResult::errno(libc::ENOTEMPTY);
                             }
                         }
@@ -875,13 +922,12 @@ impl Handler {
                         prev_inode
                             .attrs
                             .parents
-                            .remove(&(new_parent.inode, new_name.to_owned()));
+                            .remove(&(new_parent_inode, new_name.to_owned()));
 
-                        // Always save the prev inode's updated
-                        // state (may have other parents via hard
-                        // links). The actual gc — if parents went
-                        // to empty — is deferred to after the new
-                        // pointers below are durable.
+                        // Always save the prev inode's updated state (may
+                        // have other parents via hard links). The actual gc
+                        // — if parents went to empty — is deferred to after
+                        // the new pointers below are durable.
                         handler.save_inode(&*prev_inode)?;
                         Ok(overwrite.gc && prev_inode.attrs.parents.is_empty())
                     });
@@ -889,14 +935,13 @@ impl Handler {
                         Ok(v) => v,
                         Err(e) if is_missing_inode(&e) => {
                             // Stale dir entry left by a previous
-                            // crash-window bug: parent.dir references
-                            // an inode whose file is no longer on disk.
-                            // Without this branch, every rename over
-                            // the ghost name fails with NotFound and
-                            // the name can never be reclaimed.
+                            // crash-window bug: parent.dir references an
+                            // inode whose file is no longer on disk. Without
+                            // this branch, every rename over the ghost name
+                            // fails with NotFound and can never be reclaimed.
                             warn!(
                                 "link: overwriting stale parent {:?}/{:?} → missing inode {:?}",
-                                new_parent.inode, new_name, prev_ino
+                                new_parent_inode, new_name, prev_ino
                             );
                             false
                         }
@@ -905,10 +950,20 @@ impl Handler {
                     if should_gc {
                         prev_to_gc = Some(prev_ino);
                     }
-                    *prev_entry.get_mut() = new_entry;
+                    // Replace the entry. When we're about to gc the old
+                    // target, the new pointer must be durable first.
+                    if let FileData::Directory(dir) = &mut new_parent.attrs.contents {
+                        reap_gen =
+                            dir.insert(&ctrl, new_parent_inode, new_name.to_owned(), new_entry, should_gc)?;
+                    }
                 }
-                (Vacant(e), _) => {
-                    e.insert(new_entry);
+                (None, _) => {
+                    if let FileData::Directory(dir) = &mut new_parent.attrs.contents {
+                        reap_gen =
+                            dir.insert(&ctrl, new_parent_inode, new_name.to_owned(), new_entry, false)?;
+                    } else {
+                        return BkfsResult::errno(libc::ENOTDIR);
+                    }
                 }
             }
 
@@ -917,15 +972,19 @@ impl Handler {
                 .parents
                 .insert((new_parent.inode, new_name.to_owned()));
 
-            if prev_to_gc.is_some() {
-                // Overwrite path: disk ordering matters. Make the new
-                // pointer + its target durable BEFORE removing the old
-                // target's files.
+            if prev_to_gc.is_some() || reap_gen.is_some() {
+                // Disk ordering matters: make the new pointer + the new
+                // directory marker durable BEFORE removing the old target's
+                // files or a superseded bucket generation.
                 handler.save_inode_durable(&*inode)?;
                 handler.save_inode_durable(&new_parent)?;
             } else {
                 handler.save_inode(&*inode)?;
                 handler.save_inode(&new_parent)?;
+            }
+
+            if let Some((gen, buckets)) = reap_gen {
+                DirectoryContents::reap_generation(&ctrl, new_parent_inode, gen, buckets)?;
             }
 
             if let Some(prev_ino) = prev_to_gc {
@@ -958,7 +1017,7 @@ impl Handler {
             libc::W_OK,
         )?;
 
-        let inode = parent.lookup(name)?;
+        let inode = parent.lookup(self.ctrl(), name)?;
 
         if exchange {
             let new_parent = self.load_inode(new_parent)?;
@@ -976,7 +1035,7 @@ impl Handler {
                 return Ok(());
             }
 
-            let new_inode = new_parent.lookup(new_name)?;
+            let new_inode = new_parent.lookup(self.ctrl(), new_name)?;
 
             self.link(
                 req,
@@ -1136,6 +1195,10 @@ impl Handler {
             req.gid(),
             access_mask,
         )?;
+        let entries = match &inode.attrs.contents {
+            FileData::Directory(dir) => dir.snapshot(self.ctrl(), inode.inode)?,
+            _ => Default::default(),
+        };
         let fh = self.next_fh;
         self.next_fh.0 += 1;
         self.open_dirs.insert(
@@ -1143,6 +1206,7 @@ impl Handler {
             DirHandle {
                 inode: inode.inode,
                 cursors: BTreeMap::new(),
+                entries,
             },
         );
         Ok(fh)
@@ -1157,19 +1221,25 @@ impl Handler {
         mut handle_entry: impl FnMut(&mut Self, &OsStr, &DirectoryEntry, i64) -> BkfsResult<bool>,
     ) -> BkfsResult<bool> {
         let inode = self.load_inode(inode)?;
-        let Some(handle) = self.open_dirs.get_mut(&fh) else {
-            return BkfsResult::errno(libc::EACCES); // opened without read perm
-        };
-        let FileData::Directory(dir) = inode.attrs.contents else {
+        if !inode.attrs.contents.is_dir() {
             return BkfsResult::errno(libc::ENOTDIR);
+        }
+        // Take the cursor + an O(1) clone of the opendir snapshot, then drop
+        // the handle borrow so handle_entry can take &mut self in the loop.
+        let (mut cur, entries) = {
+            let Some(handle) = self.open_dirs.get_mut(&fh) else {
+                return BkfsResult::errno(libc::EACCES); // opened without read perm
+            };
+            (
+                handle.cursors.remove(&offset).map(Cow::Owned),
+                handle.entries.clone(),
+            )
         };
-
-        let mut cur = handle.cursors.remove(&offset).map(Cow::Owned);
 
         let mut range = if let Some(cursor) = cur.as_deref() {
-            dir.range::<_, OsStr>((Bound::Excluded(cursor), Bound::Unbounded))
+            entries.range::<_, OsStr>((Bound::Excluded(cursor), Bound::Unbounded))
         } else {
-            dir.range::<_, OsStr>(..)
+            entries.range::<_, OsStr>(..)
         };
 
         let self_entry = DirectoryEntry {

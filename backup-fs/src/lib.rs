@@ -657,7 +657,7 @@ impl Filesystem for BackupFS {
             FileHandleId(fh),
             offset,
             |handler, name, entry, offset| {
-                handler.mutate_inode(entry.inode, |_, inode| {
+                match handler.mutate_inode(entry.inode, |_, inode| {
                     Ok(reply.add(
                         inode.inode.0,
                         offset,
@@ -666,7 +666,14 @@ impl Filesystem for BackupFS {
                         &(&*inode).into(),
                         0,
                     ))
-                })
+                }) {
+                    Ok(full) => Ok(full),
+                    // The opendir snapshot can name a child that was unlinked
+                    // (and gc'd) since: skip the stale entry rather than
+                    // failing the whole listing with EIO.
+                    Err(e) if e.to_errno() == libc::ENOENT => Ok(false),
+                    Err(e) => Err(e),
+                }
             },
         ) {
             Ok(done) => {

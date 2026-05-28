@@ -208,6 +208,33 @@ fn bench_random_write(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_large_dir_create(c: &mut Criterion) {
+    // Creating many files in ONE directory. With directory spilling on
+    // (default), each create rewrites a single bucket — O(1). With
+    // BACKUPFS_DIR_SPILL set huge the listing stays inline and every create
+    // re-serializes the whole growing listing — O(n) per create, O(n²)
+    // total — which is the small-file backup bottleneck this fixes.
+    let h = Harness::mount();
+    let n = 8000usize;
+    let counter = std::cell::Cell::new(0u64);
+    let mut group = c.benchmark_group("large_dir_create");
+    group.throughput(Throughput::Elements(n as u64));
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.bench_function("8000_in_one_dir", |b| {
+        b.iter(|| {
+            let k = counter.get();
+            counter.set(k + 1);
+            let dir = h.mnt().join(format!("d{k}"));
+            std::fs::create_dir(&dir).unwrap();
+            for i in 0..n {
+                std::fs::write(dir.join(format!("f{i:05}")), b"x").unwrap();
+            }
+        });
+    });
+    group.finish();
+}
+
 fn bench_incremental_edit(c: &mut Criterion) {
     let h = Harness::mount();
     let path = h.mnt().join("incr.bin");
@@ -250,6 +277,7 @@ criterion_group!(
     bench_sequential_read,
     bench_small_files,
     bench_random_write,
+    bench_large_dir_create,
     bench_incremental_edit,
 );
 criterion_main!(benches);

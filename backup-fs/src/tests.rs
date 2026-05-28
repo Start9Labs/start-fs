@@ -1789,3 +1789,129 @@ fn large_file_spills_and_stays_intact() {
         None,
     );
 }
+
+/// A directory larger than the spill threshold stores its entries in bucket
+/// files (not inline in the inode) yet behaves identically: every entry is
+/// listable, lookup-able, and readable; it survives a remount; unlink
+/// removes exactly one entry; and rm -rf reaps every bucket file.
+#[test_log::test]
+fn large_directory_spills_and_stays_consistent() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    let n = 2500usize; // > the 1024 spill threshold → spills
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let d = mnt.join("big");
+            fs::create_dir(&d).unwrap();
+            for i in 0..n {
+                fs::write(d.join(format!("f{i:05}")), format!("data {i}")).unwrap();
+            }
+            let listed = fs::read_dir(&d).unwrap().count();
+            assert_eq!(listed, n, "readdir of spilled dir missing entries");
+            for i in (0..n).step_by(137) {
+                assert_eq!(
+                    fs::read(d.join(format!("f{i:05}"))).unwrap(),
+                    format!("data {i}").as_bytes()
+                );
+            }
+        },
+        None,
+    );
+
+    // The listing must actually have spilled to bucket files on disk.
+    assert!(
+        data.path().join("dirents").exists()
+            && tree(data.path().join("dirents"), false).unwrap().len() > 1,
+        "expected multiple directory bucket files for a spilled directory"
+    );
+
+    // Remount: everything is still there; unlink half; remainder intact.
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let d = mnt.join("big");
+            assert_eq!(fs::read_dir(&d).unwrap().count(), n);
+            for i in (0..n).step_by(2) {
+                fs::remove_file(d.join(format!("f{i:05}"))).unwrap();
+            }
+            assert_eq!(fs::read_dir(&d).unwrap().count(), n / 2);
+            for i in (1..n).step_by(2) {
+                assert_eq!(
+                    fs::read(d.join(format!("f{i:05}"))).unwrap(),
+                    format!("data {i}").as_bytes()
+                );
+            }
+        },
+        None,
+    );
+
+    // rm -rf the spilled directory; remount shows it gone and no buckets leak.
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| fs::remove_dir_all(mnt.join("big")).unwrap(),
+        None,
+    );
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| assert!(!mnt.join("big").exists(), "spilled dir survived rm -rf"),
+        None,
+    );
+    let leftover = tree(data.path().join("dirents"), false).unwrap_or_default();
+    assert!(leftover.is_empty(), "leftover dir bucket files after rm -rf: {leftover:?}");
+}
+
+/// rename within a spilled directory, across into another directory, and
+/// rename-over-existing — all must keep the entries resolvable and persist.
+#[test_log::test]
+fn spilled_directory_rename_paths() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    let n = 1500usize; // spills
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::create_dir(mnt.join("a")).unwrap();
+            fs::create_dir(mnt.join("b")).unwrap();
+            for i in 0..n {
+                fs::write(mnt.join(format!("a/f{i:05}")), format!("{i}")).unwrap();
+            }
+            // rename within the spilled directory
+            fs::rename(mnt.join("a/f00000"), mnt.join("a/renamed")).unwrap();
+            assert!(!mnt.join("a/f00000").exists());
+            assert_eq!(fs::read(mnt.join("a/renamed")).unwrap(), b"0");
+            // rename across to a small (inline) directory
+            fs::rename(mnt.join("a/f00001"), mnt.join("b/moved")).unwrap();
+            assert!(!mnt.join("a/f00001").exists());
+            assert_eq!(fs::read(mnt.join("b/moved")).unwrap(), b"1");
+            // rename-over-existing within the spilled directory
+            fs::write(mnt.join("a/target"), b"old").unwrap();
+            fs::rename(mnt.join("a/f00002"), mnt.join("a/target")).unwrap();
+            assert!(!mnt.join("a/f00002").exists());
+            assert_eq!(fs::read(mnt.join("a/target")).unwrap(), b"2");
+        },
+        None,
+    );
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            assert_eq!(fs::read(mnt.join("a/renamed")).unwrap(), b"0");
+            assert_eq!(fs::read(mnt.join("b/moved")).unwrap(), b"1");
+            assert_eq!(fs::read(mnt.join("a/target")).unwrap(), b"2");
+            // count: started 1500, moved 2 out (renamed in place keeps count),
+            // overwrote target (net: -2 from a, +target). renamed: f00000->renamed,
+            // f00001 moved out, f00002 -> target (overwrote a new 'target').
+            // a has: 1500 - 1(f00001 moved) = 1499 names still (renamed counts as 1, target counts as 1, f00002 gone but target existed).
+            // Simpler: just assert the three probes above; exact count is fiddly.
+            assert!(!mnt.join("a/f00001").exists());
+        },
+        None,
+    );
+}

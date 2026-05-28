@@ -131,7 +131,7 @@ impl InodeAttributes {
         }
     }
 
-    pub fn lookup(&self, name: &OsStr) -> BkfsResult<Inode> {
+    pub fn lookup(&self, ctrl: &Controller, name: &OsStr) -> BkfsResult<Inode> {
         let FileData::Directory(dir) = &self.attrs.contents else {
             return BkfsResult::errno(libc::ENOTDIR);
         };
@@ -147,8 +147,8 @@ impl InodeAttributes {
                 .unwrap_or(self.inode));
         }
 
-        match dir.get(name) {
-            Some(inode) => Ok(inode.inode),
+        match dir.get(ctrl, self.inode, name)? {
+            Some(entry) => Ok(entry.inode),
             None => BkfsResult::errno_notrace(libc::ENOENT),
         }
     }

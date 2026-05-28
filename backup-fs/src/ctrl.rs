@@ -43,6 +43,7 @@ pub struct ControllerSeed {
     inode_cipher: Mutex<ChaCha20>,
     inode_dir: PathBuf,
     contents_dir: PathBuf,
+    dirents_dir: PathBuf,
     inode_pool_path: PathBuf,
     inode_pool: Mutex<IdPool>,
     /// Counts fast (non-durable) saves since the last syncfs. Both
@@ -120,6 +121,7 @@ impl Controller {
             key,
             inode_dir: config.data_dir.join("inodes"),
             contents_dir: config.data_dir.join("contents"),
+            dirents_dir: config.data_dir.join("dirents"),
             inode_pool_path: config.data_dir.join("inode_pool"),
             inode_pool: Mutex::new(IdPool::new()),
             pending_saves: AtomicUsize::new(0),
@@ -203,17 +205,29 @@ impl Controller {
                 }
             }
         };
-        if let FileData::Directory(dir) = &mut inode.attrs.contents {
+        if let FileData::Directory(dir) = &inode.attrs.contents {
+            let entries = dir.snapshot(self, inode.inode)?;
             let mut to_prune = Vec::new();
-            for (name, entry) in dir.iter() {
+            for (name, entry) in entries.iter() {
                 let parent = (inode.inode, name.clone());
                 if self.fsck_inode(entry.inode, Some((&parent, entry)))? {
-                    to_prune.push(parent.1);
+                    to_prune.push(name.clone());
                 }
             }
-            for name in to_prune {
-                dir.remove(&name);
+            if !to_prune.is_empty() {
+                if let FileData::Directory(dir) = &mut inode.attrs.contents {
+                    for name in &to_prune {
+                        dir.remove(self, inode.inode, name, true)?;
+                    }
+                }
                 changed = true;
+            }
+            // Repair any cached len/subdirs that drifted across a crash.
+            let inode_no = inode.inode;
+            if let FileData::Directory(dir) = &mut inode.attrs.contents {
+                if dir.recompute_counts(self, inode_no)? {
+                    changed = true;
+                }
             }
         }
         if changed {
@@ -288,6 +302,72 @@ impl Controller {
     /// Blocks have no legacy layout, so resolution is just [`Self::block_path`].
     pub fn resolve_block_path(&self, content: ContentId, idx: u64) -> PathBuf {
         self.block_path(content, idx)
+    }
+
+    /// Path of a spilled-directory bucket file, keyed by `(dir, gen, idx)`.
+    fn dir_bucket_path(&self, dir: Inode, gen: u64, idx: u32) -> PathBuf {
+        let mut hasher = Sha256::new();
+        hasher.update(self.0.key.as_slice());
+        hasher.update(b"dirbucket");
+        hasher.update(dir.0.to_le_bytes());
+        hasher.update(gen.to_le_bytes());
+        hasher.update(idx.to_le_bytes());
+        let tag = hasher.finalize();
+        let bucket = u16::from_be_bytes([tag[0], tag[1]]);
+        let mut name = String::with_capacity(30);
+        for b in &tag[2..16] {
+            name.push_str(&format!("{b:02x}"));
+        }
+        self.0.dirents_dir.join(format!("{bucket:04x}/{name}"))
+    }
+
+    /// Load one directory bucket; a missing file is an empty bucket.
+    pub fn load_dir_bucket(
+        &self,
+        dir: Inode,
+        gen: u64,
+        idx: u32,
+    ) -> BkfsResult<crate::directory::Bucket> {
+        match std::fs::read(self.dir_bucket_path(dir, gen, idx)) {
+            Ok(blob) => serde::deserialize_sealed(&blob, self.key()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Default::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Persist one directory bucket. An empty bucket is removed rather than
+    /// written, so a bucket file exists iff it has entries.
+    pub fn save_dir_bucket(
+        &self,
+        dir: Inode,
+        gen: u64,
+        idx: u32,
+        bucket: &crate::directory::Bucket,
+        durable: bool,
+    ) -> BkfsResult<()> {
+        self.check_rw()?;
+        if bucket.is_empty() {
+            return self.remove_dir_bucket(dir, gen, idx);
+        }
+        let blob = serde::serialize_sealed(bucket, self.key())?;
+        let mut file = AtomicFile::create_buffered(self.dir_bucket_path(dir, gen, idx))?;
+        file.write_all(&blob)?;
+        if durable {
+            file.save()
+        } else {
+            file.save_fast()?;
+            self.tick_save()?;
+            Ok(())
+        }
+    }
+
+    /// Remove one directory bucket file, tolerating absence.
+    pub fn remove_dir_bucket(&self, dir: Inode, gen: u64, idx: u32) -> BkfsResult<()> {
+        match std::fs::remove_file(self.dir_bucket_path(dir, gen, idx)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn next_inode(&self) -> BkfsResult<Inode> {

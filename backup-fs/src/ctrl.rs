@@ -11,13 +11,14 @@ use chacha20::{ChaCha20, Key};
 use fuser::{FileType, FUSE_ROOT_ID};
 use log::error;
 use rand::Rng;
+use sha2::{Digest, Sha256};
+use std::io::Write;
 
 use crate::atomic_file::AtomicFile;
-use crate::contents::EncryptedFile;
 use crate::directory::{DirectoryContents, DirectoryEntry};
 use crate::error::{BkfsError, BkfsResult, BkfsResultExt};
 use crate::inode::{ContentId, FileData, Inode, InodeAttributes};
-use crate::serde::{load, save};
+use crate::serde;
 use crate::util::IdPool;
 use crate::{BackupFSOptions, CryptInfo};
 
@@ -40,7 +41,6 @@ pub struct ControllerSeed {
     cryptinfo: CryptInfo,
     key: Key,
     inode_cipher: Mutex<ChaCha20>,
-    contents_cipher: Mutex<ChaCha20>,
     inode_dir: PathBuf,
     contents_dir: PathBuf,
     inode_pool_path: PathBuf,
@@ -115,10 +115,8 @@ impl Controller {
         };
         let key = Key::clone_from_slice(&*cryptinfo.key);
         let inode_iv = Iv::<ChaCha20>::clone_from_slice(&cryptinfo.inode_iv);
-        let contents_iv = Iv::<ChaCha20>::clone_from_slice(&cryptinfo.inode_iv);
         Ok(Self(Arc::new(ControllerSeed {
             inode_cipher: Mutex::new(ChaCha20::new(&key, &inode_iv)),
-            contents_cipher: Mutex::new(ChaCha20::new(&key, &contents_iv)),
             key,
             inode_dir: config.data_dir.join("inodes"),
             contents_dir: config.data_dir.join("contents"),
@@ -134,10 +132,9 @@ impl Controller {
 
     pub fn load_inode_pool(&self) -> BkfsResult<()> {
         if self.0.inode_pool_path.exists() {
-            match crate::open_direct(&self.0.inode_pool_path, false)
+            match std::fs::read(&self.0.inode_pool_path)
                 .map_err(BkfsError::from)
-                .and_then(|f| EncryptedFile::open(f, &self.key()))
-                .and_then(load)
+                .and_then(|blob| serde::deserialize_sealed::<IdPool>(&blob, self.key()))
             {
                 Ok(pool) => {
                     *self.0.inode_pool.lock().unwrap() = pool;
@@ -253,13 +250,6 @@ impl Controller {
         current_path(&self.0.inode_dir, encrypted)
     }
 
-    /// Returns the current (2-level) path for writing. Cleans up legacy (5-level) copy.
-    pub fn contents_path(&self, contents: ContentId) -> PathBuf {
-        let encrypted = encrypt_u64(&self.0.contents_cipher, contents.0);
-        self.cleanup_legacy(&self.0.contents_dir, encrypted);
-        current_path(&self.0.contents_dir, encrypted)
-    }
-
     fn cleanup_legacy(&self, base: &PathBuf, encrypted: [u8; 8]) {
         let legacy = legacy_path(base, encrypted);
         if legacy.exists() {
@@ -274,11 +264,32 @@ impl Controller {
         )
     }
 
-    pub fn resolve_contents_path(&self, contents: ContentId) -> PathBuf {
-        resolve_path(
-            &self.0.contents_dir,
-            encrypt_u64(&self.0.contents_cipher, contents.0),
-        )
+    /// Deterministic, key-dependent filename for content block
+    /// `(content, idx)`. The name is a keyed SHA-256 hash, so it leaks no
+    /// information about the inode or offset, yet is stable across runs —
+    /// editing one region of a file rewrites exactly one block file and
+    /// every other block keeps its name (the property that makes
+    /// rsync/rclone incremental copies cheap).
+    pub fn block_path(&self, content: ContentId, idx: u64) -> PathBuf {
+        let mut hasher = Sha256::new();
+        hasher.update(self.0.key.as_slice());
+        hasher.update(b"block");
+        hasher.update(content.0.to_le_bytes());
+        hasher.update(idx.to_le_bytes());
+        let tag = hasher.finalize();
+        // 2-level layout: 16-bit bucket (≤65 536 dirs) + 120-bit filename.
+        // A 128-bit name makes collisions cryptographically negligible.
+        let dir = u16::from_be_bytes([tag[0], tag[1]]);
+        let mut name = String::with_capacity(30);
+        for b in &tag[2..16] {
+            name.push_str(&format!("{b:02x}"));
+        }
+        self.0.contents_dir.join(format!("{dir:04x}/{name}"))
+    }
+
+    /// Blocks have no legacy layout, so resolution is just [`Self::block_path`].
+    pub fn resolve_block_path(&self, content: ContentId, idx: u64) -> PathBuf {
+        self.block_path(content, idx)
     }
 
     pub fn next_inode(&self) -> BkfsResult<Inode> {
@@ -288,15 +299,10 @@ impl Controller {
             .next()
             .ok_or(libc::EMFILE)
             .map_err(io::Error::from_raw_os_error)?;
-        save(
-            &*pool,
-            EncryptedFile::create(
-                crate::aligned_io::BufferedDirectFile::new(
-                    AtomicFile::create(self.0.inode_pool_path.clone())?,
-                )?,
-                self.key(),
-            )?,
-        )?;
+        let blob = serde::serialize_sealed(&*pool, self.key())?;
+        let mut file = AtomicFile::create_buffered(self.0.inode_pool_path.clone())?;
+        file.write_all(&blob)?;
+        file.save()?;
         Ok(Inode(res))
     }
 

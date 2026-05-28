@@ -1424,3 +1424,260 @@ fn rename_over_existing_across_remount() {
         None,
     );
 }
+
+// ── Redesign coverage: block store, ECC, device nodes ──────────────
+
+use crate::ctrl::Controller;
+use crate::inode::{ContentId, Inode};
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::FileTypeExt;
+
+fn opts(data: &Path, password: &str) -> BackupFSOptions {
+    BackupFSOptions {
+        data_dir: data.to_owned(),
+        setuid_support: false,
+        password: password.to_owned(),
+        file_size_padding: None,
+        readonly: false,
+        idmapped_root: vec![],
+    }
+}
+
+/// Mount, run `f` to obtain a value, unmount, return it. Used to capture
+/// an inode number from inside a session (the FS is only readable while
+/// mounted).
+fn capture<T: Send + 'static>(
+    data: &Path,
+    password: &str,
+    f: impl FnOnce(&Path) -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = oneshot::channel::<T>();
+    let data_path = data.to_owned();
+    let password = password.to_owned();
+    std::thread::spawn(move || {
+        with_backupfs(
+            &data_path,
+            password,
+            move |mnt| {
+                let _ = tx.send(f(mnt));
+            },
+            None,
+        );
+    })
+    .join()
+    .unwrap();
+    rx.recv().unwrap()
+}
+
+fn sha256_file(path: &Path) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(fs::read(path).unwrap()).to_vec()
+}
+
+/// A FIFO created through the mount must round-trip its file type across a
+/// remount — exercises mknod(S_IFIFO) end to end (no privilege needed,
+/// unlike char/block devices).
+#[test_log::test]
+fn mkfifo_persists_across_remount() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let p = mnt.join("pipe");
+            let c = CString::new(p.as_os_str().as_bytes()).unwrap();
+            let r = unsafe { libc::mkfifo(c.as_ptr(), 0o644) };
+            assert_eq!(r, 0, "mkfifo failed: {}", io::Error::last_os_error());
+            assert!(
+                fs::symlink_metadata(&p).unwrap().file_type().is_fifo(),
+                "created node is not a FIFO"
+            );
+        },
+        None,
+    );
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            assert!(
+                fs::symlink_metadata(mnt.join("pipe"))
+                    .unwrap()
+                    .file_type()
+                    .is_fifo(),
+                "FIFO type was not preserved across remount"
+            );
+        },
+        None,
+    );
+}
+
+/// Unit-level check that the device-number attribute round-trips through
+/// the inode model and surfaces in `FileAttr.rdev` with the right type.
+#[test_log::test]
+fn char_device_rdev_roundtrip() {
+    use crate::inode::{FileData, InodeAttributes};
+    let rdev = 0x0103; // e.g. /dev/null-ish major:minor
+    let attrs = InodeAttributes::new(Inode(42), None, FileData::CharDevice(rdev));
+    let fa: fuser::FileAttr = (&attrs).into();
+    assert_eq!(fa.rdev, rdev);
+    assert_eq!(fa.kind, fuser::FileType::CharDevice);
+    assert_eq!(fa.rdev, attrs.attrs.contents.rdev());
+}
+
+/// Corrupting bytes inside one block file on disk (simulating bit rot)
+/// must be transparently repaired by the per-block Reed-Solomon parity:
+/// the file still reads back byte-for-byte.
+#[test_log::test]
+fn ecc_recovers_corrupted_block() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    let size = 60_000usize; // single block, multi-shard payload
+    let mut payload = vec![0u8; size];
+    pattern_fill(0, &mut payload);
+    let payload2 = payload.clone();
+
+    let ino = capture(data.path(), "ohea", move |mnt| {
+        fs::write(mnt.join("data"), &payload2).unwrap();
+        fs::metadata(mnt.join("data")).unwrap().ino()
+    });
+
+    // Locate the block file and flip a small contiguous run of bytes at
+    // the very start of the shard region — damages a single shard, well
+    // within the parity budget.
+    let ctrl = Controller::new(opts(data.path(), "ohea")).unwrap();
+    let block = ctrl.resolve_block_path(ContentId(ino), 0);
+    drop(ctrl);
+    assert!(block.exists(), "expected block file at {block:?}");
+    let mut bytes = fs::read(&block).unwrap();
+    let start = 28 + 4; // skip header + first shard's CRC → corrupt shard data
+    for b in &mut bytes[start..start + 16] {
+        *b ^= 0xFF;
+    }
+    fs::write(&block, &bytes).unwrap();
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let got = fs::read(mnt.join("data")).unwrap();
+            assert_eq!(got.len(), size);
+            pattern_check(0, &got);
+        },
+        None,
+    );
+}
+
+/// Overwriting a small region of a multi-block file must rewrite only the
+/// affected block file and leave the others byte-for-byte identical on
+/// disk — the property that makes rsync/rclone incremental copies cheap.
+#[test_log::test]
+fn incremental_overwrite_touches_one_block() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    let size = 3 * 1024 * 1024usize; // exactly 3 blocks
+    let mut payload = vec![0u8; size];
+    pattern_fill(0, &mut payload);
+    let payload2 = payload.clone();
+
+    let ino = capture(data.path(), "ohea", move |mnt| {
+        fs::write(mnt.join("big"), &payload2).unwrap();
+        fs::metadata(mnt.join("big")).unwrap().ino()
+    });
+
+    let ctrl = Controller::new(opts(data.path(), "ohea")).unwrap();
+    let paths: Vec<_> = (0..3)
+        .map(|i| ctrl.resolve_block_path(ContentId(ino), i))
+        .collect();
+    drop(ctrl);
+    for p in &paths {
+        assert!(p.exists(), "missing block file {p:?}");
+    }
+    let before: Vec<_> = paths.iter().map(|p| sha256_file(p)).collect();
+
+    // Overwrite 100 bytes inside block 1 only.
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .open(mnt.join("big"))
+                .unwrap();
+            f.seek(SeekFrom::Start(CHUNK_OFFSET + 4096)).unwrap();
+            f.write_all(&[0xABu8; 100]).unwrap();
+        },
+        None,
+    );
+
+    let after: Vec<_> = paths.iter().map(|p| sha256_file(p)).collect();
+    assert_eq!(before[0], after[0], "block 0 was rewritten unnecessarily");
+    assert_ne!(before[1], after[1], "block 1 should have changed");
+    assert_eq!(before[2], after[2], "block 2 was rewritten unnecessarily");
+
+    // And the edit is correct on read-back.
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let got = fs::read(mnt.join("big")).unwrap();
+            pattern_check(0, &got[..(CHUNK_OFFSET as usize + 4096)]);
+            assert_eq!(&got[CHUNK_OFFSET as usize + 4096..][..100], &[0xABu8; 100]);
+            pattern_check(
+                CHUNK_OFFSET + 4096 + 100,
+                &got[CHUNK_OFFSET as usize + 4096 + 100..],
+            );
+        },
+        None,
+    );
+}
+
+const CHUNK_OFFSET: u64 = 1024 * 1024; // one CHUNK_SIZE
+
+/// A sparse file (size set, middle written) stores only the touched
+/// blocks: holes occupy no block files on disk and read back as zeros.
+#[test_log::test]
+fn sparse_file_omits_hole_blocks() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    let total = 3 * 1024 * 1024u64;
+
+    let ino = capture(data.path(), "ohea", move |mnt| {
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(mnt.join("sparse"))
+            .unwrap();
+        f.set_len(total).unwrap();
+        // Write only into block 2.
+        let mut f = f;
+        f.seek(SeekFrom::Start(2 * CHUNK_OFFSET + 123)).unwrap();
+        f.write_all(b"hello sparse world").unwrap();
+        fs::metadata(mnt.join("sparse")).unwrap().ino()
+    });
+
+    let ctrl = Controller::new(opts(data.path(), "ohea")).unwrap();
+    assert!(
+        !ctrl.resolve_block_path(ContentId(ino), 0).exists(),
+        "hole block 0 should not exist on disk"
+    );
+    assert!(
+        !ctrl.resolve_block_path(ContentId(ino), 1).exists(),
+        "hole block 1 should not exist on disk"
+    );
+    assert!(
+        ctrl.resolve_block_path(ContentId(ino), 2).exists(),
+        "written block 2 should exist on disk"
+    );
+    drop(ctrl);
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let got = fs::read(mnt.join("sparse")).unwrap();
+            assert_eq!(got.len() as u64, total);
+            assert!(got[..2 * CHUNK_OFFSET as usize].iter().all(|&b| b == 0));
+            assert_eq!(&got[2 * CHUNK_OFFSET as usize + 123..][..18], b"hello sparse world");
+        },
+        None,
+    );
+}

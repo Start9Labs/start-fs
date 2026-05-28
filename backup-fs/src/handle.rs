@@ -612,17 +612,23 @@ impl Handler {
         name: &OsStr,
         mut mode: u32,
         umask: u32,
-        _rdev: u32,
+        rdev: u32,
         contents: Option<F>,
     ) -> BkfsResult<InodeAttributes> {
         let file_type = mode & libc::S_IFMT as u32;
 
-        if file_type != libc::S_IFREG as u32
-            && file_type != libc::S_IFLNK as u32
-            && file_type != libc::S_IFDIR as u32
+        if ![
+            libc::S_IFREG,
+            libc::S_IFLNK,
+            libc::S_IFDIR,
+            libc::S_IFCHR,
+            libc::S_IFBLK,
+            libc::S_IFIFO,
+            libc::S_IFSOCK,
+        ]
+        .contains(&(file_type as _))
         {
-            // TODO
-            warn!("mknod() implementation is incomplete. Only supports regular files, symlinks, and directories. Got {:o}", mode);
+            warn!("mknod() called with unsupported file type {:o}", mode);
             return BkfsResult::errno(libc::ENOSYS);
         }
 
@@ -662,6 +668,14 @@ impl Handler {
                 FileData::Symlink(PathBuf::new())
             } else if mode == libc::S_IFDIR as u32 {
                 FileData::Directory(DirectoryContents::new())
+            } else if mode == libc::S_IFCHR as u32 {
+                FileData::CharDevice(rdev)
+            } else if mode == libc::S_IFBLK as u32 {
+                FileData::BlockDevice(rdev)
+            } else if mode == libc::S_IFIFO as u32 {
+                FileData::Fifo
+            } else if mode == libc::S_IFSOCK as u32 {
+                FileData::Socket
             } else {
                 return BkfsResult::errno(libc::ENOSYS);
             }
@@ -726,10 +740,7 @@ impl Handler {
             Err(e) => return Err(e.into()),
         }
         if let FileData::File(contents) = inode.attrs.contents {
-            let path = self.ctrl().resolve_contents_path(contents);
-            if path.exists() {
-                std::fs::remove_file(path)?;
-            }
+            crate::blockstore::remove_all_blocks(self.ctrl(), contents, inode.attrs.size)?;
         }
 
         Ok(true)

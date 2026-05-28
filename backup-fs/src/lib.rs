@@ -25,7 +25,6 @@ use typenum::ToInt;
 use zeroize::Zeroizing;
 
 use crate::atomic_file::AtomicFile;
-use crate::contents::EncryptedFile;
 use crate::ctrl::{Controller, StatFs};
 use crate::directory::DirectoryContents;
 use crate::error::{BkfsError, BkfsResult};
@@ -33,19 +32,20 @@ use crate::handle::{FileHandleId, Handler};
 use crate::inode::FileData;
 use crate::inode::BLOCK_SIZE;
 use crate::inode::{Inode, InodeAttributes};
-use crate::serde::load;
-use crate::serde::save;
 
 mod aligned_io;
 mod atomic_file;
+mod blockstore;
 mod contents;
 mod ctrl;
 mod directory;
+mod ecc;
 pub mod error;
 mod handle;
 mod inode;
 mod pool;
 mod serde;
+mod vault;
 #[cfg(test)]
 mod tests;
 #[allow(dead_code)]
@@ -141,19 +141,17 @@ impl CryptInfo {
         }
     }
     pub fn load(path: &Path, password: &str) -> BkfsResult<Self> {
-        load(EncryptedFile::open_pbkdf2(
-            aligned_io::BufferedDirectFile::new(File::open(path)?)?,
-            password,
-        )?)
+        let blob = std::fs::read(path)?;
+        let plain = vault::open_pbkdf2(&blob, password)?;
+        Ok(bincode::deserialize(&plain)?)
     }
     pub fn save(&self, path: PathBuf, password: &str) -> BkfsResult<()> {
-        save(
-            self,
-            EncryptedFile::create_pbkdf2(
-                aligned_io::BufferedDirectFile::new(AtomicFile::create(path)?)?,
-                password,
-            )?,
-        )
+        use std::io::Write;
+        let plain = bincode::serialize(self)?;
+        let blob = vault::seal_pbkdf2(&plain, password)?;
+        let mut file = AtomicFile::create_buffered(path)?;
+        file.write_all(&blob)?;
+        file.save()
     }
 }
 

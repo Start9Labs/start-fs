@@ -1,348 +1,39 @@
-use std::backtrace::Backtrace;
-use std::cmp::{max, min};
+//! Per-file content access over the block store.
+//!
+//! [`Contents`] presents a regular file's byte stream on top of the
+//! fixed-size sealed blocks managed by [`crate::blockstore`]. It buffers
+//! dirty blocks in memory and reconciles them to disk on flush, doing
+//! read-modify-write at block granularity so a partial write only ever
+//! rewrites whole blocks — never a sub-region of an existing on-disk file.
+
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::ops::Range;
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
-use std::path::PathBuf;
+use std::io;
 
-use chacha20::cipher::{Iv, KeyIvInit, StreamCipher, StreamCipherSeek};
-use chacha20::{ChaCha20, Key};
-use itertools::Itertools;
-use pbkdf2::hmac::Hmac;
-use pbkdf2::pbkdf2;
 use rand::{rng, RngCore};
-use sha2::Sha256;
-use smallvec::SmallVec;
 
-use crate::aligned_io::BufferedDirectFile;
-use crate::atomic_file::AtomicFile;
+use crate::blockstore::{self, CHUNK_SIZE};
 use crate::ctrl::Controller;
-use crate::error::{BkfsError, BkfsErrorKind, BkfsResult, BkfsResultExt};
+use crate::error::{BkfsResult, BkfsResultExt};
 use crate::handle::Handler;
 use crate::inode::{time_now, ContentId, FileData, Inode, InodeAttributes};
-use crate::open_direct;
-use crate::util::RandReader;
-
-pub struct EncryptedFile<F: Read + Write + Seek + FileExt = BufferedDirectFile<File>> {
-    file: F,
-    offset: u64,
-    cipher: ChaCha20,
-}
-impl<F: Read + Write + Seek + FileExt> EncryptedFile<F> {
-    pub fn open(mut file: F, key: &Key) -> BkfsResult<Self> {
-        let mut iv = Iv::<ChaCha20>::default();
-        file.read_exact(iv.as_mut_slice())?;
-        let cipher = ChaCha20::new(key, &iv);
-        Ok(Self {
-            file,
-            offset: iv.len() as u64,
-            cipher,
-        })
-    }
-    pub fn create(mut file: F, key: &Key) -> BkfsResult<Self> {
-        let mut iv = Iv::<ChaCha20>::default();
-        rng().fill_bytes(iv.as_mut_slice());
-        file.write_all(iv.as_slice())?;
-        let cipher = ChaCha20::new(key, &iv);
-        Ok(Self {
-            file,
-            offset: iv.len() as u64,
-            cipher,
-        })
-    }
-    pub fn open_pbkdf2(mut file: F, password: &str) -> BkfsResult<Self> {
-        let mut iv = Iv::<ChaCha20>::default();
-        file.read_exact(iv.as_mut_slice())?;
-        let mut key = Key::default();
-        pbkdf2::<Hmac<Sha256>>(
-            password.as_bytes(),
-            iv.as_slice(),
-            600_000,
-            key.as_mut_slice(),
-        )
-        .map_err(|_| BkfsError {
-            kind: crate::error::BkfsErrorKind::BadCrypt,
-            backtrace: Some(Box::new(Backtrace::capture())),
-        })?;
-        let cipher = ChaCha20::new(&key, &iv);
-        Ok(Self {
-            file,
-            offset: iv.len() as u64,
-            cipher,
-        })
-    }
-    pub fn create_pbkdf2(mut file: F, password: &str) -> BkfsResult<Self> {
-        let mut iv = Iv::<ChaCha20>::default();
-        rng().fill_bytes(iv.as_mut_slice());
-        let mut key = Key::default();
-        pbkdf2::<Hmac<Sha256>>(
-            password.as_bytes(),
-            iv.as_slice(),
-            600_000,
-            key.as_mut_slice(),
-        )
-        .map_err(|_| BkfsError {
-            kind: crate::error::BkfsErrorKind::BadCrypt,
-            backtrace: Some(Box::new(Backtrace::capture())),
-        })?;
-        file.write_all(iv.as_slice())?;
-        let cipher = ChaCha20::new(&key, &iv);
-        Ok(Self {
-            file,
-            offset: iv.len() as u64,
-            cipher,
-        })
-    }
-    pub fn read_exact_at(&mut self, mut buf: &mut [u8], mut offset: u64) -> BkfsResult<()> {
-        while !buf.is_empty() {
-            let len = match self.file.read_at(buf, offset + self.offset) {
-                Ok(n) => n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e.into()),
-            };
-            if len == 0 {
-                break;
-            }
-            self.cipher.seek(offset);
-            self.cipher.apply_keystream(&mut buf[..len]);
-            buf = &mut buf[len..];
-            offset += len as u64;
-        }
-        if !buf.is_empty() {
-            buf.fill(0);
-        }
-        Ok(())
-    }
-    pub fn write_all_at(&mut self, buf: &mut [u8], offset: u64) -> BkfsResult<()> {
-        self.cipher.seek(offset);
-        self.cipher.apply_keystream(buf);
-        self.file.seek(SeekFrom::Start(offset + self.offset))?;
-        self.file.write_all(buf)?;
-        Ok(())
-    }
-}
-impl EncryptedFile<BufferedDirectFile<AtomicFile>> {
-    pub fn save(self) -> BkfsResult<()> {
-        self.file.save()
-    }
-    pub fn save_fast(self) -> BkfsResult<()> {
-        self.file.save_fast()
-    }
-}
-impl EncryptedFile<AtomicFile> {
-    pub fn save(self) -> BkfsResult<()> {
-        self.file.save()
-    }
-    pub fn save_fast(self) -> BkfsResult<()> {
-        self.file.save_fast()
-    }
-}
-impl<F: Read + Write + Seek + FileExt> Read for EncryptedFile<F> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let pos = self.file.stream_position()?;
-        let n = self.file.read(buf)?;
-        self.cipher.seek(pos - self.offset);
-        self.cipher.apply_keystream(&mut buf[..n]);
-        Ok(n)
-    }
-}
-impl<F: Read + Write + Seek + FileExt> Seek for EncryptedFile<F> {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        match pos {
-            SeekFrom::Start(n) => self.file.seek(SeekFrom::Start(n + self.offset)),
-            s => self.file.seek(s),
-        }
-        .map(|s| s - self.offset)
-    }
-}
-impl<F: Read + Write + Seek + FileExt> Write for EncryptedFile<F> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut write_buf = buf.to_vec();
-        let pos = self.file.stream_position()?;
-        self.cipher.seek(pos - self.offset);
-        self.cipher.apply_keystream(&mut write_buf);
-        self.file.write(&write_buf)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
-    }
-}
-
-pub struct MergedFile {
-    src: EncryptedFile,
-    dst: EncryptedFile<BufferedDirectFile<AtomicFile>>,
-    written: BTreeMap<u64, u64>, // position, len
-}
-impl MergedFile {
-    fn new(src: EncryptedFile, dst: PathBuf, key: &Key) -> BkfsResult<Self> {
-        let dst = EncryptedFile::create(
-            BufferedDirectFile::new(AtomicFile::new(
-                dst,
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .truncate(true)
-                    .create(true)
-                    .custom_flags(libc::O_DIRECT),
-            )?)?,
-            key,
-        )?;
-        Ok(Self {
-            src,
-            dst,
-            written: BTreeMap::new(),
-        })
-    }
-    fn read_ranges(
-        &self,
-        pos: u64,
-        len: u64,
-    ) -> (SmallVec<[Range<u64>; 1]>, SmallVec<[Range<u64>; 1]>) {
-        let end = pos + len;
-        let mut src_start = pos;
-        let mut src = SmallVec::new();
-        let mut dst = SmallVec::new();
-
-        if let Some(dst_end) = self
-            .written
-            .range(..pos)
-            .rev()
-            .next()
-            .map(|(p, l)| *p + *l)
-            .filter(|end| *end > pos)
-        {
-            dst.push(pos..dst_end);
-            src_start = dst_end;
-        }
-
-        for (p, l) in self.written.range(pos..end) {
-            if src_start < *p {
-                src.push(src_start..*p);
-            }
-            let dst_end = min(*p + *l, end);
-            dst.push(*p..dst_end);
-            src_start = dst_end;
-        }
-
-        if src_start < end {
-            src.push(src_start..end);
-        }
-
-        (src, dst)
-    }
-    fn add_written(&mut self, pos: u64, len: u64) {
-        let end = pos + len;
-        let to_remove = self
-            .written
-            .range(pos..end)
-            .map(|(p, l)| (*p, *l))
-            .collect_vec();
-        if let Some((p, l)) = self
-            .written
-            .range_mut(..=pos)
-            .rev()
-            .next()
-            .filter(|(p, l)| **p + **l >= pos)
-        {
-            let dst_end = *p + *l;
-            if dst_end > end {
-                return;
-            } else {
-                *l = end - *p;
-                for (np, nl) in &to_remove {
-                    *l = max(*l, *np + *nl - p);
-                }
-            }
-        } else {
-            let mut end = end;
-            for (p, l) in &to_remove {
-                end = max(end, *p + *l);
-            }
-            self.written.insert(pos, end - pos);
-        }
-        for (p, _) in to_remove {
-            self.written.remove(&p);
-        }
-    }
-    fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> BkfsResult<()> {
-        let (src, dst) = self.read_ranges(offset, buf.len() as u64);
-        for range in src {
-            let buf_range = ((range.start - offset) as usize)..((range.end - offset) as usize);
-            self.src.read_exact_at(&mut buf[buf_range], range.start)?;
-        }
-        for range in dst {
-            let buf_range = ((range.start - offset) as usize)..((range.end - offset) as usize);
-            self.dst.read_exact_at(&mut buf[buf_range], range.start)?;
-        }
-        Ok(())
-    }
-    fn write_all_at(&mut self, buf: &mut [u8], offset: u64) -> BkfsResult<()> {
-        self.dst.write_all_at(buf, offset)?;
-        self.add_written(offset, buf.len() as u64);
-        Ok(())
-    }
-    /// Drain `src` into `dst`, truncate to `size`. Leaves the inner
-    /// destination staged but not yet renamed into place.
-    fn finalize(&mut self, size: u64) -> BkfsResult<()> {
-        let mut remaining = size;
-        let mut start = 0_u64;
-        let mut len;
-        for (p, l) in &self.written {
-            if start < *p {
-                len = min(*p - start, remaining);
-                self.src.seek(SeekFrom::Start(start))?;
-                self.dst.seek(SeekFrom::Start(start))?;
-                io::copy(
-                    &mut ((&mut self.src).chain(io::repeat(0)).take(len)),
-                    &mut self.dst,
-                )?;
-            }
-            start = *p + *l;
-            if start >= size {
-                break;
-            }
-            remaining = size - start;
-        }
-        if start < size {
-            len = size - start;
-            self.src.seek(SeekFrom::Start(start))?;
-            self.dst.seek(SeekFrom::Start(start))?;
-            io::copy(
-                &mut ((&mut self.src)
-                    .chain(RandReader::new_crypto(rng())) // pad with randomness
-                    .take(len)),
-                &mut self.dst,
-            )?;
-        } else if start > size {
-            self.dst.file.set_len(size + self.dst.offset)?;
-        }
-        Ok(())
-    }
-
-    /// Drain and rename without a per-file sync_all. Durability is
-    /// deferred to the caller's batched syncfs — see
-    /// `Controller::tick_save` / `Controller::syncfs`.
-    fn save_fast(mut self, size: u64) -> BkfsResult<()> {
-        self.finalize(size)?;
-        drop(self.src);
-        self.dst.save_fast()?;
-        Ok(())
-    }
-}
 
 pub struct Contents {
     pub inode: InodeAttributes,
     content_id: ContentId,
     pub(crate) changed: bool,
-    file: Option<Result<MergedFile, EncryptedFile>>,
+    /// Blocks with unpersisted modifications: block index → logical bytes
+    /// (length ≤ `CHUNK_SIZE`). A block is loaded here lazily on first
+    /// write that touches it (read-modify-write).
+    dirty: BTreeMap<u64, Vec<u8>>,
+    /// Number of blocks believed to exist on disk. Initialized from the
+    /// inode's size on open and updated on every flush, so flush knows
+    /// which trailing blocks to delete after a shrink/truncate.
+    disk_blocks: u64,
     ctrl: Controller,
 }
 
-// Contents will be owned by an Arc<Mutex<_>> shared with the worker
-// pool — if any field regresses to a !Send type we want to fail the
-// build here rather than at the dispatch site.
+// Contents is owned by an Arc<Mutex<_>> shared with the worker pool — keep
+// the compile-time Send assertion the old design relied on.
 const _: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<Contents>();
@@ -353,113 +44,123 @@ impl Contents {
         let attrs: InodeAttributes = ctrl.load(inode)?;
         Self::from_attrs(ctrl, attrs, false)
     }
-    /// Open with attrs already in hand — e.g. taken from Handler's dirty
-    /// cache. `dirty` carries the unpersisted state forward so Contents::fsync
-    /// will eventually write it.
+
+    /// Open with attrs already in hand — e.g. taken from the Handler's
+    /// dirty cache. `changed` carries unpersisted metadata forward so the
+    /// eventual flush writes it.
     pub fn open_with_attrs(
         ctrl: Controller,
         attrs: InodeAttributes,
-        dirty: bool,
+        changed: bool,
     ) -> BkfsResult<Self> {
-        Self::from_attrs(ctrl, attrs, dirty)
+        Self::from_attrs(ctrl, attrs, changed)
     }
+
     fn from_attrs(ctrl: Controller, inode: InodeAttributes, changed: bool) -> BkfsResult<Self> {
         let content_id = match &inode.attrs.contents {
             FileData::File(a) => *a,
             FileData::Directory(_) => return BkfsResult::errno(libc::EISDIR),
             FileData::Symlink(_) => return BkfsResult::errno(libc::EINVAL),
+            _ => return BkfsResult::errno(libc::EINVAL),
         };
+        let disk_blocks = blockstore::block_count(inode.attrs.size);
         Ok(Self {
             inode,
             content_id,
             changed,
-            file: None,
+            dirty: BTreeMap::new(),
+            disk_blocks,
             ctrl,
         })
     }
-    fn init_content_file(&self, path: &std::path::Path) -> BkfsResult<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        let mut init = EncryptedFile::create(open_direct(path, true)?, self.ctrl.key())?;
-        init.file.flush()?;
-        Ok(())
-    }
-    pub fn readable(&mut self) -> BkfsResult<&mut Self> {
-        if self.file.is_none() {
-            let path = self.ctrl.resolve_contents_path(self.content_id);
-            self.file = Some(Err(match open_direct(&path, false)
-                .map_err(BkfsError::from)
-                .and_then(|f| EncryptedFile::open(f, self.ctrl.key()))
-            {
-                Ok(f) => f,
-                Err(e)
-                    if matches!(
-                        &e.kind,
-                        BkfsErrorKind::Io(io) if matches!(io.kind(), io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof)
-                    ) =>
-                {
-                    let path = self.ctrl.contents_path(self.content_id);
-                    self.init_content_file(&path)?;
-                    EncryptedFile::open(open_direct(&path, false)?, self.ctrl.key())?
-                }
-                Err(e) => return Err(e),
-            }));
-        }
-        Ok(self)
-    }
-    pub fn writable(&mut self) -> BkfsResult<&mut Self> {
-        self.ctrl.check_rw()?;
-        if self.file.as_ref().map_or(false, |f| f.is_ok()) {
-            return Ok(self);
-        }
-        if let Some(Err(file)) = std::mem::take(&mut self.readable()?.file) {
-            self.file = Some(Ok(MergedFile::new(
-                file,
-                self.ctrl.contents_path(self.content_id),
-                self.ctrl.key(),
-            )?));
-            Ok(self)
+
+    /// Logical valid length of block `idx` given the current file size.
+    fn valid_len(&self, idx: u64) -> usize {
+        let start = idx * CHUNK_SIZE;
+        if start >= self.inode.attrs.size {
+            0
         } else {
-            Ok(self)
+            ((self.inode.attrs.size - start).min(CHUNK_SIZE)) as usize
         }
     }
+
+    /// Fetch a block's current logical bytes from the dirty cache or disk,
+    /// zero-filled to its valid length. Holes (absent on disk) read as
+    /// zeros.
+    fn load_block(&self, idx: u64) -> BkfsResult<Vec<u8>> {
+        if let Some(buf) = self.dirty.get(&idx) {
+            return Ok(buf.clone());
+        }
+        let valid = self.valid_len(idx);
+        let mut buf = blockstore::read_block(&self.ctrl, self.content_id, idx)?.unwrap_or_default();
+        if buf.len() < valid {
+            buf.resize(valid, 0);
+        }
+        Ok(buf)
+    }
+
     pub fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> BkfsResult<()> {
-        if offset + buf.len() as u64 > self.inode.attrs.size {
+        let end = offset + buf.len() as u64;
+        if end > self.inode.attrs.size {
             return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
         }
-        match self
-            .readable()?
-            .file
-            .as_mut()
-            .unwrap_or_else(|| unreachable!("file is uninitialized"))
-        {
-            Err(file) => file.read_exact_at(buf, offset)?,
-            Ok(file) => file.read_exact_at(buf, offset)?,
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let pos = offset + filled as u64;
+            let (idx, within) = blockstore::locate(pos);
+            let block = self.load_block(idx)?;
+            let take = (buf.len() - filled).min(CHUNK_SIZE as usize - within);
+            let dst = &mut buf[filled..filled + take];
+            let avail = block.len().saturating_sub(within);
+            let copy = take.min(avail);
+            dst[..copy].copy_from_slice(&block[within..within + copy]);
+            // Bytes past the block's stored length are holes → already
+            // zeroed in `dst` (buffers arrive zeroed from the read path).
+            for b in &mut dst[copy..] {
+                *b = 0;
+            }
+            filled += take;
         }
         self.inode.attrs.atime = time_now();
         self.changed = true;
         Ok(())
     }
-    pub fn write_all_at(&mut self, buf: &mut [u8], offset: u64) -> BkfsResult<()> {
-        let this = self.writable()?;
-        let file = this
-            .file
-            .as_mut()
-            .unwrap_or_else(|| unreachable!("file is uninitialized"))
-            .as_mut()
-            .unwrap_or_else(|_| unreachable!("file is readonly"));
-        file.write_all_at(buf, offset)?;
+
+    pub fn write_all_at(&mut self, buf: &[u8], offset: u64) -> BkfsResult<()> {
+        self.ctrl.check_rw()?;
         let end = offset + buf.len() as u64;
-        this.inode.attrs.modified();
-        if end > this.inode.attrs.size {
-            this.inode.attrs.size = end;
+        let mut written = 0usize;
+        while written < buf.len() {
+            let pos = offset + written as u64;
+            let (idx, within) = blockstore::locate(pos);
+            let take = (buf.len() - written).min(CHUNK_SIZE as usize - within);
+            // Read-modify-write: pull the existing block (or a hole) into
+            // the dirty cache, then overlay the new bytes.
+            let mut block = match self.dirty.remove(&idx) {
+                Some(b) => b,
+                None => {
+                    let valid = self.valid_len(idx);
+                    let mut b =
+                        blockstore::read_block(&self.ctrl, self.content_id, idx)?.unwrap_or_default();
+                    b.truncate(valid);
+                    b
+                }
+            };
+            if block.len() < within + take {
+                block.resize(within + take, 0);
+            }
+            block[within..within + take].copy_from_slice(&buf[written..written + take]);
+            self.dirty.insert(idx, block);
+            written += take;
+        }
+        self.inode.attrs.modified();
+        if end > self.inode.attrs.size {
+            self.inode.attrs.size = end;
         }
         self.changed = true;
         Ok(())
     }
+
     pub fn fallocate(
         &mut self,
         offset: u64,
@@ -467,45 +168,43 @@ impl Contents {
         mode: i32,
         keep_size: bool,
     ) -> BkfsResult<()> {
-        let this = self.writable()?;
-        let file = this
-            .file
-            .as_mut()
-            .unwrap_or_else(|| unreachable!("file is uninitialized"))
-            .as_mut()
-            .unwrap_or_else(|_| unreachable!("file is readonly"));
-        let fd = file.dst.file.as_raw_fd();
-        let res = unsafe { libc::fallocate64(fd, mode, offset as i64, length as i64) };
-        if res != 0 {
-            return Err(io::Error::from_raw_os_error(res).into());
+        self.ctrl.check_rw()?;
+        let punch = mode & (libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_ZERO_RANGE) != 0;
+        if punch {
+            // Zero the range via read-modify-write. (We zero rather than
+            // delete whole blocks so partial edges stay correct; fully
+            // covered blocks are dropped lazily on the next shrink.)
+            let mut remaining = length;
+            let mut pos = offset;
+            let zeros = vec![0u8; CHUNK_SIZE as usize];
+            while remaining > 0 {
+                let within = (pos % CHUNK_SIZE) as usize;
+                let take = (remaining as usize).min(CHUNK_SIZE as usize - within);
+                // Don't extend the file for a pure hole-punch.
+                if pos < self.inode.attrs.size {
+                    let cap = ((self.inode.attrs.size - pos) as usize).min(take);
+                    self.write_all_at(&zeros[..cap], pos)?;
+                }
+                pos += take as u64;
+                remaining -= take as u64;
+            }
         }
         if !keep_size {
-            let end = offset + length;
-            this.inode.attrs.modified();
-            if end > this.inode.attrs.size {
-                this.inode.attrs.size = end;
+            let new_end = offset + length;
+            if new_end > self.inode.attrs.size {
+                self.inode.attrs.size = new_end;
             }
+            self.inode.attrs.modified();
             self.changed = true;
         }
         Ok(())
     }
-    /// Drain pending writes to disk via the fast path (no per-file
-    /// sync_all). Both the content file and the inode go through a
-    /// batched syncfs — see `Controller::tick_save`. Returns the
-    /// newly-saved inode attrs if a content write happened so the
-    /// caller can route the metadata save appropriately.
+
+    /// Write all dirty blocks (fast path) and prune blocks past EOF, then
+    /// persist the inode (fast). Durability is the caller's batched
+    /// `syncfs` — see `Controller::tick_save`.
     pub fn flush(&mut self) -> BkfsResult<()> {
-        if let Some(Ok(f)) = std::mem::take(&mut self.file) {
-            let size = self.ctrl.file_pad(min(
-                self.inode.attrs.size,
-                max(
-                    f.src.file.metadata()?.len(),
-                    f.written.last_key_value().map_or(0, |(p, l)| *p + *l),
-                ),
-            ));
-            f.save_fast(size)?;
-            self.ctrl.tick_save()?;
-        }
+        self.flush_content_only()?;
         if self.changed {
             self.ctrl.save_fast(&self.inode)?;
             self.ctrl.tick_save()?;
@@ -514,24 +213,58 @@ impl Contents {
         Ok(())
     }
 
-    /// User-requested fsync: flush then syncfs. Forces everything
-    /// accumulated across all fast saves to stable storage, not just
-    /// this file — that's exactly what the kernel documentation
-    /// suggests syncfs is for, and it matches what rsync / cp
-    /// actually need after a large batch.
+    /// Flush content blocks (fast), prune trailing blocks after a shrink,
+    /// but don't persist the inode — the caller routes that itself.
+    fn flush_content_only(&mut self) -> BkfsResult<()> {
+        let required = blockstore::block_count(self.inode.attrs.size);
+        let dirty = std::mem::take(&mut self.dirty);
+        let last = required.saturating_sub(1);
+        for (idx, mut block) in dirty {
+            if idx >= required {
+                // Block lies entirely past the (possibly shrunk) EOF; it
+                // will be removed by the prune loop below.
+                continue;
+            }
+            block.truncate(self.valid_len(idx));
+            if idx == last {
+                self.pad_final_block(&mut block);
+            }
+            blockstore::write_block(&self.ctrl, self.content_id, idx, &block, false)?;
+            self.ctrl.tick_save()?;
+        }
+        // Remove blocks beyond the current size (truncate / shrink).
+        for idx in required..self.disk_blocks {
+            blockstore::remove_block(&self.ctrl, self.content_id, idx)?;
+        }
+        self.disk_blocks = required;
+        Ok(())
+    }
+
+    /// Optionally pad the final block's stored plaintext with random bytes
+    /// to obscure the exact file size (the `--file-size-padding` knob).
+    /// Padding never affects logical reads, which are bounded by the inode
+    /// size.
+    fn pad_final_block(&self, block: &mut Vec<u8>) {
+        let padded = self.ctrl.file_pad(block.len() as u64) as usize;
+        if padded > block.len() {
+            let start = block.len();
+            block.resize(padded, 0);
+            rng().fill_bytes(&mut block[start..]);
+        }
+    }
+
+    /// User-requested fsync: flush everything, then `syncfs` so the whole
+    /// batch reaches stable storage.
     pub fn fsync(&mut self) -> BkfsResult<()> {
         self.flush()?;
         self.ctrl.syncfs()?;
         Ok(())
     }
 
-    pub fn truncate(&mut self, size: u64) {
-        self.inode.attrs.size = size;
-    }
     pub fn close(mut self, handler: &mut Handler) -> BkfsResult<()> {
-        // Write the content file fast, then hand the inode save to the
-        // dirty cache so subsequent setattrs (rsync's post-close
-        // chmod/chown/utime trio) coalesce onto the same disk write.
+        // Write content fast, then hand the inode save to the dirty cache
+        // so rsync's post-close chmod/chown/utime trio coalesces onto a
+        // single disk write.
         self.flush_content_only()?;
         let attrs = self.inode.clone();
         let changed = self.changed;
@@ -540,23 +273,6 @@ impl Contents {
         drop(self);
         if !handler.gc_inode(&attrs)? && changed {
             handler.save_inode(&attrs)?;
-        }
-        Ok(())
-    }
-
-    /// Flush content data (fast path), but don't persist the inode —
-    /// the caller will route that through the dirty cache.
-    fn flush_content_only(&mut self) -> BkfsResult<()> {
-        if let Some(Ok(f)) = std::mem::take(&mut self.file) {
-            let size = self.ctrl.file_pad(min(
-                self.inode.attrs.size,
-                max(
-                    f.src.file.metadata()?.len(),
-                    f.written.last_key_value().map_or(0, |(p, l)| *p + *l),
-                ),
-            ));
-            f.save_fast(size)?;
-            self.ctrl.tick_save()?;
         }
         Ok(())
     }

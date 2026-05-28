@@ -1,8 +1,6 @@
 use std::alloc::{self, Layout};
 use std::cell::RefCell;
-use std::fs::{File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::ops::Deref;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::FileExt;
 use std::ptr;
@@ -600,12 +598,6 @@ impl<F: FileExt + AsRawFd> Seek for BufferedDirectFile<F> {
 
 // ── Type-specific methods ─────────────────────────────
 
-impl BufferedDirectFile<File> {
-    pub fn metadata(&self) -> io::Result<Metadata> {
-        self.file().metadata()
-    }
-}
-
 impl BufferedDirectFile<AtomicFile> {
     pub fn save(mut self) -> BkfsResult<()> {
         self.flush()?;
@@ -619,19 +611,5 @@ impl BufferedDirectFile<AtomicFile> {
     pub fn save_fast(mut self) -> BkfsResult<()> {
         self.flush()?;
         self.file.take().unwrap().save_fast()
-    }
-
-    pub fn set_len(&mut self, size: u64) -> io::Result<()> {
-        let file = self.file.as_ref().unwrap();
-        let state = self.state.get_mut();
-        Self::flush_dirty(state, file)?;
-        // Invalidate — file geometry changed
-        state.base = u64::MAX;
-        state.valid = 0;
-        self.file.as_ref().unwrap().set_len(size)
-    }
-
-    pub fn as_raw_fd(&self) -> RawFd {
-        self.file().deref().as_raw_fd()
     }
 }

@@ -1,0 +1,523 @@
+//! Log-structured object store for inode records.
+//!
+//! Inodes (and, later, the small-file content inlined in them) are stored as
+//! append-only **records** in shared **segment** files under `segments/`,
+//! rather than one file per inode. For a backup of many small files this
+//! turns "one CREATE + one RENAME per inode" into "append to a shared
+//! segment", amortizing the per-object backing-store cost that dominates the
+//! many-small-files workload.
+//!
+//! ## Frame format (self-locating, resync-able)
+//!
+//! ```text
+//!   magic        "BKL1"  (4)            // resync anchor
+//!   header_crc   u32     (4)            // CRC-32 of the 16 header bytes below
+//!   seq          u64     (8)            // global monotonic sequence number
+//!   payload_len  u32     (4)            // length of the sealed payload
+//!   reserved     u32     (4)            // 0
+//!   payload      [u8; payload_len]      // vault::seal(bincode(Record))
+//!   (zero-pad to 8-byte alignment)
+//! ```
+//!
+//! The `magic` + `header_crc` let replay **scan forward to the next valid
+//! header** when a frame is torn/corrupt, instead of truncating the log at
+//! the first bad byte. `seq` (not physical position) is the authority for
+//! "latest record for an inode wins" — so a later compaction stage can
+//! relocate a frame to a new segment/offset while preserving its `seq`.
+//!
+//! Each payload is independently `vault`-sealed (ChaCha20 + SHA-256 tag +
+//! Reed-Solomon ECC), so corruption within one frame is self-healed by its
+//! own parity and never spreads.
+//!
+//! ## Durability & caching
+//!
+//! Segment writes go through the page cache (so a read right after a write
+//! sees the data — "read your writes" — without an O_DIRECT tail buffer),
+//! and [`SegmentLog::sync`] issues `fdatasync` + `posix_fadvise(DONTNEED)` to
+//! make the tail durable and then drop the now-clean pages. Frames are small
+//! and flushed on the batched-syncfs cadence, so dirty metadata stays bounded
+//! — avoiding the CIFS "need-memory-to-flush / need-flush-to-free" trap that
+//! large content writes (still O_DIRECT, see `blockstore`) are the real risk
+//! for.
+//!
+//! ## Crash recovery
+//!
+//! [`SegmentLog::open`] replays every segment, applying records by `seq`
+//! (later wins; `Tombstone` deletes), rebuilding the in-RAM index and the
+//! per-segment live-byte accounting from scratch — never trusting counts
+//! across a crash. A torn tail frame fails its header CRC or `vault::open`
+//! and is skipped via forward-resync.
+
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::Read;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
+use std::path::PathBuf;
+
+use chacha20::Key;
+use serde::{Deserialize, Serialize};
+
+use crate::error::{BkfsError, BkfsResult};
+use crate::inode::{Attributes, Inode};
+use crate::vault;
+
+const MAGIC: [u8; 4] = *b"BKL1";
+const HEADER_LEN: usize = 24; // magic(4) + crc(4) + seq(8) + payload_len(4) + reserved(4)
+const ALIGN: u64 = 8;
+
+/// Default rolled-segment size. Small enough that the active (perpetually
+/// appended) segment stays a modest object for rsync/rclone to re-scan, and
+/// that replay/compaction work in bounded chunks; large enough to amortize
+/// per-segment overhead. Overridable via `BACKUPFS_SEGMENT_SIZE`.
+fn segment_size() -> u64 {
+    use std::sync::OnceLock;
+    static N: OnceLock<u64> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("BACKUPFS_SEGMENT_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&n| n >= 4096)
+            .unwrap_or(8 * 1024 * 1024)
+    })
+}
+
+/// One persisted record. Single-key by design: directory entries live in
+/// their own bucket files (see `directory`) and large content in block files
+/// (see `blockstore`), so the log never needs multi-key atomic records.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Record {
+    Inode { inode: u64, attrs: Attributes },
+    Tombstone { inode: u64 },
+}
+
+/// Physical location of a record's frame within the log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Location {
+    pub segment: u64,
+    pub offset: u64,
+    pub len: u32,
+}
+
+#[derive(Default, Clone, Copy)]
+struct SegMeta {
+    total: u64,
+    live: u64,
+}
+
+/// Padded on-disk size of a frame carrying `payload_len` sealed bytes.
+fn frame_size(payload_len: usize) -> u64 {
+    let raw = HEADER_LEN as u64 + payload_len as u64;
+    raw.div_ceil(ALIGN) * ALIGN
+}
+
+fn encode_frame(seq: u64, payload: &[u8]) -> Vec<u8> {
+    let total = frame_size(payload.len()) as usize;
+    let mut buf = vec![0u8; total];
+    buf[0..4].copy_from_slice(&MAGIC);
+    // header_crc covers seq + payload_len + reserved (the 16 bytes at [8..24])
+    buf[8..16].copy_from_slice(&seq.to_le_bytes());
+    buf[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    // reserved [20..24] stays zero
+    let crc = crc32fast::hash(&buf[8..24]);
+    buf[4..8].copy_from_slice(&crc.to_le_bytes());
+    buf[HEADER_LEN..HEADER_LEN + payload.len()].copy_from_slice(payload);
+    buf
+}
+
+/// Parse a frame header at the start of `buf`. Returns `(seq, payload_len)`
+/// if the header is intact (magic + CRC), else None (caller resyncs).
+fn parse_header(buf: &[u8]) -> Option<(u64, usize)> {
+    if buf.len() < HEADER_LEN || buf[0..4] != MAGIC {
+        return None;
+    }
+    let crc = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+    if crc32fast::hash(&buf[8..24]) != crc {
+        return None;
+    }
+    let seq = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+    let payload_len = u32::from_le_bytes(buf[16..20].try_into().unwrap()) as usize;
+    Some((seq, payload_len))
+}
+
+pub struct SegmentLog {
+    dir: PathBuf,
+    key: Key,
+    /// Open append handle for the active (highest-id) segment.
+    active: File,
+    active_id: u64,
+    active_offset: u64,
+    next_seq: u64,
+    index: HashMap<u64, Location>,
+    seg_meta: HashMap<u64, SegMeta>,
+    /// Highest inode number ever observed in any frame (incl. tombstoned),
+    /// so a recovered allocator never re-hands a number that was used.
+    max_inode: u64,
+}
+
+fn segment_path(dir: &std::path::Path, id: u64) -> PathBuf {
+    dir.join(format!("{id:016x}.seg"))
+}
+
+impl SegmentLog {
+    /// Open (creating if absent) the log under `dir`, replaying existing
+    /// segments to rebuild the in-RAM index.
+    pub fn open(dir: PathBuf, key: Key) -> BkfsResult<Self> {
+        std::fs::create_dir_all(&dir)?;
+        let mut segment_ids = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(hex) = name.strip_suffix(".seg") {
+                if let Ok(id) = u64::from_str_radix(hex, 16) {
+                    segment_ids.push(id);
+                }
+            }
+        }
+        segment_ids.sort_unstable();
+
+        let mut index: HashMap<u64, Location> = HashMap::new();
+        // Track the winning seq per inode so later-seq records win even if
+        // physically earlier (post-compaction relocation).
+        let mut winning_seq: HashMap<u64, u64> = HashMap::new();
+        let mut seg_meta: HashMap<u64, SegMeta> = HashMap::new();
+        let mut next_seq = 1u64;
+        let mut max_inode = 0u64;
+
+        for &id in &segment_ids {
+            let mut file = File::open(segment_path(&dir, id))?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            let mut pos = 0usize;
+            let mut live = 0u64;
+            while pos + HEADER_LEN <= bytes.len() {
+                let Some((seq, payload_len)) = parse_header(&bytes[pos..]) else {
+                    // Torn/garbage frame: resync to the next magic.
+                    pos += match find_magic(&bytes[pos + 1..]) {
+                        Some(off) => off + 1,
+                        None => break,
+                    };
+                    continue;
+                };
+                let frame_len = frame_size(payload_len);
+                let end = pos + HEADER_LEN + payload_len;
+                if end > bytes.len() {
+                    break; // truncated tail
+                }
+                let payload = &bytes[pos + HEADER_LEN..end];
+                match vault::open(payload, &key).and_then(|p| {
+                    bincode::deserialize::<Record>(&p).map_err(BkfsError::from)
+                }) {
+                    Ok(record) => {
+                        next_seq = next_seq.max(seq + 1);
+                        let inode = record.inode();
+                        max_inode = max_inode.max(inode);
+                        let loc = Location { segment: id, offset: pos as u64, len: frame_len as u32 };
+                        let better = winning_seq.get(&inode).map_or(true, |&w| seq >= w);
+                        if better {
+                            winning_seq.insert(inode, seq);
+                            match record {
+                                Record::Inode { .. } => {
+                                    index.insert(inode, loc);
+                                }
+                                Record::Tombstone { .. } => {
+                                    index.remove(&inode);
+                                }
+                            }
+                        }
+                        live += frame_len;
+                    }
+                    Err(_) => {
+                        // Frame failed ECC/integrity: skip it (a later good
+                        // frame for the same inode, if any, still applies).
+                        pos += match find_magic(&bytes[pos + 1..]) {
+                            Some(off) => off + 1,
+                            None => break,
+                        };
+                        continue;
+                    }
+                }
+                pos += frame_len as usize;
+            }
+            seg_meta.insert(id, SegMeta { total: bytes.len() as u64, live });
+        }
+
+        // Recompute live bytes precisely: a frame is live iff it is the
+        // current index Location for its inode. The pass above counted every
+        // parseable frame; correct it by subtracting superseded frames.
+        recompute_live(&index, &mut seg_meta, &dir, &key)?;
+
+        // Open (or create) the active segment = the highest id, appended to.
+        let active_id = segment_ids.last().copied().unwrap_or(0);
+        let active = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(false)
+            .write(true)
+            .open(segment_path(&dir, active_id))?;
+        let active_offset = active.metadata()?.len();
+
+        Ok(Self {
+            dir,
+            key,
+            active,
+            active_id,
+            active_offset,
+            next_seq,
+            index,
+            seg_meta,
+            max_inode,
+        })
+    }
+
+    pub fn contains(&self, inode: Inode) -> bool {
+        self.index.contains_key(&inode.0)
+    }
+
+    pub fn max_inode(&self) -> u64 {
+        self.max_inode
+    }
+
+    /// Read and decode the record at `loc`.
+    pub fn read_at(&self, loc: Location) -> BkfsResult<Record> {
+        let mut frame = vec![0u8; loc.len as usize];
+        let file;
+        let f: &File = if loc.segment == self.active_id {
+            &self.active
+        } else {
+            file = File::open(segment_path(&self.dir, loc.segment))?;
+            &file
+        };
+        f.read_exact_at(&mut frame, loc.offset)?;
+        let (_, payload_len) = parse_header(&frame)
+            .ok_or_else(|| BkfsError::wrap(std::io::Error::other("corrupt log frame header")))?;
+        let payload = &frame[HEADER_LEN..HEADER_LEN + payload_len];
+        let plain = vault::open(payload, &self.key)?;
+        Ok(bincode::deserialize(&plain)?)
+    }
+
+    /// Load an inode's attributes, or None if it isn't in the index.
+    pub fn load(&self, inode: Inode) -> BkfsResult<Option<Attributes>> {
+        let Some(&loc) = self.index.get(&inode.0) else {
+            return Ok(None);
+        };
+        match self.read_at(loc)? {
+            Record::Inode { attrs, .. } => Ok(Some(attrs)),
+            Record::Tombstone { .. } => Ok(None),
+        }
+    }
+
+    fn append(&mut self, record: &Record) -> BkfsResult<Location> {
+        let inode = record.inode();
+        let payload = vault::seal(&bincode::serialize(record)?, &self.key);
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let frame = encode_frame(seq, &payload);
+        // Roll to a new segment if the active one is full (but never leave a
+        // segment empty: always write at least one frame per segment).
+        if self.active_offset > 0 && self.active_offset + frame.len() as u64 > segment_size() {
+            self.roll()?;
+        }
+        let offset = self.active_offset;
+        self.active.write_all_at(&frame, offset)?;
+        self.active_offset += frame.len() as u64;
+        let loc = Location { segment: self.active_id, offset, len: frame.len() as u32 };
+
+        self.max_inode = self.max_inode.max(inode);
+        let seg = self.seg_meta.entry(self.active_id).or_default();
+        seg.total += frame.len() as u64;
+        seg.live += frame.len() as u64;
+        // Supersede any prior live frame for this inode.
+        if let Some(prev) = self.index.get(&inode).copied() {
+            if let Some(m) = self.seg_meta.get_mut(&prev.segment) {
+                m.live = m.live.saturating_sub(prev.len as u64);
+            }
+        }
+        Ok(loc)
+    }
+
+    /// Append/replace an inode record. Returns its location.
+    pub fn put(&mut self, inode: Inode, attrs: &Attributes) -> BkfsResult<()> {
+        let loc = self.append(&Record::Inode { inode: inode.0, attrs: attrs.clone() })?;
+        self.index.insert(inode.0, loc);
+        Ok(())
+    }
+
+    /// Append a tombstone and drop the inode from the index.
+    pub fn tombstone(&mut self, inode: Inode) -> BkfsResult<()> {
+        let loc = self.append(&Record::Tombstone { inode: inode.0 })?;
+        // The tombstone frame itself is dead weight once written (nothing
+        // references it via the index); account it as non-live.
+        if let Some(m) = self.seg_meta.get_mut(&loc.segment) {
+            m.live = m.live.saturating_sub(loc.len as u64);
+        }
+        self.index.remove(&inode.0);
+        Ok(())
+    }
+
+    fn roll(&mut self) -> BkfsResult<()> {
+        // Make the segment we're leaving durable before starting a new one.
+        self.sync()?;
+        self.active_id += 1;
+        self.active = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(segment_path(&self.dir, self.active_id))?;
+        self.active_offset = 0;
+        Ok(())
+    }
+
+    /// Flush the active segment to stable storage and drop its now-clean
+    /// pages from the cache to keep metadata cache bounded.
+    pub fn sync(&self) -> BkfsResult<()> {
+        self.active.sync_data()?;
+        // Best-effort: drop clean pages we just synced.
+        let fd = self.active.as_raw_fd();
+        // SAFETY: fd is a valid owned fd; DONTNEED on a synced range is advisory.
+        unsafe {
+            libc::posix_fadvise(fd, 0, self.active_offset as libc::off_t, libc::POSIX_FADV_DONTNEED);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn index_len(&self) -> usize {
+        self.index.len()
+    }
+}
+
+impl Record {
+    fn inode(&self) -> u64 {
+        match self {
+            Record::Inode { inode, .. } | Record::Tombstone { inode } => *inode,
+        }
+    }
+}
+
+/// Index of the first occurrence of MAGIC in `buf`, if any.
+fn find_magic(buf: &[u8]) -> Option<usize> {
+    buf.windows(MAGIC.len()).position(|w| w == MAGIC)
+}
+
+/// Reset every segment's live bytes to the sum of frame sizes whose inode
+/// still resolves to that exact location in `index`.
+fn recompute_live(
+    index: &HashMap<u64, Location>,
+    seg_meta: &mut HashMap<u64, SegMeta>,
+    _dir: &std::path::Path,
+    _key: &Key,
+) -> BkfsResult<()> {
+    for m in seg_meta.values_mut() {
+        m.live = 0;
+    }
+    for loc in index.values() {
+        if let Some(m) = seg_meta.get_mut(&loc.segment) {
+            m.live += loc.len as u64;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inode::{FileData, InodeAttributes};
+
+    fn key() -> Key {
+        *Key::from_slice(&[5u8; 32])
+    }
+
+    fn attrs(size: u64) -> Attributes {
+        let mut a = InodeAttributes::new(Inode(1), None, FileData::File(crate::inode::ContentId(1)));
+        a.attrs.size = size;
+        a.attrs
+    }
+
+    #[test]
+    fn put_load_roundtrip_and_replay() {
+        let tmp = tempdir::TempDir::new("seglog").unwrap();
+        let dir = tmp.path().join("segments");
+        {
+            let mut log = SegmentLog::open(dir.clone(), key()).unwrap();
+            for i in 1..=50u64 {
+                log.put(Inode(i), &attrs(i * 100)).unwrap();
+            }
+            // overwrite some
+            for i in 1..=10u64 {
+                log.put(Inode(i), &attrs(999)).unwrap();
+            }
+            log.tombstone(Inode(25)).unwrap();
+            log.sync().unwrap();
+            assert!(log.load(Inode(25)).unwrap().is_none());
+            assert_eq!(log.load(Inode(1)).unwrap().unwrap().size, 999);
+            assert_eq!(log.load(Inode(40)).unwrap().unwrap().size, 4000);
+        }
+        // Reopen → replay rebuilds the index, latest-seq-wins, tombstone gone.
+        let log = SegmentLog::open(dir, key()).unwrap();
+        assert_eq!(log.index_len(), 49); // 50 created, 1 tombstoned
+        assert!(log.load(Inode(25)).unwrap().is_none());
+        assert_eq!(log.load(Inode(1)).unwrap().unwrap().size, 999);
+        assert_eq!(log.load(Inode(50)).unwrap().unwrap().size, 5000);
+        assert_eq!(log.max_inode(), 50);
+    }
+
+    #[test]
+    fn rotates_across_segments() {
+        std::env::set_var("BACKUPFS_SEGMENT_SIZE", "8192");
+        let tmp = tempdir::TempDir::new("seglog").unwrap();
+        let dir = tmp.path().join("segments");
+        {
+            let mut log = SegmentLog::open(dir.clone(), key()).unwrap();
+            for i in 1..=200u64 {
+                log.put(Inode(i), &attrs(i)).unwrap();
+            }
+            log.sync().unwrap();
+        }
+        let n_segs = std::fs::read_dir(&dir).unwrap().count();
+        assert!(n_segs > 1, "expected multiple segments, got {n_segs}");
+        let log = SegmentLog::open(dir, key()).unwrap();
+        assert_eq!(log.index_len(), 200);
+        for i in 1..=200u64 {
+            assert_eq!(log.load(Inode(i)).unwrap().unwrap().size, i);
+        }
+        std::env::remove_var("BACKUPFS_SEGMENT_SIZE");
+    }
+
+    #[test]
+    fn resync_past_corrupt_frame() {
+        let tmp = tempdir::TempDir::new("seglog").unwrap();
+        let dir = tmp.path().join("segments");
+        {
+            let mut log = SegmentLog::open(dir.clone(), key()).unwrap();
+            for i in 1..=20u64 {
+                log.put(Inode(i), &attrs(i)).unwrap();
+            }
+            log.sync().unwrap();
+        }
+        // Corrupt one frame's payload in the middle of the single segment so
+        // its vault::open fails; replay must still recover the others.
+        let seg = segment_path(&dir, 0);
+        let mut bytes = std::fs::read(&seg).unwrap();
+        // Find the 3rd frame and trash a payload byte.
+        let mut pos = 0;
+        for _ in 0..3 {
+            let (_, plen) = parse_header(&bytes[pos..]).unwrap();
+            if pos / 200 == 2 {
+                break;
+            }
+            pos += frame_size(plen) as usize;
+        }
+        let target = pos + HEADER_LEN + 4;
+        for b in &mut bytes[target..target + 64] {
+            *b ^= 0xFF;
+        }
+        std::fs::write(&seg, &bytes).unwrap();
+
+        let log = SegmentLog::open(dir, key()).unwrap();
+        // At least all-but-one inode survive (the corrupted frame's inode is
+        // beyond ECC repair and is dropped).
+        assert!(log.index_len() >= 19, "expected ≥19 survivors, got {}", log.index_len());
+    }
+}

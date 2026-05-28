@@ -103,14 +103,14 @@ fn resolve_path(base: &PathBuf, encrypted: [u8; 8]) -> PathBuf {
 impl Controller {
     pub fn new(config: BackupFSOptions) -> BkfsResult<Self> {
         let cryptinfo_path = config.data_dir.join("cryptinfo");
-        let cryptinfo = if cryptinfo_path.exists() {
+        let cryptinfo = if CryptInfo::any_exists(&cryptinfo_path) {
             CryptInfo::load(&cryptinfo_path, &config.password)?
         } else {
             if config.readonly {
                 return BkfsResult::errno_notrace(libc::EROFS);
             }
             let cryptinfo = CryptInfo::new();
-            cryptinfo.save(cryptinfo_path.clone(), &config.password)?;
+            cryptinfo.save(&cryptinfo_path, &config.password)?;
             cryptinfo
         };
         let key = Key::clone_from_slice(&*cryptinfo.key);
@@ -230,9 +230,7 @@ impl Controller {
 
     pub fn change_password(&self, password: &str) -> BkfsResult<()> {
         self.check_rw()?;
-        self.0
-            .cryptinfo
-            .save(self.0.cryptinfo_path.clone(), password)
+        self.0.cryptinfo.save(&self.0.cryptinfo_path, password)
     }
 
     pub fn check_rw(&self) -> BkfsResult<()> {

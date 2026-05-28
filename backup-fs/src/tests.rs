@@ -1681,3 +1681,58 @@ fn sparse_file_omits_hole_blocks() {
         None,
     );
 }
+
+/// The cryptinfo is the one unrecoverable single point of failure (lose it
+/// → the master key is gone → no data is readable). It is written as
+/// redundant copies, so losing or corrupting the primary must not brick the
+/// backup, and the damaged copy should self-heal on the next mount.
+#[test_log::test]
+fn cryptinfo_survives_primary_loss_and_self_heals() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::write(mnt.join("file"), b"important backup data").unwrap();
+        },
+        None,
+    );
+
+    let primary = data.path().join("cryptinfo");
+    let backup = data.path().join("cryptinfo.bak1");
+    assert!(primary.exists(), "primary cryptinfo missing");
+    assert!(backup.exists(), "redundant cryptinfo copy was not written");
+
+    // Simulate total loss of the primary (deleted / lost dir entry).
+    fs::remove_file(&primary).unwrap();
+
+    // Remount: must recover from the backup, read data back, and re-heal
+    // the primary copy.
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            assert_eq!(
+                fs::read(mnt.join("file")).unwrap(),
+                b"important backup data"
+            );
+        },
+        None,
+    );
+    assert!(primary.exists(), "primary cryptinfo was not self-healed");
+
+    // Now corrupt the backup instead (zero it out) and confirm recovery
+    // from the (healed) primary.
+    fs::write(&backup, b"\x00\x00\x00\x00").unwrap();
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            assert_eq!(
+                fs::read(mnt.join("file")).unwrap(),
+                b"important backup data"
+            );
+        },
+        None,
+    );
+}

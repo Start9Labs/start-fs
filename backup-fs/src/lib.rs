@@ -126,6 +126,11 @@ pub struct BackupFS {
 const CHACHA_KEY_SIZE: usize = <<ChaCha20 as KeySizeUser>::KeySize as ToInt<usize>>::INT;
 const CHACHA_IV_SIZE: usize = <<ChaCha20 as IvSizeUser>::IvSize as ToInt<usize>>::INT;
 
+/// Number of redundant copies of the cryptinfo (master-key header) kept in
+/// separate files. The first is the canonical `cryptinfo`; the rest are
+/// `cryptinfo.bak1`, … — see [`CryptInfo::replica_paths`].
+const CRYPTINFO_REPLICAS: usize = 2;
+
 #[derive(Deserialize, Serialize)]
 pub struct CryptInfo {
     pub key: Zeroizing<[u8; CHACHA_KEY_SIZE]>,
@@ -140,18 +145,74 @@ impl CryptInfo {
             contents_iv: rand::random(),
         }
     }
-    pub fn load(path: &Path, password: &str) -> BkfsResult<Self> {
-        let blob = std::fs::read(path)?;
-        let plain = vault::open_pbkdf2(&blob, password)?;
-        Ok(bincode::deserialize(&plain)?)
+    /// The cryptinfo is the one file whose total loss is unrecoverable —
+    /// without it the master key can't be derived and *no* data is
+    /// readable. Each copy is already internally ECC-protected against bit
+    /// rot (see [`vault`]); keeping `CRYPTINFO_REPLICAS` full copies in
+    /// separate files additionally survives whole-file loss or truncation
+    /// of any single replica.
+    pub fn replica_paths(primary: &Path) -> Vec<PathBuf> {
+        let mut paths = vec![primary.to_owned()];
+        for i in 1..CRYPTINFO_REPLICAS {
+            paths.push(primary.with_extension(format!("bak{i}")));
+        }
+        paths
     }
-    pub fn save(&self, path: PathBuf, password: &str) -> BkfsResult<()> {
+
+    /// True if any replica of the cryptinfo is present on disk.
+    pub fn any_exists(primary: &Path) -> bool {
+        Self::replica_paths(primary).iter().any(|p| p.exists())
+    }
+
+    /// Load the cryptinfo from the first readable replica. If a replica is
+    /// missing or corrupt while another is good (and the store is
+    /// writable), the bad copies are healed from the good one.
+    pub fn load(primary: &Path, password: &str) -> BkfsResult<Self> {
+        let paths = Self::replica_paths(primary);
+        let mut result: Option<Self> = None;
+        let mut healthy = 0usize;
+        let mut last_err = None;
+        for path in &paths {
+            match std::fs::read(path)
+                .map_err(BkfsError::from)
+                .and_then(|blob| vault::open_pbkdf2(&blob, password))
+                .and_then(|plain| Ok(bincode::deserialize::<Self>(&plain)?))
+            {
+                Ok(ci) => {
+                    healthy += 1;
+                    if result.is_none() {
+                        result = Some(ci);
+                    }
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        match result {
+            Some(ci) => {
+                if healthy < paths.len() {
+                    // Best-effort self-heal of damaged/missing replicas;
+                    // ignore failure (e.g. read-only backing store).
+                    let _ = ci.save(primary, password);
+                }
+                Ok(ci)
+            }
+            None => Err(last_err
+                .unwrap_or_else(|| BkfsError::wrap(io::Error::other("cryptinfo not found")))),
+        }
+    }
+
+    pub fn save(&self, primary: &Path, password: &str) -> BkfsResult<()> {
         use std::io::Write;
         let plain = bincode::serialize(self)?;
         let blob = vault::seal_pbkdf2(&plain, password)?;
-        let mut file = AtomicFile::create_buffered(path)?;
-        file.write_all(&blob)?;
-        file.save()
+        // Write backups first and the primary last, so a crash mid-save
+        // never leaves the primary as the only (torn) copy.
+        for path in Self::replica_paths(primary).into_iter().rev() {
+            let mut file = AtomicFile::create_buffered(path)?;
+            file.write_all(&blob)?;
+            file.save()?;
+        }
+        Ok(())
     }
 }
 

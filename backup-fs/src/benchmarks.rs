@@ -242,3 +242,149 @@ fn comprehensive_ecc_bench() {
     atomic_file_save_throughput();
     encryption_throughput();
 }
+
+/// Mirrors Claude's end-to-end FUSE benchmark using BlockStore + EccCodec
+/// directly (not yet wired into the FUSE Contents path).
+#[test]
+fn claude_style_throughput() {
+    
+    use crate::block_store::BlockStore;
+    use crate::ctrl::Controller;
+    use crate::inode::ContentId;
+    use crate::BackupFSOptions;
+    use tempdir::TempDir;
+
+    const MIB: usize = 1024 * 1024;
+    let data = TempDir::new("bench_blockstore").unwrap();
+
+    // Init a minimal cryptinfo + Controller so BlockStore can encrypt
+    let ctrl = Controller::new(BackupFSOptions {
+        data_dir: data.path().to_owned(),
+        setuid_support: false,
+        password: "bench".to_string(),
+        file_size_padding: None,
+        readonly: false,
+        idmapped_root: vec![],
+    })
+    .unwrap();
+
+    let cid = ContentId(1);
+
+    fn mbps(bytes: usize, dt: std::time::Duration) -> f64 {
+        (bytes as f64 / MIB as f64) / dt.as_secs_f64()
+    }
+
+    println!("\nbackup-fs block store benchmark (BlockStore + ChaCha20 + Reed-Solomon ECC)\n");
+
+    // ── 1. Sequential write (64 MiB) ──
+    let total: usize = 64 * MIB;
+    let chunk = vec![0xA5u8; 256 * 1024]; // 256 KiB = block size
+    let t = Instant::now();
+    {
+        let mut bs = BlockStore::create(ctrl.clone(), cid).unwrap();
+        let mut written: u64 = 0;
+        while written < total as u64 {
+            bs.write(&chunk, written).unwrap();
+            written += chunk.len() as u64;
+        }
+        bs.flush().unwrap();
+    }
+    let dt = t.elapsed();
+    println!("sequential write : {:7.1} MiB/s  ({} MiB)", mbps(total, dt), total / MIB);
+
+    // ── 2. Sequential read (64 MiB) ──
+    let t = Instant::now();
+    {
+        let mut bs = BlockStore::open(ctrl.clone(), cid, total as u64).unwrap();
+        let mut buf = vec![0u8; 4 * MIB];
+        let mut read: u64 = 0;
+        while read < total as u64 {
+            let n = bs.read(&mut buf, read).unwrap();
+            if n == 0 {
+                break;
+            }
+            read += n as u64;
+        }
+        assert_eq!(read, total as u64);
+    }
+    let dt = t.elapsed();
+    println!("sequential read  : {:7.1} MiB/s  ({} MiB)", mbps(total, dt), total / MIB);
+
+    // ── 3. Many small files ──
+    let n_small = 1000;
+    let t = Instant::now();
+    for i in 0..n_small {
+        let cid = ContentId(1000 + i as u64);
+        let mut bs = BlockStore::create(ctrl.clone(), cid).unwrap();
+        let payload = format!("small file {i:05}").as_bytes().to_vec();
+        bs.write(&payload, 0).unwrap();
+        bs.flush().unwrap();
+    }
+    let dt = t.elapsed();
+    println!(
+        "small files      : {:7.0} files/s ({} write + flush)",
+        n_small as f64 / dt.as_secs_f64(),
+        n_small
+    );
+
+    // ── 4. Scattered partial overwrites ──
+    let n_writes = 200;
+    let patch = vec![0x33u8; 4096];
+    let t = Instant::now();
+    {
+        let mut bs = BlockStore::open(ctrl.clone(), cid, total as u64).unwrap();
+        for i in 0..n_writes {
+            let off = ((i * 1_048_583) % (total - 4096)) as u64;
+            bs.write(&patch, off).unwrap();
+        }
+        bs.flush().unwrap();
+    }
+    let dt = t.elapsed();
+    println!(
+        "random 4 KiB write: {:7.0} ops/s   ({} writes, flushed)",
+        n_writes as f64 / dt.as_secs_f64(),
+        n_writes
+    );
+
+    // ── 5. Incremental edit ──
+    let dir = ctrl.contents_dir_path(cid);
+    let before_mtime: Vec<_> = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd
+            .filter_map(|e| {
+                let e = e.ok()?;
+                let m = e.metadata().ok()?;
+                Some((e.path(), m.modified().unwrap()))
+            })
+            .collect(),
+        Err(_) => vec![],
+    };
+    let files_before = before_mtime.len();
+    let bytes_before: u64 = before_mtime.iter().filter_map(|(p, _)| std::fs::metadata(p).ok().map(|m| m.len())).sum();
+
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    // Edit 1 byte at offset 32 MiB + 7
+    {
+        let mut bs = BlockStore::open(ctrl.clone(), cid, total as u64).unwrap();
+        bs.write(b"!", 32 * MIB as u64 + 7).unwrap();
+        bs.flush().unwrap();
+    }
+
+    let changed = before_mtime
+        .iter()
+        .filter(|(p, old_mtime)| {
+            std::fs::metadata(p)
+                .map(|m| m.modified().unwrap() > *old_mtime)
+                .unwrap_or(false)
+        })
+        .count();
+
+    println!(
+        "\nincremental edit : 1 byte changed → {changed} of {files_before} block files rewritten"
+    );
+    println!(
+        "                   ({:.0} MiB of content on disk; rsync/rclone re-sends only {changed} block{})",
+        bytes_before as f64 / MIB as f64,
+        if changed == 1 { "" } else { "s" }
+    );
+}

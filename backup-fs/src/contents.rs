@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::sync::OnceLock;
 
 use rand::{rng, RngCore};
 
@@ -17,6 +18,26 @@ use crate::error::{BkfsResult, BkfsResultExt};
 use crate::handle::Handler;
 use crate::inode::{time_now, ContentId, FileData, Inode, InodeAttributes};
 
+/// Soft cap on per-file in-memory dirty data. With `FOPEN_DIRECT_IO` the
+/// kernel streams writes straight to us and never triggers a writeback, so
+/// without a cap a single large sequential write would buffer the *entire*
+/// file in our heap before anything reached the backing store — defeating
+/// the whole point of avoiding kernel page-cache buildup, and serializing
+/// all crypto/ECC/I/O into one burst at close. Once the buffer exceeds this,
+/// completed low blocks are sealed and written out (fast path, batched
+/// syncfs), bounding memory and pipelining I/O with the incoming writes.
+/// Overridable via `BACKUPFS_WRITE_BUFFER` (bytes).
+fn write_buffer_budget() -> usize {
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("BACKUPFS_WRITE_BUFFER")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= CHUNK_SIZE as usize)
+            .unwrap_or(16 * 1024 * 1024)
+    })
+}
+
 pub struct Contents {
     pub inode: InodeAttributes,
     content_id: ContentId,
@@ -25,6 +46,9 @@ pub struct Contents {
     /// (length ≤ `CHUNK_SIZE`). A block is loaded here lazily on first
     /// write that touches it (read-modify-write).
     dirty: BTreeMap<u64, Vec<u8>>,
+    /// Running total of `dirty`'s block byte lengths, kept in sync so the
+    /// spill threshold is an O(1) check.
+    dirty_bytes: usize,
     /// Number of blocks believed to exist on disk. Initialized from the
     /// inode's size on open and updated on every flush, so flush knows
     /// which trailing blocks to delete after a shrink/truncate.
@@ -69,6 +93,7 @@ impl Contents {
             content_id,
             changed,
             dirty: BTreeMap::new(),
+            dirty_bytes: 0,
             disk_blocks,
             ctrl,
         })
@@ -137,7 +162,10 @@ impl Contents {
             // Read-modify-write: pull the existing block (or a hole) into
             // the dirty cache, then overlay the new bytes.
             let mut block = match self.dirty.remove(&idx) {
-                Some(b) => b,
+                Some(b) => {
+                    self.dirty_bytes -= b.len();
+                    b
+                }
                 None => {
                     let valid = self.valid_len(idx);
                     let mut b =
@@ -150,6 +178,7 @@ impl Contents {
                 block.resize(within + take, 0);
             }
             block[within..within + take].copy_from_slice(&buf[written..written + take]);
+            self.dirty_bytes += block.len();
             self.dirty.insert(idx, block);
             written += take;
         }
@@ -158,6 +187,27 @@ impl Contents {
             self.inode.attrs.size = end;
         }
         self.changed = true;
+        self.spill_to_budget()?;
+        Ok(())
+    }
+
+    /// Bound in-memory dirty data: while over budget, seal and write out the
+    /// lowest-indexed dirty block (fast path; durability rides the batched
+    /// syncfs) and drop it from the cache. The highest block — the active
+    /// write frontier — is always kept so sequential appends keep coalescing
+    /// in memory. A spilled block that is touched again is transparently
+    /// reloaded via read-modify-write.
+    fn spill_to_budget(&mut self) -> BkfsResult<()> {
+        let budget = write_buffer_budget();
+        while self.dirty_bytes > budget && self.dirty.len() > 1 {
+            let idx = *self.dirty.keys().next().unwrap();
+            let mut block = self.dirty.remove(&idx).unwrap();
+            self.dirty_bytes -= block.len();
+            block.truncate(self.valid_len(idx));
+            blockstore::write_block(&self.ctrl, self.content_id, idx, &block, false)?;
+            self.ctrl.tick_save()?;
+            self.disk_blocks = self.disk_blocks.max(idx + 1);
+        }
         Ok(())
     }
 
@@ -218,6 +268,7 @@ impl Contents {
     fn flush_content_only(&mut self) -> BkfsResult<()> {
         let required = blockstore::block_count(self.inode.attrs.size);
         let dirty = std::mem::take(&mut self.dirty);
+        self.dirty_bytes = 0;
         let last = required.saturating_sub(1);
         for (idx, mut block) in dirty {
             if idx >= required {

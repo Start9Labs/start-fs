@@ -297,10 +297,17 @@ impl Controller {
             .next()
             .ok_or(libc::EMFILE)
             .map_err(io::Error::from_raw_os_error)?;
+        // Fast (non-fsync) save: a per-creation sync_all here was a CIFS
+        // round trip on every single file in a backup. The pool is
+        // reconstructible by fsck, and its update rides the same batched
+        // syncfs as the inode/content writes that consume the id — so a
+        // crash loses the pool bump and those inodes together (consistent),
+        // never reusing a live id.
         let blob = serde::serialize_sealed(&*pool, self.key())?;
         let mut file = AtomicFile::create_buffered(self.0.inode_pool_path.clone())?;
         file.write_all(&blob)?;
-        file.save()?;
+        file.save_fast()?;
+        self.tick_save()?;
         Ok(Inode(res))
     }
 

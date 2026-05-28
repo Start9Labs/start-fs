@@ -1736,3 +1736,56 @@ fn cryptinfo_survives_primary_loss_and_self_heals() {
         None,
     );
 }
+
+/// A file several times larger than the in-memory write buffer must spill
+/// completed blocks to disk mid-write (bounding memory) and still read back
+/// byte-for-byte, both live and across a remount. Guards the eager-spill
+/// path added to bound dirty memory under FOPEN_DIRECT_IO.
+#[test_log::test]
+fn large_file_spills_and_stays_intact() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    // 40 MiB > the 16 MiB default write buffer → forces several spills.
+    let size = 40 * 1024 * 1024usize;
+    let mut buf = vec![0u8; size];
+    pattern_fill(0, &mut buf);
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            // Stream it in 256 KiB writes, like a real copy would.
+            let mut f = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(mnt.join("big"))
+                .unwrap();
+            for chunk in buf.chunks(256 * 1024) {
+                f.write_all(chunk).unwrap();
+            }
+            f.sync_all().unwrap();
+            let readback = fs::read(mnt.join("big")).unwrap();
+            assert_eq!(readback.len(), size);
+            pattern_check(0, &readback);
+        },
+        None,
+    );
+
+    // 40 MiB / 1 MiB chunk = 40 block files.
+    assert_eq!(
+        tree(data.path().join("contents"), false).unwrap().len(),
+        40,
+        "unexpected block file count"
+    );
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let readback = fs::read(mnt.join("big")).unwrap();
+            assert_eq!(readback.len(), size);
+            pattern_check(0, &readback);
+        },
+        None,
+    );
+}

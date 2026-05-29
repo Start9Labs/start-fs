@@ -46,6 +46,7 @@ io-uring = "0.7.11"
 crossbeam-channel = "0.5"
 reed-solomon-erasure = "6"
 crc32fast = "1"
+zstd = "0.13"
 
 [dev-dependencies]
 tempdir = "0.3.7"

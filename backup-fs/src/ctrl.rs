@@ -141,8 +141,17 @@ impl Controller {
     /// Append/replace a packed-content extent (small/medium file content
     /// stored in shared segments rather than its own block file). Sealing is
     /// done outside the log lock.
-    pub fn cpack_put(&self, id: ContentId, bytes: &[u8], durable: bool) -> BkfsResult<()> {
-        let rec = seglog::seal_content(&self.key(), id.0, bytes)?;
+    pub fn cpack_put(
+        &self,
+        id: ContentId,
+        bytes: &[u8],
+        codec: crate::compress::Codec,
+        durable: bool,
+    ) -> BkfsResult<()> {
+        // Compress before sealing (ciphertext is incompressible); the
+        // extent's stored payload carries the compression tag.
+        let stored = crate::compress::compress(bytes, codec);
+        let rec = seglog::seal_content(&self.key(), id.0, &stored)?;
         let mut log = self.0.log.lock().unwrap();
         log.append(&rec)?;
         if durable {
@@ -152,7 +161,10 @@ impl Controller {
     }
 
     pub fn cpack_load(&self, id: ContentId) -> BkfsResult<Option<Vec<u8>>> {
-        self.0.log.lock().unwrap().load_content(id.0)
+        match self.0.log.lock().unwrap().load_content(id.0)? {
+            Some(stored) => Ok(Some(crate::compress::decompress(&stored)?)),
+            None => Ok(None),
+        }
     }
 
     pub fn cpack_tombstone(&self, id: ContentId, durable: bool) -> BkfsResult<()> {

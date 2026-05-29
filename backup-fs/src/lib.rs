@@ -36,6 +36,7 @@ use crate::inode::{Inode, InodeAttributes};
 mod aligned_io;
 mod atomic_file;
 mod blockstore;
+mod compress;
 mod contents;
 mod ctrl;
 mod directory;

@@ -66,21 +66,28 @@ pub fn read_block(
     };
     let mut blob = Vec::new();
     file.read_to_end(&mut blob)?;
-    Ok(Some(vault::open(&blob, ctrl.key())?))
+    // open (decrypt + ECC) → decompress back to the logical block bytes.
+    let stored = vault::open(&blob, ctrl.key())?;
+    Ok(Some(crate::compress::decompress(&stored)?))
 }
 
-/// Seal and write one block whole. `durable` selects `sync_all` (the
-/// crash-safe path used on explicit syncs) versus the batched fast path
-/// (rename only; durability deferred to a later `syncfs`).
+/// Compress (per `codec`), seal, and write one block whole. `durable`
+/// selects `sync_all` (the crash-safe path used on explicit syncs) versus
+/// the batched fast path (rename only; durability deferred to a later
+/// `syncfs`).
 pub fn write_block(
     ctrl: &Controller,
     content: ContentId,
     idx: u64,
     plaintext: &[u8],
+    codec: crate::compress::Codec,
     durable: bool,
 ) -> BkfsResult<()> {
     ctrl.check_rw()?;
-    let blob = vault::seal(plaintext, ctrl.key());
+    // Compress BEFORE sealing — ciphertext is incompressible. Each block is
+    // compressed independently, so a one-block edit recompresses only it.
+    let stored = crate::compress::compress(plaintext, codec);
+    let blob = vault::seal(&stored, ctrl.key());
     let mut file = BufferedDirectFile::new(AtomicFile::create(ctrl.block_path(content, idx))?)?;
     file.write_all(&blob)?;
     if durable {

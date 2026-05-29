@@ -2189,3 +2189,74 @@ fn idle_remount_does_not_recompact_live_packed() {
         None,
     );
 }
+
+/// Total bytes across content block files.
+fn content_bytes(data: &Path) -> u64 {
+    let dir = data.join("contents");
+    let mut total = 0u64;
+    let mut stack = vec![dir];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let m = e.metadata().unwrap();
+            if m.is_dir() {
+                stack.push(e.path());
+            } else {
+                total += m.len();
+            }
+        }
+    }
+    total
+}
+
+/// A compressible file (by extension policy) is stored much smaller than its
+/// logical size; an incompressible-extension file is stored ~raw. Both read
+/// back byte-for-byte.
+#[test_log::test]
+fn compression_shrinks_compressible_content() {
+    // 2 MiB of highly compressible text → block-backed (>1 MiB), .log → zstd.
+    let text: Vec<u8> = b"the quick brown fox jumps over the lazy dog\n"
+        .iter()
+        .copied()
+        .cycle()
+        .take(2 * 1024 * 1024)
+        .collect();
+    let data_log = TempDir::new("backupfs_log").unwrap();
+    with_backupfs(
+        data_log.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::write(mnt.join("big.log"), &text).unwrap();
+            assert_eq!(fs::read(mnt.join("big.log")).unwrap(), text);
+        },
+        None,
+    );
+    let log_on_disk = content_bytes(data_log.path());
+    assert!(
+        log_on_disk < text.len() as u64 / 4,
+        "compressible .log not compressed: {log_on_disk} bytes for {} logical",
+        text.len()
+    );
+
+    // 2 MiB of random with an incompressible extension → stored raw.
+    let mut rnd = vec![0u8; 2 * 1024 * 1024];
+    {
+        use rand::RngCore;
+        rand::rng().fill_bytes(&mut rnd);
+    }
+    let data_jpg = TempDir::new("backupfs_jpg").unwrap();
+    with_backupfs(
+        data_jpg.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::write(mnt.join("photo.jpg"), &rnd).unwrap();
+            assert_eq!(fs::read(mnt.join("photo.jpg")).unwrap(), rnd);
+        },
+        None,
+    );
+    let jpg_on_disk = content_bytes(data_jpg.path());
+    assert!(
+        jpg_on_disk >= rnd.len() as u64,
+        "incompressible .jpg unexpectedly smaller than raw: {jpg_on_disk}"
+    );
+}

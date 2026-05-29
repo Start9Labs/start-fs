@@ -21,6 +21,7 @@ use std::sync::OnceLock;
 use rand::{rng, RngCore};
 
 use crate::blockstore::{self, CHUNK_SIZE};
+use crate::compress::{self, Codec};
 use crate::ctrl::Controller;
 use crate::error::{BkfsResult, BkfsResultExt};
 use crate::handle::Handler;
@@ -108,6 +109,9 @@ pub struct Contents {
     /// durable — tombstoning it earlier could, on crash, leave a durable
     /// `Packed` inode pointing at a deleted extent (reads as zeros).
     pending_content_tombstone: Option<ContentId>,
+    /// Compression codec for this file's content, chosen from its name's
+    /// extension at open time (see `compress::codec_for_name`).
+    codec: Codec,
     ctrl: Controller,
 }
 
@@ -157,7 +161,23 @@ impl Contents {
             FileData::Directory(_) => return BkfsResult::errno(libc::EISDIR),
             _ => return BkfsResult::errno(libc::EINVAL),
         };
-        Ok(Self { inode, changed, body, pending_content_tombstone: None, ctrl })
+        // Compression codec from the file's name (first parent's). A file
+        // with no name (shouldn't happen for an open regular file) gets the
+        // unknown-extension default.
+        let codec = inode
+            .attrs
+            .parents
+            .get_min()
+            .map(|(_, name)| compress::codec_for_name(name))
+            .unwrap_or(Codec::Zstd(2));
+        Ok(Self {
+            inode,
+            changed,
+            body,
+            pending_content_tombstone: None,
+            codec,
+            ctrl,
+        })
     }
 
     fn size(&self) -> u64 {
@@ -397,7 +417,7 @@ impl Contents {
             *dirty_bytes -= block.len();
             *disk_blocks = (*disk_blocks).max(idx + 1);
             block.truncate(valid);
-            blockstore::write_block(&self.ctrl, content_id, idx, &block, false)?;
+            blockstore::write_block(&self.ctrl, content_id, idx, &block, self.codec, false)?;
             self.ctrl.tick_save()?;
         }
     }
@@ -506,7 +526,7 @@ impl Contents {
             }
             Plan::Packed(cid, bytes) => {
                 if let Some(b) = bytes {
-                    self.ctrl.cpack_put(cid, &b, false)?;
+                    self.ctrl.cpack_put(cid, &b, self.codec, false)?;
                     self.ctrl.tick_save()?;
                 }
                 self.inode.attrs.contents = FileData::Packed(cid);
@@ -532,7 +552,7 @@ impl Contents {
             if idx == last {
                 self.pad_final_inline(&mut block);
             }
-            blockstore::write_block(&self.ctrl, content_id, idx, &block, false)?;
+            blockstore::write_block(&self.ctrl, content_id, idx, &block, self.codec, false)?;
             self.ctrl.tick_save()?;
         }
         for idx in required..disk_blocks {

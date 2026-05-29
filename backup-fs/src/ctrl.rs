@@ -121,11 +121,6 @@ impl Controller {
         self.0.constants.ecc()
     }
 
-    /// The format constants adopted from the superblock.
-    pub fn constants(&self) -> &Constants {
-        &self.0.constants
-    }
-
     /// Inline-tier upper bound (bytes), from the superblock.
     pub fn inline_threshold(&self) -> u64 {
         self.0.constants.inline_threshold
@@ -377,7 +372,7 @@ impl Controller {
     /// rsync/rclone incremental copies cheap).
     pub fn block_path(&self, content: ContentId, idx: u64) -> PathBuf {
         // FROZEN as superblock `path_hash_scheme == 1`: the domain tag, the
-        // little-endian id encoding, and the 16-bit-dir / 120-bit-name split
+        // little-endian id encoding, and the 16-bit-dir / 112-bit-name split
         // below all determine where bytes physically live and how reads find
         // them. Changing any of it makes every existing block file
         // unresolvable, so it must be gated by a FORMAT_VERSION /
@@ -388,8 +383,8 @@ impl Controller {
         hasher.update(content.0.to_le_bytes());
         hasher.update(idx.to_le_bytes());
         let tag = hasher.finalize();
-        // 2-level layout: 16-bit bucket (≤65 536 dirs) + 120-bit filename.
-        // A 128-bit name makes collisions cryptographically negligible.
+        // 2-level layout: 16-bit bucket (≤65 536 dirs) + 112-bit filename.
+        // The 128-bit digest makes collisions cryptographically negligible.
         let dir = u16::from_be_bytes([tag[0], tag[1]]);
         let mut name = String::with_capacity(30);
         for b in &tag[2..16] {

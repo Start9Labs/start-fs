@@ -159,7 +159,7 @@ impl From<bincode::error::DecodeError> for BkfsError {
 }
 
 impl BkfsError {
-    /// Construct an [`BkfsErrorKind::UnsupportedFormat`] error from a message.
+    /// Construct a [`BkfsErrorKind::UnsupportedFormat`] error from a message.
     pub fn unsupported(msg: impl Into<String>) -> Self {
         BkfsError {
             kind: BkfsErrorKind::UnsupportedFormat(msg.into()),

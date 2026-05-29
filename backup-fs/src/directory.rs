@@ -6,8 +6,9 @@
 //!   sealed blob. This is the original layout and stays in force for small
 //!   directories, so the common case is byte-for-byte unchanged.
 //!
-//! * **Spilled** — once a directory grows past [`SPILL_COUNT`] entries the
-//!   listing is sharded across `buckets` separate sealed bucket files, and
+//! * **Spilled** — once a directory grows past the spill threshold
+//!   ([`Controller::dir_spill`]) the listing is sharded across `buckets`
+//!   separate sealed bucket files, and
 //!   the inode keeps only a small marker (`gen`, `buckets`, and cached
 //!   `len`/`subdirs` counts). A name maps to exactly one bucket by a keyed
 //!   hash, so a single lookup/create/unlink reads or rewrites just *one*

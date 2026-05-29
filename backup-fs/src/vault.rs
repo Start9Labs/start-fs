@@ -129,6 +129,11 @@ impl EccParams {
     }
 }
 
+// Both report `BadChecksum`, differing only in backtrace capture:
+//   bad_checksum() — the genuine post-decrypt SHA-256 tag mismatch; usually a
+//     wrong key/password, so capture a backtrace for diagnosis.
+//   corrupt()      — cheap, attacker-reachable rejections of a malformed
+//     header/blob (untrusted backing store); skip the backtrace.
 fn bad_checksum() -> BkfsError {
     BkfsError {
         kind: BkfsErrorKind::BadChecksum,

@@ -3,9 +3,10 @@
 //! [`Contents`] presents a regular file's byte stream over one of two
 //! storage bodies:
 //!
-//! * **Inline** — a small file (≤ [`inline_threshold`]) whose bytes live
-//!   directly in its inode record in the log. No separate content file at
-//!   all: a tiny file costs zero extra backing-store objects.
+//! * **Inline** — a small file (≤ the inline threshold,
+//!   [`Controller::inline_threshold`]) whose bytes live directly in its inode
+//!   record in the log. No separate content file at all: a tiny file costs
+//!   zero extra backing-store objects.
 //! * **Blocks** — a larger file split into [`CHUNK_SIZE`] sealed block files
 //!   (see [`crate::blockstore`]), read-modify-written a whole block at a time
 //!   so a partial write never rewrites a sub-region of an on-disk object.
@@ -467,19 +468,7 @@ impl Contents {
         // promote so the flush below stores it correctly. Bytes beyond the
         // in-memory buffer stay holes (sparse) — never materialized, so a
         // huge set_len can't OOM us.
-        let inline_threshold = self.ctrl.inline_threshold();
-        let pack_max = self.ctrl.pack_max();
-        match &self.body {
-            Body::Inline(_) if size > inline_threshold => {
-                if size <= pack_max {
-                    self.inline_to_packed();
-                } else {
-                    self.inline_to_blocks()?;
-                }
-            }
-            Body::Packed { .. } if size > pack_max => self.packed_to_blocks()?,
-            _ => {}
-        }
+        self.promote_for(size)?;
 
         // Memory-backed tiers (inline / packed): CLONE the buffer (it is the
         // file's only copy until persisted) rather than draining it, so a

@@ -1641,7 +1641,7 @@ fn sparse_file_omits_hole_blocks() {
     );
 }
 
-/// The cryptinfo is the one unrecoverable single point of failure (lose it
+/// The superblock is the one unrecoverable single point of failure (lose it
 /// → the master key is gone → no data is readable). It is written as
 /// redundant copies, so losing or corrupting the primary must not brick the
 /// backup, and the damaged copy should self-heal on the next mount.

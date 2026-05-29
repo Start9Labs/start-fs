@@ -2317,3 +2317,91 @@ fn packed_to_blocks_on_close_survives_crash_before_flush() {
     assert_eq!(got.len(), big.len(), "file truncated/lost after crash");
     pattern_check(0, &got);
 }
+
+/// Not a correctness test — a measurement. Writes a representative mixed
+/// backup corpus (compressible logs/JSON/source + incompressible blobs)
+/// through the mount and reports logical vs on-disk content size, so the PR
+/// can quote a real end-to-end compression ratio. Run with:
+///   cargo test --release measure_compression_ratio -- --ignored --nocapture
+#[test_log::test]
+#[ignore]
+fn measure_compression_ratio() {
+    fn log_corpus(bytes: usize) -> Vec<u8> {
+        // Realistic structured log lines — repetitive, highly compressible.
+        let mut out = Vec::with_capacity(bytes);
+        let mut n = 0u64;
+        while out.len() < bytes {
+            let line = format!(
+                "2026-05-28T12:{:02}:{:02}.{:03}Z INFO  startos::backup::worker[{}]: \
+                 transferred chunk seq={} size=1048576 retries=0 host=backup-target.local ok\n",
+                (n / 60) % 60, n % 60, n % 1000, n % 8, n
+            );
+            out.extend_from_slice(line.as_bytes());
+            n += 1;
+        }
+        out.truncate(bytes);
+        out
+    }
+    fn json_corpus(bytes: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes);
+        let mut n = 0u64;
+        while out.len() < bytes {
+            let obj = format!(
+                "{{\"id\":{},\"service\":\"registry\",\"status\":\"running\",\"healthy\":true,\
+                 \"uptime_s\":{},\"version\":\"0.3.6\",\"tags\":[\"net\",\"db\",\"sync\"]}}\n",
+                n,
+                n * 37
+            );
+            out.extend_from_slice(obj.as_bytes());
+            n += 1;
+        }
+        out.truncate(bytes);
+        out
+    }
+    fn random_corpus(bytes: usize) -> Vec<u8> {
+        use rand::RngCore;
+        let mut v = vec![0u8; bytes];
+        rand::rng().fill_bytes(&mut v);
+        v
+    }
+
+    let mib = 1024 * 1024;
+    let files: Vec<(&str, Vec<u8>)> = vec![
+        ("services.log", log_corpus(24 * mib)),
+        ("journal.log", log_corpus(16 * mib)),
+        ("status.json", json_corpus(12 * mib)),
+        ("db-dump.sql", log_corpus(8 * mib)), // sql ext → zstd 9, log-like text
+        ("media.jpg", random_corpus(12 * mib)), // incompressible ext → raw
+        ("blob.bin", random_corpus(8 * mib)),   // unknown ext, random → adaptive raw
+    ];
+    let logical: usize = files.iter().map(|(_, d)| d.len()).sum();
+
+    let data = TempDir::new("backupfs_ratio").unwrap();
+    let files_for_write = files.clone();
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        move |mnt| {
+            for (name, bytes) in &files_for_write {
+                fs::write(mnt.join(name), bytes).unwrap();
+            }
+            // read back a couple to confirm round-trip under compression
+            for (name, bytes) in &files_for_write {
+                assert_eq!(&fs::read(mnt.join(name)).unwrap(), bytes, "{name} mismatch");
+            }
+        },
+        None,
+    );
+
+    let on_disk = content_bytes(data.path()) as usize;
+    let pct = 100.0 * on_disk as f64 / logical as f64;
+    eprintln!("──────────── compression ratio (mixed backup corpus) ────────────");
+    eprintln!("  logical content : {:>10} bytes ({} MiB)", logical, logical / mib);
+    eprintln!("  on-disk content : {:>10} bytes ({} MiB)", on_disk, on_disk / mib);
+    eprintln!(
+        "  stored          : {:.1}% of logical  ({:.2}× reduction)",
+        pct,
+        logical as f64 / on_disk as f64
+    );
+    eprintln!("──────────────────────────────────────────────────────────────────");
+}

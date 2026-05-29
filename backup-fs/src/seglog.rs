@@ -208,6 +208,10 @@ pub struct SegmentLog {
     /// Highest inode number ever observed in any frame (incl. tombstoned),
     /// so a recovered allocator never re-hands a number that was used.
     max_inode: u64,
+    /// Roll to a new segment once the active one would exceed this. Captured
+    /// at open (from `segment_size()`) so it can't shift under us — and so a
+    /// test can pin it without racing the process-global env cache.
+    segment_size: u64,
 }
 
 fn segment_path(dir: &std::path::Path, id: u64) -> PathBuf {
@@ -218,6 +222,12 @@ impl SegmentLog {
     /// Open (creating if absent) the log under `dir`, replaying existing
     /// segments to rebuild the in-RAM index.
     pub fn open(dir: PathBuf, key: Key) -> BkfsResult<Self> {
+        Self::open_sized(dir, key, segment_size())
+    }
+
+    /// As [`open`], with an explicit segment size. Lets tests pin the rotation
+    /// threshold deterministically instead of relying on the cached env var.
+    fn open_sized(dir: PathBuf, key: Key, segment_size: u64) -> BkfsResult<Self> {
         std::fs::create_dir_all(&dir)?;
         let mut segment_ids = Vec::new();
         for entry in std::fs::read_dir(&dir)? {
@@ -336,6 +346,7 @@ impl SegmentLog {
             content,
             seg_meta,
             max_inode,
+            segment_size,
         })
     }
 
@@ -402,7 +413,7 @@ impl SegmentLog {
         let frame = encode_frame(seq, &rec.bytes);
         // Roll to a new segment if the active one is full (but never leave a
         // segment empty: always write at least one frame per segment).
-        if self.active_offset > 0 && self.active_offset + frame.len() as u64 > segment_size() {
+        if self.active_offset > 0 && self.active_offset + frame.len() as u64 > self.segment_size {
             self.roll()?;
         }
         let offset = self.active_offset;
@@ -508,7 +519,7 @@ impl SegmentLog {
     /// — re-sealing would change every byte (fresh nonce) and break rsync
     /// delta-matching of the relocated bytes.
     fn append_verbatim(&mut self, frame: &[u8], space: Space, key: u64) -> BkfsResult<()> {
-        if self.active_offset > 0 && self.active_offset + frame.len() as u64 > segment_size() {
+        if self.active_offset > 0 && self.active_offset + frame.len() as u64 > self.segment_size {
             self.roll()?;
         }
         let offset = self.active_offset;
@@ -674,11 +685,14 @@ mod tests {
 
     #[test]
     fn rotates_across_segments() {
-        std::env::set_var("BACKUPFS_SEGMENT_SIZE", "8192");
+        // Pin the segment size directly — `segment_size()` is a process-global
+        // OnceLock cached on first use, so setting the env var here would race
+        // with any other test that touched the log first.
+        const SEG: u64 = 8192;
         let tmp = tempdir::TempDir::new("seglog").unwrap();
         let dir = tmp.path().join("segments");
         {
-            let mut log = SegmentLog::open(dir.clone(), key()).unwrap();
+            let mut log = SegmentLog::open_sized(dir.clone(), key(), SEG).unwrap();
             for i in 1..=200u64 {
                 log.put(Inode(i), &attrs(i)).unwrap();
             }
@@ -686,12 +700,11 @@ mod tests {
         }
         let n_segs = std::fs::read_dir(&dir).unwrap().count();
         assert!(n_segs > 1, "expected multiple segments, got {n_segs}");
-        let log = SegmentLog::open(dir, key()).unwrap();
+        let log = SegmentLog::open_sized(dir, key(), SEG).unwrap();
         assert_eq!(log.index_len(), 200);
         for i in 1..=200u64 {
             assert_eq!(log.load(Inode(i)).unwrap().unwrap().size, i);
         }
-        std::env::remove_var("BACKUPFS_SEGMENT_SIZE");
     }
 
     #[test]

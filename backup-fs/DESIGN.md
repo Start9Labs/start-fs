@@ -101,50 +101,24 @@ count, which dominates many-small-files backups to CIFS/rclone:
   directly in its inode record — zero extra content objects. Larger files
   migrate to per-file 1 MiB block files.
 
-### Planned: shared content packing for sub-block files (NOT yet implemented)
+- **Shared content packing + compaction (shipped).** A file in
+  `(4 KiB, pack_max=1 MiB]` is stored as a single extent in the shared
+  content log (`Record::Content` in `seglog`, a separate content index;
+  the inode holds `FileData::Packed(content_id)`) rather than its own block
+  file. Tiers: ≤ 4 KiB inline → ≤ 1 MiB packed → > 1 MiB blocks; growth
+  migrates inline→packed→blocks one-way. `BACKUPFS_PACK_MAX` tunes/disables
+  packing. **Compaction** (`seglog::compact`, on unmount, gated by
+  `BACKUPFS_COMPACT_RATIO`, default 0.6) reclaims dead extents: live frames
+  are relocated **verbatim** (no re-seal — keeps bytes stable for rsync,
+  preserves `seq` for replay) into the active segment, durable before the
+  old segment is unlinked. Local A/B (500 × 64 KiB files): ~27% faster than
+  one-block-per-file; larger on CIFS.
 
-**Gap.** A file between the inline threshold (4 KiB) and one chunk (1 MiB)
-still gets exactly one block file of its own — a partially-filled object. A
-workload dominated by, say, 64 KiB files therefore still pays one
-CREATE+RENAME per file. Inline packing handles the tiny tail; this stage
-would handle the medium range.
+### Deferred items (space/robustness, not correctness)
 
-**Approach.** Pack multiple sub-block file contents into shared, append-only
-**content-pack** segments (a content-side analogue of the inode `seglog`,
-and likely reusing that machinery). A small file's content reference becomes
-`(pack_segment, offset, len)` instead of `(content_id, block_index)`; its
-bytes are appended to the active content pack. Files ≥ 1 MiB keep their own
-block files; files ≤ 4 KiB stay inline. So the packed range is roughly
-`(4 KiB, 1 MiB)`.
-
-**Garbage collection (the hard part, explicitly accepted).** Deleting or
-overwriting a packed file leaves dead space in a pack. Reclaim lazily:
-mark-deleted (drop the index/inode reference), and run a **threshold-gated
-compaction pass** when a pack's dead-space ratio crosses a bound — copy the
-still-live extents into a fresh pack, repoint the referencing inodes, then
-delete the old pack (durable-before-delete, mirroring the inode log).
-Optimize for speed over disk footprint: tolerate dead space until the
-threshold, then compact in bulk. Reuse `seglog`'s seq-ordered replay,
-forward-resync, and per-record sealing (ChaCha20 + Reed-Solomon ECC).
-
-**Trade-offs / open questions.**
-- *Incremental backup*: a content pack mutates as it's appended, so rsync/
-  rclone re-send the active pack; compaction rewrites packs. Same
-  active-segment-churn trade-off as the inode log — sealed packs stay
-  immutable until compaction, so the cost is bounded and threshold-tunable.
-- *Compaction vs. offsite bandwidth*: rewriting a pack re-transfers its live
-  bytes; gate compaction on a high dead-ratio + a minimum interval, and
-  prefer near-dead packs (verbatim-copy live frames to keep bytes stable).
-- *Worth it?* Only if medium (4 KiB–1 MiB) files dominate the target
-  workload. **Gated on benchmarking the shipped stages first** — the
-  inline + inode-log packing may already capture most of the win for the
-  tiny-file-heavy case, in which case this stage's GC complexity is not
-  worth the squeeze.
-
-### Other deferred items (space/robustness, not correctness)
-
-- Compaction of the **inode** log segments (dead inode-record reclamation),
-  and streamed multi-generation checkpoints for fast remount on huge stores.
+- Compaction of the inode/content log **mid-mount** (currently only on
+  unmount) and streamed multi-generation checkpoints for fast remount on
+  huge stores (replay currently decrypts every frame).
 - A `find_orphans` sweep to reclaim directory bucket / content files orphaned
   by a crash mid-reshard or mid-GC.
 - `fsync` of parent directories in `AtomicFile` (durability currently rides

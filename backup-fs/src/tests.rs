@@ -2495,3 +2495,41 @@ fn superblock_change_password_persists() {
         "old password must no longer open after change, got {err:?}"
     );
 }
+
+/// If both superblock replicas are lost but the data store survives (e.g. an
+/// unreliable backing store dropped the two small superblock files), mounting
+/// must REFUSE rather than mint a fresh superblock with a new key — which would
+/// present an empty filesystem and orphan/overwrite the surviving data.
+#[test_log::test]
+fn missing_superblock_over_existing_data_is_refused() {
+    use crate::error::BkfsErrorKind;
+    let data = TempDir::new("backupfs_data").unwrap();
+    // Create a populated store (writes superblock + segments/contents).
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::write(mnt.join("important.txt"), b"survivor").unwrap();
+        },
+        None,
+    );
+    // Lose BOTH superblock replicas; leave segments/contents/dirents intact.
+    for name in ["superblock", "superblock.bak1"] {
+        let p = data.path().join(name);
+        if p.exists() {
+            fs::remove_file(&p).unwrap();
+        }
+    }
+    assert!(
+        data.path().join("segments").exists(),
+        "precondition: data store should still be present"
+    );
+
+    let err = open_ctrl_err(data.path(), "ohea");
+    assert!(
+        matches!(err.kind, BkfsErrorKind::UnsupportedFormat(_)),
+        "missing superblock over existing data must be refused, got {err:?}"
+    );
+    // And no fresh superblock was created over the data.
+    assert!(!data.path().join("superblock").exists());
+}

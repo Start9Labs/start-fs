@@ -203,6 +203,18 @@ pub fn open(blob: &[u8], key: &Key) -> BkfsResult<Vec<u8>> {
     if data == 0 || parity == 0 || total > ecc::MAX_SHARDS {
         return Err(corrupt());
     }
+    // Bound the claimed payload length BEFORE it reaches `ecc::decode`, which
+    // does `Vec::with_capacity(payload_len)`. `payload_len` comes from the
+    // unauthenticated header (the SHA-256 tag is only verified *after* decode),
+    // so on an untrusted backing store a forged-but-header-coherent blob could
+    // otherwise reserve up to ~4 GiB and OOM the host on the very first sealed
+    // read (including the superblock at mount). A legitimate payload is the
+    // concatenation of `data` equal shards and is physically contained in the
+    // blob, so both bounds below hold for any real blob and neither can
+    // false-reject.
+    if payload_len > data.saturating_mul(shard_len) || payload_len > blob.len() {
+        return Err(corrupt());
+    }
 
     // Collect shards, treating any whose CRC fails (or which is truncated
     // off the end of the blob) as an erasure.
@@ -289,9 +301,8 @@ mod tests {
 
     #[test]
     fn recovers_from_corruption() {
-        // Explicit 8 data + 3 parity for a deterministic shard layout
-        // (ecc_params() is a process-global OnceLock and can't be steered
-        // per-test). open() reads the params back out of the header.
+        // Explicit 8 data + 3 parity for a deterministic shard layout.
+        // open() reads the params back out of the header (self-describing).
         let key = test_key();
         let pt: Vec<u8> = (0..50_000u32).map(|i| (i % 257) as u8).collect();
         let mut blob = seal_with(&pt, &key, 8, 3);
@@ -320,6 +331,21 @@ mod tests {
             open(&blob, Key::from_slice(&*wrong)).unwrap_err().kind,
             BkfsErrorKind::BadChecksum
         ));
+    }
+
+    #[test]
+    fn oversized_payload_len_is_rejected_not_allocated() {
+        // A header-coherent blob claiming a ~4 GiB payload must be rejected by
+        // the bound (returning corrupt()) rather than reaching the
+        // Vec::with_capacity in ecc::decode and OOM-ing the host.
+        let key = test_key();
+        let mut blob = seal(b"hi", &key, EccParams::default());
+        // Overwrite payload_len (bytes 8..12) with u32::MAX.
+        blob[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        match open(&blob, &key) {
+            Err(e) => assert!(matches!(e.kind, BkfsErrorKind::BadChecksum)),
+            Ok(_) => panic!("oversized payload_len must not open"),
+        }
     }
 
     #[test]

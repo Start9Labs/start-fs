@@ -40,6 +40,7 @@
 //! `format_version` is additionally echoed inside the sealed body and
 //! cross-checked, turning envelope tampering into an authenticated mismatch.
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -92,6 +93,12 @@ pub const DIRENT_HASH_SCHEME_V1: u8 = 1;
 /// unauthenticated-envelope DoS (absurdly high) or KDF weakening (too low).
 const MIN_KDF_ROUNDS: u32 = 100_000;
 const MAX_KDF_ROUNDS: u32 = 4_000_000;
+
+/// Upper bound on `dir_max_bucket` (the per-bucket reshard trigger). At ~100k
+/// entries a bucket's bincode encoding stays well under `serde`'s data decode
+/// limit (64 MiB), so a misconfigured value can't produce an undecodable
+/// bucket. Reshard normally keeps buckets near `TARGET_PER_BUCKET` (64).
+const MAX_DIR_MAX_BUCKET: u32 = 100_000;
 
 // Envelope byte offsets.
 const OFF_ENVELOPE_VER: usize = 4;
@@ -230,6 +237,15 @@ impl Constants {
         if self.dir_spill == 0 || self.dir_max_bucket == 0 {
             return bad("dir_spill / dir_max_bucket must be non-zero".to_owned());
         }
+        // Keep a single bucket's encoded size comfortably under the data decode
+        // limit even at the reshard trigger, so a degenerate dir_max_bucket
+        // (set via env at creation) can't produce a bucket that fails to decode.
+        if self.dir_max_bucket > MAX_DIR_MAX_BUCKET {
+            return bad(format!(
+                "dir_max_bucket {} exceeds the supported maximum {MAX_DIR_MAX_BUCKET}",
+                self.dir_max_bucket
+            ));
+        }
         Ok(())
     }
 
@@ -285,12 +301,26 @@ pub fn any_exists(primary: &Path) -> bool {
     replica_paths(primary).iter().any(|p| p.exists())
 }
 
+/// Whether the data store siblings of the superblock (`segments`, `contents`,
+/// `dirents`) hold any data. Used to refuse creating a fresh superblock over a
+/// store whose superblock replicas were lost but whose data survived. A truly
+/// fresh store has none of these yet (they are created lazily after the
+/// superblock), so this never false-positives at first creation.
+fn data_store_nonempty(primary: &Path) -> bool {
+    let Some(dir) = primary.parent() else { return false };
+    ["segments", "contents", "dirents"].iter().any(|sub| {
+        std::fs::read_dir(dir.join(sub))
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false)
+    })
+}
+
 impl Superblock {
     /// Open the existing superblock at `primary`, or create a fresh one if no
     /// replica exists (unless `readonly`).
     pub fn open_or_create(primary: &Path, password: &str, readonly: bool) -> BkfsResult<Superblock> {
         if any_exists(primary) {
-            Self::load(primary, password)
+            Self::load(primary, password, readonly)
         } else if primary.with_file_name("cryptinfo").exists() {
             // A pre-versioning store (master key in `cryptinfo`, bincode-v1
             // data). There is no migration path; refuse with a clear error
@@ -300,6 +330,19 @@ impl Superblock {
             Err(BkfsError::unsupported(
                 "found a legacy unversioned `cryptinfo` store with no superblock; this build cannot \
                  read the pre-versioning on-disk format",
+            ))
+        } else if data_store_nonempty(primary) {
+            // Both superblock replicas are gone but a populated data store
+            // remains (e.g. an unreliable backing store dropped the two small
+            // superblock files while segments/content survived). Minting a
+            // fresh superblock here would generate a NEW master key, present an
+            // empty filesystem, and orphan/overwrite the surviving data on the
+            // next backup pass. Refuse instead, so the operator can restore the
+            // superblock (or its `.bak1`) rather than silently lose data.
+            Err(BkfsError::unsupported(
+                "superblock replicas are missing but the data store is non-empty; refusing to \
+                 create a fresh superblock over existing data — restore `superblock` or \
+                 `superblock.bak1` from backup",
             ))
         } else if readonly {
             BkfsResult::errno_notrace(libc::EROFS)
@@ -328,10 +371,9 @@ impl Superblock {
     /// Load, picking the replica with the highest generation as canonical and
     /// healing the rest toward it. Distinguishes a wrong password (every
     /// readable replica fails the integrity tag) from genuine loss.
-    fn load(primary: &Path, password: &str) -> BkfsResult<Superblock> {
+    fn load(primary: &Path, password: &str, readonly: bool) -> BkfsResult<Superblock> {
         let paths = replica_paths(primary);
         let mut best: Option<Superblock> = None;
-        let mut readable = 0usize;
         let mut bad_checksum = 0usize;
         let mut healthy = 0usize;
         let mut last_err: Option<BkfsError> = None;
@@ -345,7 +387,6 @@ impl Superblock {
                     continue;
                 }
             };
-            readable += 1;
             match parse_one(&raw, password) {
                 Ok(sb) => {
                     healthy += 1;
@@ -365,19 +406,25 @@ impl Superblock {
 
         match best {
             Some(sb) => {
-                if healthy < paths.len() {
+                if healthy < paths.len() && !readonly {
                     // Heal damaged/missing replicas from the canonical copy.
-                    // Best-effort: a read-only or near-full store keeps mounting
-                    // off the good replica with reduced redundancy.
+                    // Skipped on a read-only mount (which must never write); a
+                    // near-full store likewise keeps mounting off the good
+                    // replica with reduced redundancy.
                     if let Err(e) = sb.persist(primary, password) {
                         warn!("superblock self-heal failed (reduced redundancy): {e}");
                     }
+                } else if healthy < paths.len() {
+                    warn!("superblock has reduced redundancy; self-heal skipped (read-only mount)");
                 }
                 Ok(sb)
             }
-            None if readable > 0 && bad_checksum == readable => {
-                // Every readable replica failed the integrity tag — almost
-                // certainly the wrong password rather than independent loss.
+            // No replica decoded, but at least one failed the integrity tag:
+            // almost certainly the wrong password rather than independent loss.
+            // (`> 0`, not `== readable`, so a second replica that is also
+            // independently corrupt at the envelope level can't mask the
+            // wrong-password signal — `best` is None here, so `healthy == 0`.)
+            None if bad_checksum > 0 => {
                 Err(BkfsError {
                     kind: BkfsErrorKind::BadChecksum,
                     backtrace: None,
@@ -397,13 +444,13 @@ impl Superblock {
         rng().fill_bytes(&mut salt);
         let key = vault::derive_key(password, &salt, PBKDF2_ROUNDS)?;
 
-        let mut master = [0u8; 32];
+        let mut master = Zeroizing::new([0u8; 32]);
         master.copy_from_slice(self.key.as_slice());
         let body = Body {
             format_version: FORMAT_VERSION,
             generation: self.generation,
             created_unix: self.created_unix,
-            master_key: Zeroizing::new(master),
+            master_key: master,
             constants: self.constants,
             features: 0,
         };
@@ -429,9 +476,17 @@ impl Superblock {
             f.write_all(&file)?;
             f.save()?;
         }
+        // fsync the containing directory so the rename(s) that expose the new
+        // superblock are themselves durable. AtomicFile::save fsyncs the file
+        // data and renames, but not the parent dir entry — and the CLI
+        // `change-password`/`fsck` paths return without the unmount syncfs, so
+        // without this a reported password rotation could be lost on a crash.
+        // (Mirrors seglog's fsync_dir for segment renames.)
+        if let Some(dir) = primary.parent() {
+            File::open(dir)?.sync_all()?;
+        }
         Ok(())
     }
-
 }
 
 /// Parse and authenticate one superblock replica. The version gate runs on the
@@ -451,10 +506,11 @@ fn parse_one(raw: &[u8], password: &str) -> BkfsResult<Superblock> {
         )));
     }
     let format_version = u32::from_le_bytes(raw[OFF_FORMAT_VERSION..OFF_KDF_ALGO].try_into().unwrap());
-    if format_version > SUPPORTED_FORMAT_VERSION {
+    if format_version == 0 || format_version > SUPPORTED_FORMAT_VERSION {
         return Err(BkfsError::unsupported(format!(
-            "filesystem format version {format_version} was written by a newer backup-fs; \
-             upgrade the software (this build supports up to {SUPPORTED_FORMAT_VERSION})"
+            "unsupported filesystem format version {format_version}; this build supports \
+             1..={SUPPORTED_FORMAT_VERSION} (a higher value was written by a newer backup-fs — \
+             upgrade the software)"
         )));
     }
     let kdf_algo = raw[OFF_KDF_ALGO];

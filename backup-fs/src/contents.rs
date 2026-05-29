@@ -103,6 +103,11 @@ pub struct Contents {
     pub inode: InodeAttributes,
     pub(crate) changed: bool,
     body: Body,
+    /// A packed extent superseded by a packed→blocks migration, to be
+    /// tombstoned only AFTER the replacement (blocks + File inode record) is
+    /// durable — tombstoning it earlier could, on crash, leave a durable
+    /// `Packed` inode pointing at a deleted extent (reads as zeros).
+    pending_content_tombstone: Option<ContentId>,
     ctrl: Controller,
 }
 
@@ -152,7 +157,7 @@ impl Contents {
             FileData::Directory(_) => return BkfsResult::errno(libc::EISDIR),
             _ => return BkfsResult::errno(libc::EINVAL),
         };
-        Ok(Self { inode, changed, body, ctrl })
+        Ok(Self { inode, changed, body, pending_content_tombstone: None, ctrl })
     }
 
     fn size(&self) -> u64 {
@@ -303,7 +308,9 @@ impl Contents {
         };
         let content_id = *content_id;
         let data = std::mem::take(buf);
-        self.ctrl.cpack_tombstone(content_id, false)?;
+        // Defer dropping the old packed extent until the new blocks + File
+        // inode record are durable (see `pending_content_tombstone`).
+        self.pending_content_tombstone = Some(content_id);
         let mut dirty = BTreeMap::new();
         let mut dirty_bytes = 0usize;
         for (i, chunk) in data.chunks(CHUNK_SIZE as usize).enumerate() {
@@ -438,6 +445,14 @@ impl Contents {
             self.ctrl.tick_save()?;
             self.changed = false;
         }
+        // Only now (blocks written, File inode record appended after them) is
+        // it safe to drop the superseded packed extent: the tombstone lands
+        // at a higher log offset than the File record, so if it's durable the
+        // record is too — the inode can't end up Packed pointing at a hole.
+        if let Some(cid) = self.pending_content_tombstone.take() {
+            self.ctrl.cpack_tombstone(cid, false)?;
+            self.ctrl.tick_save()?;
+        }
         Ok(())
     }
 
@@ -550,9 +565,20 @@ impl Contents {
         self.flush_content_only()?;
         let attrs = self.inode.clone();
         let changed = self.changed;
+        // Capture before drop; issue after the inode record is durable so a
+        // crash can't leave a Packed inode pointing at a tombstoned extent.
+        let pending = self.pending_content_tombstone.take();
+        let ctrl = self.ctrl.clone();
         drop(self);
-        if !handler.gc_inode(&attrs)? && changed {
+        let gced = handler.gc_inode(&attrs)?;
+        if !gced && changed {
             handler.save_inode(&attrs)?;
+        }
+        // If the inode was gc'd, gc_inode already tombstoned its current
+        // content; only a leftover superseded extent (from a packed→blocks
+        // migration this session) still needs dropping.
+        if let Some(cid) = pending {
+            ctrl.cpack_tombstone(cid, false)?;
         }
         Ok(())
     }

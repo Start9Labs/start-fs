@@ -2128,3 +2128,64 @@ fn compaction_reclaims_dead_space() {
         None,
     );
 }
+
+/// Sorted list of segment file names.
+fn segment_names(data: &Path) -> Vec<String> {
+    let mut v: Vec<String> = fs::read_dir(data.join("segments"))
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// Regression for the recompute_live bug: a fully-live set of packed files
+/// must not be recompacted on an idle mount/unmount cycle (which would
+/// needlessly re-transfer all packed content and churn extent locations).
+/// With the content index counted as live, the unmount compaction finds
+/// nothing dead and leaves every segment untouched.
+#[test_log::test]
+fn idle_remount_does_not_recompact_live_packed() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    let n = 220usize; // > one 8 MiB segment of 64 KiB packed files
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            for i in 0..n {
+                let mut b = vec![0u8; 64 * 1024];
+                pattern_fill(i as u64, &mut b);
+                fs::write(mnt.join(format!("f{i:04}")), b).unwrap();
+            }
+        },
+        None,
+    );
+    let segs_before = segment_names(data.path());
+    assert!(segs_before.len() > 1, "expected multiple segments");
+
+    // Idle cycle: mount, touch nothing, unmount → compaction runs.
+    with_backupfs(data.path(), "ohea".to_owned(), |_mnt| {}, None);
+
+    let segs_after = segment_names(data.path());
+    assert_eq!(
+        segs_before, segs_after,
+        "idle remount recompacted live packed segments (recompute_live regression)"
+    );
+
+    // Content still intact.
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            for i in (0..n).step_by(37) {
+                let mut want = vec![0u8; 64 * 1024];
+                pattern_fill(i as u64, &mut want);
+                assert_eq!(fs::read(mnt.join(format!("f{i:04}"))).unwrap(), want);
+            }
+        },
+        None,
+    );
+}

@@ -313,7 +313,7 @@ impl SegmentLog {
         // Recompute live bytes precisely: a frame is live iff it is the
         // current index Location for its inode. The pass above counted every
         // parseable frame; correct it by subtracting superseded frames.
-        recompute_live(&index, &mut seg_meta, &dir, &key)?;
+        recompute_live(&index, &content, &mut seg_meta);
 
         // Open (or create) the active segment = the highest id, appended to.
         let active_id = segment_ids.last().copied().unwrap_or(0);
@@ -463,6 +463,8 @@ impl SegmentLog {
             .write(true)
             .open(segment_path(&self.dir, self.active_id))?;
         self.active_offset = 0;
+        // Make the new segment's directory entry durable.
+        self.fsync_dir()?;
         Ok(())
     }
 
@@ -530,6 +532,17 @@ impl SegmentLog {
     /// removed, so a crash can only leave reclaimable dead duplicates, never
     /// lose a live frame. Returns the number of segments compacted.
     pub fn compact(&mut self, dead_threshold: f64) -> BkfsResult<usize> {
+        // The active segment is never a compaction candidate, so its own dead
+        // frames would strand for the mount's lifetime. If it's grown dead
+        // enough, seal it (roll) first so it becomes compactable below.
+        if let Some(m) = self.seg_meta.get(&self.active_id) {
+            if self.active_offset > 0
+                && m.total > 0
+                && (m.total - m.live) as f64 / m.total as f64 > dead_threshold
+            {
+                self.roll()?;
+            }
+        }
         let candidates: Vec<u64> = self
             .seg_meta
             .iter()
@@ -597,23 +610,23 @@ fn find_magic(buf: &[u8]) -> Option<usize> {
     buf.windows(MAGIC.len()).position(|w| w == MAGIC)
 }
 
-/// Reset every segment's live bytes to the sum of frame sizes whose inode
-/// still resolves to that exact location in `index`.
+/// Reset every segment's live bytes to the sum of frame sizes still pointed
+/// at by an index — BOTH the inode index and the content index. (Omitting
+/// the content index scored every live packed extent as dead after a
+/// remount, so compaction needlessly rewrote fully-live content segments.)
 fn recompute_live(
     index: &HashMap<u64, Location>,
+    content: &HashMap<u64, Location>,
     seg_meta: &mut HashMap<u64, SegMeta>,
-    _dir: &std::path::Path,
-    _key: &Key,
-) -> BkfsResult<()> {
+) {
     for m in seg_meta.values_mut() {
         m.live = 0;
     }
-    for loc in index.values() {
+    for loc in index.values().chain(content.values()) {
         if let Some(m) = seg_meta.get_mut(&loc.segment) {
             m.live += loc.len as u64;
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]

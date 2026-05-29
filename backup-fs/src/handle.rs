@@ -672,7 +672,8 @@ impl Handler {
             let mode = mode & libc::S_IFMT as u32;
 
             if mode == libc::S_IFREG as u32 {
-                FileData::File(inode.into())
+                // Start inline; grows into block storage past the threshold.
+                FileData::Inline(Vec::new())
             } else if mode == libc::S_IFLNK as u32 {
                 FileData::Symlink(PathBuf::new())
             } else if mode == libc::S_IFDIR as u32 {

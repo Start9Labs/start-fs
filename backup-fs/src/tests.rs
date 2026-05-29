@@ -138,6 +138,12 @@ fn tree(path: impl AsRef<Path>, dirs: bool) -> Result<Vec<String>, io::Error> {
     Ok(children)
 }
 
+/// Count content block files, tolerating an absent `contents/` dir — a
+/// backup whose files are all inline-sized writes no content blocks at all.
+fn content_files(data: &Path) -> usize {
+    tree(data.join("contents"), false).map(|v| v.len()).unwrap_or(0)
+}
+
 #[test_log::test]
 fn write_file() {
     let data = TempDir::new("backupfs_data").unwrap();
@@ -157,7 +163,8 @@ fn write_file() {
         },
         None,
     );
-    assert_eq!(tree(data.path().join("contents"), false).unwrap().len(), 1);
+    // "foo bar" is inline (no separate content block).
+    assert_eq!(content_files(data.path()), 0);
 }
 
 #[test_log::test]
@@ -307,7 +314,8 @@ fn write_one_file_async() {
         },
         None,
     );
-    assert_eq!(tree(data.path().join("contents"), false).unwrap().len(), 1);
+    // "foo bar" is inline (no separate content block).
+    assert_eq!(content_files(data.path()), 0);
 }
 
 #[test_log::test]
@@ -340,10 +348,8 @@ fn write_many_files_async() {
         },
         None,
     );
-    assert_eq!(
-        tree(data.path().join("contents"), false).unwrap().len(),
-        100
-    );
+    // The 100 tiny files are inline → no content blocks.
+    assert_eq!(content_files(data.path()), 0);
 }
 
 /// rm -rf should fully remove a tree from disk — no orphan inode files.
@@ -371,9 +377,11 @@ fn rmrf_leaves_no_orphans() {
             fs::create_dir(mnt.join("backup/volumes")).unwrap();
             fs::create_dir(mnt.join("backup/volumes/main")).unwrap();
             for i in 0..10 {
+                // > inline threshold so each file is block-backed and the
+                // block-reaping assertion below is meaningful.
                 fs::write(
                     mnt.join(format!("backup/volumes/main/f{i:02}")),
-                    format!("payload {i}"),
+                    vec![i as u8; 8192],
                 )
                 .unwrap();
             }
@@ -383,8 +391,7 @@ fn rmrf_leaves_no_orphans() {
 
     // Snapshot content-file count after creation (inodes now live in the
     // log, counted via the index below).
-    let content_files_after_create =
-        tree(data.path().join("contents"), false).unwrap().len();
+    let content_files_after_create = content_files(data.path());
 
     // Phase 2: rm -rf the whole subtree
     with_backupfs(
@@ -428,13 +435,13 @@ fn rmrf_leaves_no_orphans() {
         ctrl.live_inode_count()
     );
     drop(ctrl);
-    let contents_now = tree(data.path().join("contents"), false).unwrap();
+    let contents_now = content_files(data.path());
     let expected_contents = content_files_after_create - 10;
     assert_eq!(
-        contents_now.len(),
+        contents_now,
         expected_contents,
         "orphan content files left after rm-rf: expected {expected_contents}, got {}",
-        contents_now.len()
+        contents_now
     );
 }
 
@@ -590,13 +597,15 @@ fn unlink_file_after_remount() {
         "ohea".to_owned(),
         |mnt| {
             fs::create_dir(mnt.join("d")).unwrap();
-            fs::write(mnt.join("d/keep"), b"keep").unwrap();
-            fs::write(mnt.join("d/kill"), b"kill").unwrap();
+            // > inline threshold → block-backed, so there's a content blob
+            // to reap on unlink.
+            fs::write(mnt.join("d/keep"), vec![1u8; 8192]).unwrap();
+            fs::write(mnt.join("d/kill"), vec![2u8; 8192]).unwrap();
         },
         None,
     );
 
-    let content_before = tree(data.path().join("contents"), false).unwrap().len();
+    let content_before = content_files(data.path());
 
     with_backupfs(
         data.path(),
@@ -618,7 +627,7 @@ fn unlink_file_after_remount() {
     );
 
     assert_eq!(
-        tree(data.path().join("contents"), false).unwrap().len(),
+        content_files(data.path()),
         content_before - 1,
         "unlinked file's content blob wasn't reaped"
     );
@@ -1862,6 +1871,94 @@ fn spilled_directory_rename_paths() {
             // a has: 1500 - 1(f00001 moved) = 1499 names still (renamed counts as 1, target counts as 1, f00002 gone but target existed).
             // Simpler: just assert the three probes above; exact count is fiddly.
             assert!(!mnt.join("a/f00001").exists());
+        },
+        None,
+    );
+}
+
+/// A small file's content is stored inline in its inode record (no content
+/// block file), and survives fsync, repeated flushes, and a remount.
+/// Regression: an earlier inline flush drained the in-memory buffer, so a
+/// second flush (fsync-then-close, as in the atomic-save pattern) persisted
+/// empty bytes — the file read back as zeros.
+#[test_log::test]
+fn inline_small_file_survives_fsync_and_remount() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let p = mnt.join("tiny");
+            let mut f = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&p)
+                .unwrap();
+            f.write_all(b"hello inline").unwrap();
+            f.sync_all().unwrap(); // first flush — used to drain the buffer
+            assert_eq!(fs::read(&p).unwrap(), b"hello inline", "lost after fsync");
+            f.write_all(b" more").unwrap();
+            f.sync_all().unwrap();
+            drop(f);
+            assert_eq!(fs::read(&p).unwrap(), b"hello inline more");
+        },
+        None,
+    );
+    // Inline → no content block on disk.
+    assert_eq!(content_files(data.path()), 0, "tiny file should be inline");
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            assert_eq!(fs::read(mnt.join("tiny")).unwrap(), b"hello inline more");
+        },
+        None,
+    );
+}
+
+/// A file that grows past the inline threshold migrates to block storage
+/// transparently, preserving the bytes already written inline, and reads
+/// back correctly live and across a remount.
+#[test_log::test]
+fn file_grows_from_inline_to_blocks() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    let total = 10_000usize; // > 4 KiB inline threshold → block-backed
+    let mut buf = vec![0u8; total];
+    pattern_fill(0, &mut buf);
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let p = mnt.join("grower");
+            let mut f = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&p)
+                .unwrap();
+            // First a sub-threshold write (stored inline), then extend past
+            // the threshold (forces the inline→blocks migration).
+            f.write_all(&buf[..3000]).unwrap();
+            f.write_all(&buf[3000..]).unwrap();
+            f.sync_all().unwrap();
+            drop(f);
+            let got = fs::read(&p).unwrap();
+            assert_eq!(got.len(), total);
+            pattern_check(0, &got);
+        },
+        None,
+    );
+    // Now block-backed: at least one content block exists.
+    assert!(content_files(data.path()) >= 1, "expected a content block after growth");
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let got = fs::read(mnt.join("grower")).unwrap();
+            assert_eq!(got.len(), total);
+            pattern_check(0, &got);
         },
         None,
     );

@@ -1,10 +1,18 @@
-//! Per-file content access over the block store.
+//! Per-file content access.
 //!
-//! [`Contents`] presents a regular file's byte stream on top of the
-//! fixed-size sealed blocks managed by [`crate::blockstore`]. It buffers
-//! dirty blocks in memory and reconciles them to disk on flush, doing
-//! read-modify-write at block granularity so a partial write only ever
-//! rewrites whole blocks — never a sub-region of an existing on-disk file.
+//! [`Contents`] presents a regular file's byte stream over one of two
+//! storage bodies:
+//!
+//! * **Inline** — a small file (≤ [`inline_threshold`]) whose bytes live
+//!   directly in its inode record in the log. No separate content file at
+//!   all: a tiny file costs zero extra backing-store objects.
+//! * **Blocks** — a larger file split into [`CHUNK_SIZE`] sealed block files
+//!   (see [`crate::blockstore`]), read-modify-written a whole block at a time
+//!   so a partial write never rewrites a sub-region of an on-disk object.
+//!
+//! A file is created inline and transitions to block storage the first time
+//! it grows past the threshold (one-way; a file that was large stays
+//! block-backed even if later truncated small).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -18,15 +26,28 @@ use crate::error::{BkfsResult, BkfsResultExt};
 use crate::handle::Handler;
 use crate::inode::{time_now, ContentId, FileData, Inode, InodeAttributes};
 
-/// Soft cap on per-file in-memory dirty data. With `FOPEN_DIRECT_IO` the
-/// kernel streams writes straight to us and never triggers a writeback, so
-/// without a cap a single large sequential write would buffer the *entire*
-/// file in our heap before anything reached the backing store — defeating
-/// the whole point of avoiding kernel page-cache buildup, and serializing
-/// all crypto/ECC/I/O into one burst at close. Once the buffer exceeds this,
-/// completed low blocks are sealed and written out (fast path, batched
-/// syncfs), bounding memory and pipelining I/O with the incoming writes.
-/// Overridable via `BACKUPFS_WRITE_BUFFER` (bytes).
+/// Files at or below this size are stored inline in their inode record;
+/// larger files use block storage. Default 4 KiB (one filesystem block) —
+/// large enough to absorb the long tail of tiny files (dotfiles, configs,
+/// symlink-ish data) where the per-object cost dominates, small enough that
+/// re-appending the inode record on a metadata change stays cheap.
+/// Overridable via `BACKUPFS_INLINE_MAX`; capped at `CHUNK_SIZE`.
+pub fn inline_threshold() -> u64 {
+    static T: OnceLock<u64> = OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("BACKUPFS_INLINE_MAX")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(4096)
+            .min(CHUNK_SIZE)
+    })
+}
+
+/// Soft cap on per-file in-memory dirty *block* data. With `FOPEN_DIRECT_IO`
+/// the kernel streams writes straight to us and never triggers a writeback,
+/// so without a cap a large sequential write would buffer the entire file in
+/// our heap. Once exceeded, completed low blocks are written out (fast path)
+/// and dropped, bounding memory and pipelining I/O. `BACKUPFS_WRITE_BUFFER`.
 fn write_buffer_budget() -> usize {
     static BUDGET: OnceLock<usize> = OnceLock::new();
     *BUDGET.get_or_init(|| {
@@ -38,21 +59,24 @@ fn write_buffer_budget() -> usize {
     })
 }
 
+enum Body {
+    /// Whole file content, mirrored into `inode.attrs.contents` as
+    /// `FileData::Inline` on flush.
+    Inline(Vec<u8>),
+    Blocks {
+        content_id: ContentId,
+        /// Block index → logical bytes (≤ `CHUNK_SIZE`), loaded lazily for RMW.
+        dirty: BTreeMap<u64, Vec<u8>>,
+        dirty_bytes: usize,
+        /// Blocks believed to exist on disk (for trailing-block prune).
+        disk_blocks: u64,
+    },
+}
+
 pub struct Contents {
     pub inode: InodeAttributes,
-    content_id: ContentId,
     pub(crate) changed: bool,
-    /// Blocks with unpersisted modifications: block index → logical bytes
-    /// (length ≤ `CHUNK_SIZE`). A block is loaded here lazily on first
-    /// write that touches it (read-modify-write).
-    dirty: BTreeMap<u64, Vec<u8>>,
-    /// Running total of `dirty`'s block byte lengths, kept in sync so the
-    /// spill threshold is an O(1) check.
-    dirty_bytes: usize,
-    /// Number of blocks believed to exist on disk. Initialized from the
-    /// inode's size on open and updated on every flush, so flush knows
-    /// which trailing blocks to delete after a shrink/truncate.
-    disk_blocks: u64,
+    body: Body,
     ctrl: Controller,
 }
 
@@ -70,8 +94,7 @@ impl Contents {
     }
 
     /// Open with attrs already in hand — e.g. taken from the Handler's
-    /// dirty cache. `changed` carries unpersisted metadata forward so the
-    /// eventual flush writes it.
+    /// dirty cache. `changed` carries unpersisted metadata forward.
     pub fn open_with_attrs(
         ctrl: Controller,
         attrs: InodeAttributes,
@@ -81,54 +104,58 @@ impl Contents {
     }
 
     fn from_attrs(ctrl: Controller, inode: InodeAttributes, changed: bool) -> BkfsResult<Self> {
-        let content_id = match &inode.attrs.contents {
-            FileData::File(a) => *a,
+        let body = match &inode.attrs.contents {
+            FileData::Inline(bytes) => {
+                // Trim any size-obfuscation padding back to the logical size
+                // so it can't accumulate across flush/remount cycles.
+                let mut b = bytes.clone();
+                b.truncate(inode.attrs.size as usize);
+                Body::Inline(b)
+            }
+            FileData::File(cid) => Body::Blocks {
+                content_id: *cid,
+                dirty: BTreeMap::new(),
+                dirty_bytes: 0,
+                disk_blocks: blockstore::block_count(inode.attrs.size),
+            },
             FileData::Directory(_) => return BkfsResult::errno(libc::EISDIR),
-            FileData::Symlink(_) => return BkfsResult::errno(libc::EINVAL),
             _ => return BkfsResult::errno(libc::EINVAL),
         };
-        let disk_blocks = blockstore::block_count(inode.attrs.size);
-        Ok(Self {
-            inode,
-            content_id,
-            changed,
-            dirty: BTreeMap::new(),
-            dirty_bytes: 0,
-            disk_blocks,
-            ctrl,
-        })
+        Ok(Self { inode, changed, body, ctrl })
     }
 
-    /// Logical valid length of block `idx` given the current file size.
-    fn valid_len(&self, idx: u64) -> usize {
-        let start = idx * CHUNK_SIZE;
-        if start >= self.inode.attrs.size {
-            0
-        } else {
-            ((self.inode.attrs.size - start).min(CHUNK_SIZE)) as usize
-        }
+    fn size(&self) -> u64 {
+        self.inode.attrs.size
     }
 
-    /// Fetch a block's current logical bytes from the dirty cache or disk,
-    /// zero-filled to its valid length. Holes (absent on disk) read as
-    /// zeros.
-    fn load_block(&self, idx: u64) -> BkfsResult<Vec<u8>> {
-        if let Some(buf) = self.dirty.get(&idx) {
-            return Ok(buf.clone());
-        }
-        let valid = self.valid_len(idx);
-        let mut buf = blockstore::read_block(&self.ctrl, self.content_id, idx)?.unwrap_or_default();
-        if buf.len() < valid {
-            buf.resize(valid, 0);
-        }
-        Ok(buf)
-    }
+    // ── reads ──────────────────────────────────────────────
 
     pub fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> BkfsResult<()> {
         let end = offset + buf.len() as u64;
-        if end > self.inode.attrs.size {
+        if end > self.size() {
             return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
         }
+        match &self.body {
+            Body::Inline(data) => {
+                // `off` is clamped to the stored length: bytes in
+                // [data.len(), size) are holes (e.g. after a truncate-grow)
+                // and read back as zeros. Clamping also avoids slicing past
+                // the end (which would panic in a worker and wedge the op).
+                let off = (offset as usize).min(data.len());
+                let copy = buf.len().min(data.len() - off);
+                buf[..copy].copy_from_slice(&data[off..off + copy]);
+                for b in &mut buf[copy..] {
+                    *b = 0;
+                }
+            }
+            Body::Blocks { .. } => self.read_blocks_at(buf, offset)?,
+        }
+        self.inode.attrs.atime = time_now();
+        self.changed = true;
+        Ok(())
+    }
+
+    fn read_blocks_at(&self, buf: &mut [u8], offset: u64) -> BkfsResult<()> {
         let mut filled = 0usize;
         while filled < buf.len() {
             let pos = offset + filled as u64;
@@ -139,49 +166,65 @@ impl Contents {
             let avail = block.len().saturating_sub(within);
             let copy = take.min(avail);
             dst[..copy].copy_from_slice(&block[within..within + copy]);
-            // Bytes past the block's stored length are holes → already
-            // zeroed in `dst` (buffers arrive zeroed from the read path).
             for b in &mut dst[copy..] {
                 *b = 0;
             }
             filled += take;
         }
-        self.inode.attrs.atime = time_now();
-        self.changed = true;
         Ok(())
     }
+
+    /// Logical valid length of block `idx` given the current file size.
+    fn valid_len(&self, idx: u64) -> usize {
+        let start = idx * CHUNK_SIZE;
+        if start >= self.size() {
+            0
+        } else {
+            ((self.size() - start).min(CHUNK_SIZE)) as usize
+        }
+    }
+
+    fn load_block(&self, idx: u64) -> BkfsResult<Vec<u8>> {
+        let Body::Blocks { content_id, dirty, .. } = &self.body else {
+            return Ok(Vec::new());
+        };
+        if let Some(buf) = dirty.get(&idx) {
+            return Ok(buf.clone());
+        }
+        let valid = self.valid_len(idx);
+        let mut buf = blockstore::read_block(&self.ctrl, *content_id, idx)?.unwrap_or_default();
+        if buf.len() < valid {
+            buf.resize(valid, 0);
+        }
+        Ok(buf)
+    }
+
+    // ── writes ─────────────────────────────────────────────
 
     pub fn write_all_at(&mut self, buf: &[u8], offset: u64) -> BkfsResult<()> {
         self.ctrl.check_rw()?;
         let end = offset + buf.len() as u64;
-        let mut written = 0usize;
-        while written < buf.len() {
-            let pos = offset + written as u64;
-            let (idx, within) = blockstore::locate(pos);
-            let take = (buf.len() - written).min(CHUNK_SIZE as usize - within);
-            // Read-modify-write: pull the existing block (or a hole) into
-            // the dirty cache, then overlay the new bytes.
-            let mut block = match self.dirty.remove(&idx) {
-                Some(b) => {
-                    self.dirty_bytes -= b.len();
-                    b
+
+        if let Body::Inline(_) = &self.body {
+            if end <= inline_threshold() {
+                let Body::Inline(data) = &mut self.body else { unreachable!() };
+                if (data.len() as u64) < end {
+                    data.resize(end as usize, 0);
                 }
-                None => {
-                    let valid = self.valid_len(idx);
-                    let mut b =
-                        blockstore::read_block(&self.ctrl, self.content_id, idx)?.unwrap_or_default();
-                    b.truncate(valid);
-                    b
+                data[offset as usize..end as usize].copy_from_slice(buf);
+                self.inode.attrs.modified();
+                if end > self.inode.attrs.size {
+                    self.inode.attrs.size = end;
                 }
-            };
-            if block.len() < within + take {
-                block.resize(within + take, 0);
+                self.changed = true;
+                return Ok(());
             }
-            block[within..within + take].copy_from_slice(&buf[written..written + take]);
-            self.dirty_bytes += block.len();
-            self.dirty.insert(idx, block);
-            written += take;
+            // Grows past the inline threshold → migrate to block storage,
+            // then fall through to the block write path below.
+            self.inline_to_blocks()?;
         }
+
+        self.write_blocks_at(buf, offset)?;
         self.inode.attrs.modified();
         if end > self.inode.attrs.size {
             self.inode.attrs.size = end;
@@ -191,24 +234,84 @@ impl Contents {
         Ok(())
     }
 
-    /// Bound in-memory dirty data: while over budget, seal and write out the
-    /// lowest-indexed dirty block (fast path; durability rides the batched
-    /// syncfs) and drop it from the cache. The highest block — the active
-    /// write frontier — is always kept so sequential appends keep coalescing
-    /// in memory. A spilled block that is touched again is transparently
-    /// reloaded via read-modify-write.
-    fn spill_to_budget(&mut self) -> BkfsResult<()> {
-        let budget = write_buffer_budget();
-        while self.dirty_bytes > budget && self.dirty.len() > 1 {
-            let idx = *self.dirty.keys().next().unwrap();
-            let mut block = self.dirty.remove(&idx).unwrap();
-            self.dirty_bytes -= block.len();
-            block.truncate(self.valid_len(idx));
-            blockstore::write_block(&self.ctrl, self.content_id, idx, &block, false)?;
-            self.ctrl.tick_save()?;
-            self.disk_blocks = self.disk_blocks.max(idx + 1);
+    fn write_blocks_at(&mut self, buf: &[u8], offset: u64) -> BkfsResult<()> {
+        let content_id = match &self.body {
+            Body::Blocks { content_id, .. } => *content_id,
+            Body::Inline(_) => unreachable!("inline must be migrated before block write"),
+        };
+        let mut written = 0usize;
+        while written < buf.len() {
+            let pos = offset + written as u64;
+            let (idx, within) = blockstore::locate(pos);
+            let take = (buf.len() - written).min(CHUNK_SIZE as usize - within);
+            let valid = self.valid_len(idx);
+            let Body::Blocks { dirty, dirty_bytes, .. } = &mut self.body else { unreachable!() };
+            let mut block = match dirty.remove(&idx) {
+                Some(b) => {
+                    *dirty_bytes -= b.len();
+                    b
+                }
+                None => {
+                    let mut b = blockstore::read_block(&self.ctrl, content_id, idx)?
+                        .unwrap_or_default();
+                    b.truncate(valid);
+                    b
+                }
+            };
+            if block.len() < within + take {
+                block.resize(within + take, 0);
+            }
+            block[within..within + take].copy_from_slice(&buf[written..written + take]);
+            let Body::Blocks { dirty, dirty_bytes, .. } = &mut self.body else { unreachable!() };
+            *dirty_bytes += block.len();
+            dirty.insert(idx, block);
+            written += take;
         }
         Ok(())
+    }
+
+    /// Migrate an inline file to block storage, preserving its bytes as the
+    /// initial dirty blocks. Content id is the (never-reused) inode number.
+    fn inline_to_blocks(&mut self) -> BkfsResult<()> {
+        let Body::Inline(data) = &mut self.body else { return Ok(()) };
+        let data = std::mem::take(data);
+        let content_id = ContentId(self.inode.inode.0);
+        let mut dirty = BTreeMap::new();
+        let mut dirty_bytes = 0usize;
+        for (i, chunk) in data.chunks(CHUNK_SIZE as usize).enumerate() {
+            dirty_bytes += chunk.len();
+            dirty.insert(i as u64, chunk.to_vec());
+        }
+        self.body = Body::Blocks { content_id, dirty, dirty_bytes, disk_blocks: 0 };
+        self.inode.attrs.contents = FileData::File(content_id);
+        Ok(())
+    }
+
+    fn spill_to_budget(&mut self) -> BkfsResult<()> {
+        let budget = write_buffer_budget();
+        let content_id = match &self.body {
+            Body::Blocks { content_id, .. } => *content_id,
+            Body::Inline(_) => return Ok(()),
+        };
+        loop {
+            let idx = {
+                let Body::Blocks { dirty, dirty_bytes, .. } = &self.body else { return Ok(()) };
+                if *dirty_bytes <= budget || dirty.len() <= 1 {
+                    return Ok(());
+                }
+                *dirty.keys().next().unwrap()
+            };
+            let valid = self.valid_len(idx);
+            let Body::Blocks { dirty, dirty_bytes, disk_blocks, .. } = &mut self.body else {
+                return Ok(());
+            };
+            let mut block = dirty.remove(&idx).unwrap();
+            *dirty_bytes -= block.len();
+            *disk_blocks = (*disk_blocks).max(idx + 1);
+            block.truncate(valid);
+            blockstore::write_block(&self.ctrl, content_id, idx, &block, false)?;
+            self.ctrl.tick_save()?;
+        }
     }
 
     pub fn fallocate(
@@ -219,20 +322,15 @@ impl Contents {
         keep_size: bool,
     ) -> BkfsResult<()> {
         self.ctrl.check_rw()?;
-        let punch = mode & (libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_ZERO_RANGE) != 0;
-        if punch {
-            // Zero the range via read-modify-write. (We zero rather than
-            // delete whole blocks so partial edges stay correct; fully
-            // covered blocks are dropped lazily on the next shrink.)
+        if mode & (libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_ZERO_RANGE) != 0 {
             let mut remaining = length;
             let mut pos = offset;
             let zeros = vec![0u8; CHUNK_SIZE as usize];
             while remaining > 0 {
                 let within = (pos % CHUNK_SIZE) as usize;
                 let take = (remaining as usize).min(CHUNK_SIZE as usize - within);
-                // Don't extend the file for a pure hole-punch.
-                if pos < self.inode.attrs.size {
-                    let cap = ((self.inode.attrs.size - pos) as usize).min(take);
+                if pos < self.size() {
+                    let cap = ((self.size() - pos) as usize).min(take);
                     self.write_all_at(&zeros[..cap], pos)?;
                 }
                 pos += take as u64;
@@ -250,9 +348,8 @@ impl Contents {
         Ok(())
     }
 
-    /// Write all dirty blocks (fast path) and prune blocks past EOF, then
-    /// persist the inode (fast). Durability is the caller's batched
-    /// `syncfs` — see `Controller::tick_save`.
+    // ── flush / close ──────────────────────────────────────
+
     pub fn flush(&mut self) -> BkfsResult<()> {
         self.flush_content_only()?;
         if self.changed {
@@ -263,49 +360,69 @@ impl Contents {
         Ok(())
     }
 
-    /// Flush content blocks (fast), prune trailing blocks after a shrink,
-    /// but don't persist the inode — the caller routes that itself.
+    /// Reconcile the body to disk and into `inode.attrs.contents`, but don't
+    /// persist the inode record itself — the caller routes that.
     fn flush_content_only(&mut self) -> BkfsResult<()> {
+        // A setattr/truncate may have changed size out from under an inline
+        // body; reconcile, migrating to blocks if it grew past the threshold.
+        if let Body::Inline(data) = &mut self.body {
+            if self.inode.attrs.size > inline_threshold() {
+                // Grew past the threshold (e.g. a truncate-grow): migrate the
+                // *existing* bytes to block 0 and fall through to the block
+                // flush. Bytes beyond `data` stay holes (sparse) — never
+                // materialized, so a huge set_len can't OOM us.
+                self.inline_to_blocks()?;
+            } else {
+                // size ≤ threshold, so this resize is bounded and cheap.
+                // CLONE (don't drain): the inline buffer is the file's only
+                // copy of its content, so a later flush (fsync then close)
+                // must still find it. Draining it would persist empty bytes.
+                data.resize(self.inode.attrs.size as usize, 0);
+                self.inode.attrs.contents = FileData::Inline(data.clone());
+                return Ok(());
+            }
+        }
+
         let required = blockstore::block_count(self.inode.attrs.size);
-        let dirty = std::mem::take(&mut self.dirty);
-        self.dirty_bytes = 0;
+        let (content_id, dirty, disk_blocks) = match &mut self.body {
+            Body::Blocks { content_id, dirty, dirty_bytes, disk_blocks } => {
+                *dirty_bytes = 0;
+                (*content_id, std::mem::take(dirty), *disk_blocks)
+            }
+            Body::Inline(_) => return Ok(()),
+        };
         let last = required.saturating_sub(1);
         for (idx, mut block) in dirty {
             if idx >= required {
-                // Block lies entirely past the (possibly shrunk) EOF; it
-                // will be removed by the prune loop below.
-                continue;
+                continue; // past EOF; pruned below
             }
             block.truncate(self.valid_len(idx));
             if idx == last {
-                self.pad_final_block(&mut block);
+                self.pad_final_inline(&mut block);
             }
-            blockstore::write_block(&self.ctrl, self.content_id, idx, &block, false)?;
+            blockstore::write_block(&self.ctrl, content_id, idx, &block, false)?;
             self.ctrl.tick_save()?;
         }
-        // Remove blocks beyond the current size (truncate / shrink).
-        for idx in required..self.disk_blocks {
-            blockstore::remove_block(&self.ctrl, self.content_id, idx)?;
+        for idx in required..disk_blocks {
+            blockstore::remove_block(&self.ctrl, content_id, idx)?;
         }
-        self.disk_blocks = required;
+        if let Body::Blocks { disk_blocks, .. } = &mut self.body {
+            *disk_blocks = required;
+        }
         Ok(())
     }
 
-    /// Optionally pad the final block's stored plaintext with random bytes
-    /// to obscure the exact file size (the `--file-size-padding` knob).
-    /// Padding never affects logical reads, which are bounded by the inode
-    /// size.
-    fn pad_final_block(&self, block: &mut Vec<u8>) {
-        let padded = self.ctrl.file_pad(block.len() as u64) as usize;
-        if padded > block.len() {
-            let start = block.len();
-            block.resize(padded, 0);
-            rng().fill_bytes(&mut block[start..]);
+    /// Optionally pad stored bytes with random data to obscure the exact
+    /// size (the `--file-size-padding` knob). Never affects logical reads.
+    fn pad_final_inline(&self, bytes: &mut Vec<u8>) {
+        let padded = self.ctrl.file_pad(bytes.len() as u64) as usize;
+        if padded > bytes.len() {
+            let start = bytes.len();
+            bytes.resize(padded, 0);
+            rng().fill_bytes(&mut bytes[start..]);
         }
     }
 
-    /// User-requested fsync: flush everything, then `syncfs` so the whole
-    /// batch reaches stable storage.
     pub fn fsync(&mut self) -> BkfsResult<()> {
         self.flush()?;
         self.ctrl.syncfs()?;
@@ -313,14 +430,9 @@ impl Contents {
     }
 
     pub fn close(mut self, handler: &mut Handler) -> BkfsResult<()> {
-        // Write content fast, then hand the inode save to the dirty cache
-        // so rsync's post-close chmod/chown/utime trio coalesces onto a
-        // single disk write.
         self.flush_content_only()?;
         let attrs = self.inode.clone();
         let changed = self.changed;
-        // Drop so the Weak in handler.inodes has strong_count == 0 and
-        // gc_inode can collect if this was the last reference.
         drop(self);
         if !handler.gc_inode(&attrs)? && changed {
             handler.save_inode(&attrs)?;

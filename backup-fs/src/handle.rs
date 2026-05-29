@@ -749,15 +749,12 @@ impl Handler {
         self.dirty.remove(&inode.inode);
         self.read_cache.borrow_mut().remove(inode.inode);
 
-        // An inode created and deleted within the same mount session
-        // may have lived only in the dirty cache and never been flushed
-        // to disk. NotFound here means the dirty-cache removal above
-        // was the whole story.
-        match std::fs::remove_file(self.ctrl().resolve_inode_path(inode.inode)) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
+        // Tombstone the inode in the log durably BEFORE removing its content
+        // (block files / dir buckets): a crash with the content gone but the
+        // tombstone not yet durable would leave the inode "live" on replay
+        // pointing at deleted content. (An inode that only ever lived in the
+        // dirty cache and was never appended still gets a harmless tombstone.)
+        self.ctrl().log_tombstone(inode.inode, true)?;
         match &inode.attrs.contents {
             FileData::File(contents) => {
                 crate::blockstore::remove_all_blocks(self.ctrl(), *contents, inode.attrs.size)?;

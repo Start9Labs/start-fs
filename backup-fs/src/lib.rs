@@ -44,9 +44,6 @@ pub mod error;
 mod handle;
 mod inode;
 mod pool;
-// Foundation for log-structured inode packing (stages 3+ of small-file
-// packing); not yet wired into the filesystem, so allow dead code for now.
-#[allow(dead_code)]
 mod seglog;
 mod serde;
 mod vault;

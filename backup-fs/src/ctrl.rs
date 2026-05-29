@@ -3,23 +3,23 @@ use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use chacha20::cipher::{Iv, KeyIvInit, StreamCipher, StreamCipherSeek};
-use chacha20::{ChaCha20, Key};
+use std::io::Write;
+
+use chacha20::Key;
 use fuser::{FileType, FUSE_ROOT_ID};
 use log::error;
 use rand::Rng;
 use sha2::{Digest, Sha256};
-use std::io::Write;
 
 use crate::atomic_file::AtomicFile;
 use crate::directory::{DirectoryContents, DirectoryEntry};
-use crate::error::{BkfsError, BkfsResult, BkfsResultExt};
-use crate::inode::{ContentId, FileData, Inode, InodeAttributes};
+use crate::error::{BkfsResult, BkfsResultExt};
+use crate::inode::{Attributes, ContentId, FileData, Inode, InodeAttributes};
+use crate::seglog::{self, SegmentLog};
 use crate::serde;
-use crate::util::IdPool;
 use crate::{BackupFSOptions, CryptInfo};
 
 #[derive(Clone)]
@@ -33,19 +33,21 @@ const _: fn() = || {
     assert_send_sync::<Controller>();
 };
 
-const U16_MSB: u16 = 0b1000_0000_0000_0000;
-
 pub struct ControllerSeed {
     config: BackupFSOptions,
     cryptinfo_path: PathBuf,
     cryptinfo: CryptInfo,
     key: Key,
-    inode_cipher: Mutex<ChaCha20>,
-    inode_dir: PathBuf,
     contents_dir: PathBuf,
     dirents_dir: PathBuf,
-    inode_pool_path: PathBuf,
-    inode_pool: Mutex<IdPool>,
+    /// Log-structured inode store. Inodes are records here, not per-inode
+    /// files. Behind a Mutex because the Controller is shared across the
+    /// worker pool; sealing happens outside the lock (see `seglog`).
+    log: Mutex<SegmentLog>,
+    /// Monotonic inode-number allocator. Seeded past the highest number ever
+    /// seen in the log at mount (ids are never reused), so a recovered
+    /// allocator can't collide with a surviving inode.
+    next_inode: AtomicU64,
     /// Counts fast (non-durable) saves since the last syncfs. Both
     /// dispatch-thread eviction and worker-thread content saves bump
     /// this; when it reaches the batch threshold, the next caller
@@ -54,51 +56,6 @@ pub struct ControllerSeed {
     /// Cached fd on the data dir for syncfs. Lazily opened and reused
     /// so the batched syncfs path doesn't pay an open(2) on every call.
     data_dir_fd: OnceLock<File>,
-}
-
-fn encrypt_u64(cipher: &Mutex<ChaCha20>, num: u64) -> [u8; 8] {
-    let mut buf = u64::to_be_bytes(num);
-    let mut cipher = cipher.lock().unwrap();
-    cipher.seek(num * std::mem::size_of::<u64>() as u64);
-    cipher.apply_keystream(&mut buf);
-    buf
-}
-
-fn legacy_path(base: &PathBuf, encrypted: [u8; 8]) -> PathBuf {
-    let a = u16::from_be_bytes([encrypted[0], encrypted[1]]);
-    let b = u16::from_be_bytes([encrypted[2], encrypted[3]]);
-    let c = u16::from_be_bytes([encrypted[4], encrypted[5]]);
-    let d = u16::from_be_bytes([encrypted[6], encrypted[7]]);
-    let e = (a & U16_MSB >> 12) | (a & U16_MSB >> 13) | (a & U16_MSB >> 14) | (a & U16_MSB >> 15);
-    let a = a & !U16_MSB;
-    let b = b & !U16_MSB;
-    let c = c & !U16_MSB;
-    let d = d & !U16_MSB;
-    base.join(format!("{a:04x}/{b:04x}/{c:04x}/{d:04x}/{e:02x}"))
-}
-
-/// 2-level path: 2 bytes for directory (65K buckets), 6 bytes for filename.
-/// Supports ~4B files before any bucket exceeds FAT32's 65K entry limit.
-fn current_path(base: &PathBuf, encrypted: [u8; 8]) -> PathBuf {
-    let dir = u16::from_be_bytes([encrypted[0], encrypted[1]]);
-    let file = &encrypted[2..];
-    base.join(format!(
-        "{dir:04x}/{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        file[0], file[1], file[2], file[3], file[4], file[5]
-    ))
-}
-
-/// Returns the current (2-level) path, falling back to legacy (5-level) if only that exists.
-fn resolve_path(base: &PathBuf, encrypted: [u8; 8]) -> PathBuf {
-    let path = current_path(base, encrypted);
-    if path.exists() {
-        return path;
-    }
-    let legacy = legacy_path(base, encrypted);
-    if legacy.exists() {
-        return legacy;
-    }
-    path
 }
 
 impl Controller {
@@ -115,15 +72,16 @@ impl Controller {
             cryptinfo
         };
         let key = Key::clone_from_slice(&*cryptinfo.key);
-        let inode_iv = Iv::<ChaCha20>::clone_from_slice(&cryptinfo.inode_iv);
+        // Opening the log replays existing segments, rebuilding the in-RAM
+        // index and the max-inode high-water mark.
+        let log = SegmentLog::open(config.data_dir.join("segments"), key)?;
+        let next_inode = (log.max_inode() + 1).max(FUSE_ROOT_ID + 1);
         Ok(Self(Arc::new(ControllerSeed {
-            inode_cipher: Mutex::new(ChaCha20::new(&key, &inode_iv)),
             key,
-            inode_dir: config.data_dir.join("inodes"),
             contents_dir: config.data_dir.join("contents"),
             dirents_dir: config.data_dir.join("dirents"),
-            inode_pool_path: config.data_dir.join("inode_pool"),
-            inode_pool: Mutex::new(IdPool::new()),
+            log: Mutex::new(log),
+            next_inode: AtomicU64::new(next_inode),
             pending_saves: AtomicUsize::new(0),
             data_dir_fd: OnceLock::new(),
             config,
@@ -132,28 +90,53 @@ impl Controller {
         })))
     }
 
-    pub fn load_inode_pool(&self) -> BkfsResult<()> {
-        if self.0.inode_pool_path.exists() {
-            match std::fs::read(&self.0.inode_pool_path)
-                .map_err(BkfsError::from)
-                .and_then(|blob| serde::deserialize_sealed::<IdPool>(&blob, self.key()))
-            {
-                Ok(pool) => {
-                    *self.0.inode_pool.lock().unwrap() = pool;
-                    return Ok(());
-                }
-                Err(e) => {
-                    error!("failed to load inode pool: {e}\n    Reconstructing...");
-                }
-            }
+    /// Append/replace an inode record in the log. `durable` fdatasyncs the
+    /// active segment before returning; otherwise durability rides the
+    /// batched syncfs. Sealing is done before taking the log lock.
+    pub fn log_put(&self, inode: Inode, attrs: &Attributes, durable: bool) -> BkfsResult<()> {
+        let rec = seglog::seal_inode(&self.key(), inode, attrs)?;
+        let mut log = self.0.log.lock().unwrap();
+        log.append(&rec)?;
+        if durable {
+            log.sync()?;
         }
-        self.fsck(false)?;
+        Ok(())
+    }
 
+    /// Append a tombstone for `inode`. Callers that need the deletion durable
+    /// before removing the inode's content (block files / dir buckets) pass
+    /// `durable = true`.
+    pub fn log_tombstone(&self, inode: Inode, durable: bool) -> BkfsResult<()> {
+        let rec = seglog::seal_tombstone(&self.key(), inode)?;
+        let mut log = self.0.log.lock().unwrap();
+        log.append(&rec)?;
+        if durable {
+            log.sync()?;
+        }
+        Ok(())
+    }
+
+    pub fn log_load(&self, inode: Inode) -> BkfsResult<Option<Attributes>> {
+        self.0.log.lock().unwrap().load(inode)
+    }
+
+    pub fn log_contains(&self, inode: Inode) -> bool {
+        self.0.log.lock().unwrap().contains(inode)
+    }
+
+    /// Number of live inodes in the log index (used by tests to detect
+    /// orphan/zombie inodes the old layout would have left as files).
+    pub fn live_inode_count(&self) -> usize {
+        self.0.log.lock().unwrap().live_count()
+    }
+
+    /// No-op kept for the mount path: the log's replay (in `new`) already
+    /// rebuilt the index and the inode-number high-water mark.
+    pub fn load_inode_pool(&self) -> BkfsResult<()> {
         Ok(())
     }
 
     pub fn fsck(&self, find_orphans: bool) -> BkfsResult<()> {
-        *self.0.inode_pool.lock().unwrap() = IdPool::new();
         self.fsck_inode(Inode(FUSE_ROOT_ID), None)?;
         if find_orphans {
             self.find_orphans()?;
@@ -168,8 +151,6 @@ impl Controller {
     ) -> BkfsResult<bool> {
         let mut prune = false;
         let mut changed = false;
-        self.0.inode_pool.lock().unwrap().remove(inode.0);
-        // match self.load::(args)
         let mut inode = match self.load::<InodeAttributes>(inode) {
             Ok(mut inode) => {
                 if let Some((parent, _)) = parent {
@@ -253,27 +234,6 @@ impl Controller {
         } else {
             Ok(())
         }
-    }
-
-    /// Returns the current (2-level) path for writing. Cleans up legacy (5-level) copy.
-    pub fn inode_path(&self, inode: Inode) -> PathBuf {
-        let encrypted = encrypt_u64(&self.0.inode_cipher, inode.0);
-        self.cleanup_legacy(&self.0.inode_dir, encrypted);
-        current_path(&self.0.inode_dir, encrypted)
-    }
-
-    fn cleanup_legacy(&self, base: &PathBuf, encrypted: [u8; 8]) {
-        let legacy = legacy_path(base, encrypted);
-        if legacy.exists() {
-            let _ = std::fs::remove_file(&legacy);
-        }
-    }
-
-    pub fn resolve_inode_path(&self, inode: Inode) -> PathBuf {
-        resolve_path(
-            &self.0.inode_dir,
-            encrypt_u64(&self.0.inode_cipher, inode.0),
-        )
     }
 
     /// Deterministic, key-dependent filename for content block
@@ -372,23 +332,14 @@ impl Controller {
 
     pub fn next_inode(&self) -> BkfsResult<Inode> {
         self.check_rw()?;
-        let mut pool = self.0.inode_pool.lock().unwrap();
-        let res: u64 = pool
-            .next()
-            .ok_or(libc::EMFILE)
-            .map_err(io::Error::from_raw_os_error)?;
-        // Fast (non-fsync) save: a per-creation sync_all here was a CIFS
-        // round trip on every single file in a backup. The pool is
-        // reconstructible by fsck, and its update rides the same batched
-        // syncfs as the inode/content writes that consume the id — so a
-        // crash loses the pool bump and those inodes together (consistent),
-        // never reusing a live id.
-        let blob = serde::serialize_sealed(&*pool, self.key())?;
-        let mut file = AtomicFile::create_buffered(self.0.inode_pool_path.clone())?;
-        file.write_all(&blob)?;
-        file.save_fast()?;
-        self.tick_save()?;
-        Ok(Inode(res))
+        // Monotonic, never-reused. Needs no separate persistence: replay
+        // reseeds it past the highest inode ever recorded in the log, so a
+        // crash can never re-hand a number a surviving inode still uses.
+        let id = self.0.next_inode.fetch_add(1, Ordering::Relaxed);
+        if id == 0 || id == u64::MAX {
+            return BkfsResult::errno(libc::EMFILE);
+        }
+        Ok(Inode(id))
     }
 
     pub fn file_pad(&self, size: u64) -> u64 {
@@ -510,10 +461,12 @@ pub struct StatFs {
 
 impl Controller {
     pub fn statfs(&self) -> StatFs {
-        let pool = self.0.inode_pool.lock().unwrap();
+        // Approximate: every number below the monotonic allocator counts as
+        // "used" (deleted ids are never reclaimed). Good enough for df.
+        let used = self.0.next_inode.load(Ordering::Relaxed).saturating_sub(1);
         StatFs {
-            ffree: pool.free_space(),
-            files: pool.used_space(),
+            files: used,
+            ffree: u64::MAX - used,
         }
     }
 }

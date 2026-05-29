@@ -1,6 +1,5 @@
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -9,12 +8,10 @@ use imbl::{OrdMap, OrdSet};
 use log::debug;
 use serde::{Deserialize, Serialize};
 
-use crate::atomic_file::AtomicFile;
 use crate::ctrl::{Controller, Exists, Load, Save};
 use crate::directory::DirectoryContents;
 use crate::error::{BkfsResult, BkfsResultExt};
 use crate::handle::{FileHandleId, Handler};
-use crate::serde;
 use crate::{get_groups, IdMappedRoot};
 
 pub const BLOCK_SIZE: u64 = 4096;
@@ -242,33 +239,28 @@ fn parse_xattr_namespace(key: &[u8]) -> BkfsResult<XattrNamespace> {
 
 impl<'a> Save for &'a InodeAttributes {
     fn save(self, ctrl: &Controller) -> BkfsResult<()> {
-        let blob = serde::serialize_sealed(&self.attrs, ctrl.key())?;
-        let mut file = AtomicFile::create_buffered(ctrl.inode_path(self.inode))?;
-        file.write_all(&blob)?;
-        file.save()
+        ctrl.log_put(self.inode, &self.attrs, true)
     }
     fn save_fast(self, ctrl: &Controller) -> BkfsResult<()> {
-        let blob = serde::serialize_sealed(&self.attrs, ctrl.key())?;
-        let mut file = AtomicFile::create_buffered(ctrl.inode_path(self.inode))?;
-        file.write_all(&blob)?;
-        file.save_fast()
+        ctrl.log_put(self.inode, &self.attrs, false)
     }
 }
 
 impl Load for InodeAttributes {
     type Args<'a> = Inode;
     fn load(ctrl: &Controller, inode: Self::Args<'_>) -> BkfsResult<Self> {
-        let blob = std::fs::read(ctrl.resolve_inode_path(inode))?;
-        Ok(InodeAttributes {
-            inode,
-            attrs: serde::deserialize_sealed(&blob, ctrl.key())?,
-        })
+        match ctrl.log_load(inode)? {
+            Some(attrs) => Ok(InodeAttributes { inode, attrs }),
+            // Absent from the index = never written or tombstoned. Surface
+            // as NotFound so the stale-parent self-heal paths fire.
+            None => BkfsResult::errno_notrace(libc::ENOENT),
+        }
     }
 }
 
 impl Exists for InodeAttributes {
     fn exists(ctrl: &Controller, inode: Self::Args<'_>) -> bool {
-        ctrl.resolve_inode_path(inode).exists()
+        ctrl.log_contains(inode)
     }
 }
 

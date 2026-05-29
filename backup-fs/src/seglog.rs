@@ -91,6 +91,29 @@ pub enum Record {
     Tombstone { inode: u64 },
 }
 
+/// A record already serialized + vault-sealed, ready to append. Produced
+/// outside the log lock by [`seal_inode`]/[`seal_tombstone`].
+pub struct SealedRecord {
+    inode: u64,
+    bytes: Vec<u8>,
+    tombstone: bool,
+}
+
+/// Seal an inode record (encryption + ECC) without touching the log.
+pub fn seal_inode(key: &Key, inode: Inode, attrs: &Attributes) -> BkfsResult<SealedRecord> {
+    let bytes = vault::seal(
+        &bincode::serialize(&Record::Inode { inode: inode.0, attrs: attrs.clone() })?,
+        key,
+    );
+    Ok(SealedRecord { inode: inode.0, bytes, tombstone: false })
+}
+
+/// Seal a tombstone record without touching the log.
+pub fn seal_tombstone(key: &Key, inode: Inode) -> BkfsResult<SealedRecord> {
+    let bytes = vault::seal(&bincode::serialize(&Record::Tombstone { inode: inode.0 })?, key);
+    Ok(SealedRecord { inode: inode.0, bytes, tombstone: true })
+}
+
 /// Physical location of a record's frame within the log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Location {
@@ -308,12 +331,13 @@ impl SegmentLog {
         }
     }
 
-    fn append(&mut self, record: &Record) -> BkfsResult<Location> {
-        let inode = record.inode();
-        let payload = vault::seal(&bincode::serialize(record)?, &self.key);
+    /// Append a pre-sealed record (see [`seal_inode`]/[`seal_tombstone`]).
+    /// Sealing is done by the caller *outside* the log lock so the global
+    /// append critical section never serializes ChaCha20/Reed-Solomon work.
+    pub fn append(&mut self, rec: &SealedRecord) -> BkfsResult<()> {
         let seq = self.next_seq;
         self.next_seq += 1;
-        let frame = encode_frame(seq, &payload);
+        let frame = encode_frame(seq, &rec.bytes);
         // Roll to a new segment if the active one is full (but never leave a
         // segment empty: always write at least one frame per segment).
         if self.active_offset > 0 && self.active_offset + frame.len() as u64 > segment_size() {
@@ -324,36 +348,41 @@ impl SegmentLog {
         self.active_offset += frame.len() as u64;
         let loc = Location { segment: self.active_id, offset, len: frame.len() as u32 };
 
-        self.max_inode = self.max_inode.max(inode);
+        self.max_inode = self.max_inode.max(rec.inode);
         let seg = self.seg_meta.entry(self.active_id).or_default();
         seg.total += frame.len() as u64;
         seg.live += frame.len() as u64;
         // Supersede any prior live frame for this inode.
-        if let Some(prev) = self.index.get(&inode).copied() {
+        if let Some(prev) = self.index.get(&rec.inode).copied() {
             if let Some(m) = self.seg_meta.get_mut(&prev.segment) {
                 m.live = m.live.saturating_sub(prev.len as u64);
             }
         }
-        Ok(loc)
-    }
-
-    /// Append/replace an inode record. Returns its location.
-    pub fn put(&mut self, inode: Inode, attrs: &Attributes) -> BkfsResult<()> {
-        let loc = self.append(&Record::Inode { inode: inode.0, attrs: attrs.clone() })?;
-        self.index.insert(inode.0, loc);
-        Ok(())
-    }
-
-    /// Append a tombstone and drop the inode from the index.
-    pub fn tombstone(&mut self, inode: Inode) -> BkfsResult<()> {
-        let loc = self.append(&Record::Tombstone { inode: inode.0 })?;
-        // The tombstone frame itself is dead weight once written (nothing
-        // references it via the index); account it as non-live.
-        if let Some(m) = self.seg_meta.get_mut(&loc.segment) {
-            m.live = m.live.saturating_sub(loc.len as u64);
+        if rec.tombstone {
+            // The tombstone frame is dead weight once written (nothing
+            // references it via the index); account it as non-live.
+            if let Some(m) = self.seg_meta.get_mut(&loc.segment) {
+                m.live = m.live.saturating_sub(loc.len as u64);
+            }
+            self.index.remove(&rec.inode);
+        } else {
+            self.index.insert(rec.inode, loc);
         }
-        self.index.remove(&inode.0);
         Ok(())
+    }
+
+    /// Append/replace an inode record (seals inline; convenience for tests).
+    #[cfg(test)]
+    pub fn put(&mut self, inode: Inode, attrs: &Attributes) -> BkfsResult<()> {
+        let rec = seal_inode(&self.key, inode, attrs)?;
+        self.append(&rec)
+    }
+
+    /// Append a tombstone (seals inline; convenience for tests).
+    #[cfg(test)]
+    pub fn tombstone(&mut self, inode: Inode) -> BkfsResult<()> {
+        let rec = seal_tombstone(&self.key, inode)?;
+        self.append(&rec)
     }
 
     fn roll(&mut self) -> BkfsResult<()> {
@@ -380,6 +409,11 @@ impl SegmentLog {
             libc::posix_fadvise(fd, 0, self.active_offset as libc::off_t, libc::POSIX_FADV_DONTNEED);
         }
         Ok(())
+    }
+
+    /// Number of live inodes (index entries).
+    pub fn live_count(&self) -> usize {
+        self.index.len()
     }
 
     #[cfg(test)]

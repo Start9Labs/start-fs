@@ -157,7 +157,6 @@ fn write_file() {
         },
         None,
     );
-    assert_eq!(tree(data.path().join("inodes"), false).unwrap().len(), 2);
     assert_eq!(tree(data.path().join("contents"), false).unwrap().len(), 1);
 }
 
@@ -178,7 +177,6 @@ fn write_directory() {
         },
         None,
     );
-    assert_eq!(tree(data.path().join("inodes"), false).unwrap().len(), 4);
 }
 
 #[test_log::test]
@@ -309,7 +307,6 @@ fn write_one_file_async() {
         },
         None,
     );
-    assert_eq!(tree(data.path().join("inodes"), false).unwrap().len(), 2);
     assert_eq!(tree(data.path().join("contents"), false).unwrap().len(), 1);
 }
 
@@ -343,7 +340,6 @@ fn write_many_files_async() {
         },
         None,
     );
-    assert_eq!(tree(data.path().join("inodes"), false).unwrap().len(), 101);
     assert_eq!(
         tree(data.path().join("contents"), false).unwrap().len(),
         100
@@ -385,9 +381,8 @@ fn rmrf_leaves_no_orphans() {
         None,
     );
 
-    // Snapshot inode-file count after creation.
-    let inode_files_after_create =
-        tree(data.path().join("inodes"), false).unwrap().len();
+    // Snapshot content-file count after creation (inodes now live in the
+    // log, counted via the index below).
     let content_files_after_create =
         tree(data.path().join("contents"), false).unwrap().len();
 
@@ -422,20 +417,19 @@ fn rmrf_leaves_no_orphans() {
         None,
     );
 
-    // After rm-rf we deleted 13 inodes (3 dirs + 10 files) and 10 content
-    // files. After the phase-3 re-creates we add 3 inodes (3 dirs) and 0
-    // content files. Net relative to phase 1: inodes -10, contents -10.
-    let inodes_now = tree(data.path().join("inodes"), false).unwrap();
-    let contents_now = tree(data.path().join("contents"), false).unwrap();
-    let expected_inodes = inode_files_after_create - 10;
-    let expected_contents = content_files_after_create - 10;
+    // After rm-rf + phase-3 re-create, the only live inodes are root + the
+    // 3 re-created dirs (no zombies resurrected on replay), and the 10
+    // content blocks are reaped.
+    let ctrl = crate::ctrl::Controller::new(opts(data.path(), "ohea")).unwrap();
     assert_eq!(
-        inodes_now.len(),
-        expected_inodes,
-        "orphan inode files left after rm-rf: expected {expected_inodes}, got {} — {:?}",
-        inodes_now.len(),
-        inodes_now
+        ctrl.live_inode_count(),
+        4,
+        "expected root + 3 re-created dirs live, got {}",
+        ctrl.live_inode_count()
     );
+    drop(ctrl);
+    let contents_now = tree(data.path().join("contents"), false).unwrap();
+    let expected_contents = content_files_after_create - 10;
     assert_eq!(
         contents_now.len(),
         expected_contents,
@@ -529,20 +523,7 @@ fn rmdir_heals_stale_parent_reference() {
         None,
     );
 
-    // Snapshot what's on disk, then corrupt: find the 'stale' inode's
-    // on-disk file and remove it. The parent dir still references it.
-    let before: std::collections::HashSet<String> = tree(data.path().join("inodes"), false)
-        .unwrap()
-        .into_iter()
-        .collect();
-
-    // Remove one inode file to simulate a lost write / torn unmount.
-    // We don't know which file corresponds to "stale" without digging
-    // into the encryption, so we open the FS and find the one whose
-    // removal produces the symptom.
-    //
-    // Simpler: mount, look up "stale" to get its inode number, then
-    // remove its inode file externally.
+    // Mount, look up "stale" to get its inode number.
     let stale_inode = {
         let (tx, rx) = oneshot::channel::<Option<u64>>();
         let data_path = data.path().to_owned();
@@ -562,31 +543,11 @@ fn rmdir_heals_stale_parent_reference() {
         rx.recv().unwrap().unwrap()
     };
 
-    // Now find which inode file corresponds to that inode and remove
-    // it externally (this models an unclean shutdown where the
-    // parent's dir entry was saved but the child's inode wasn't).
-    let inode_dir = data.path().join("inodes");
-    let inodes_after: std::collections::HashSet<String> = tree(&inode_dir, false)
-        .unwrap()
-        .into_iter()
-        .collect();
-    // New inodes after the lookup session are exactly the candidates.
-    let _new_inodes: Vec<_> = inodes_after.difference(&before).collect();
-
-    // Deterministic approach: peel off the Controller and call
-    // resolve_inode_path directly.
-    let ctrl = crate::ctrl::Controller::new(BackupFSOptions {
-        data_dir: data.path().to_owned(),
-        setuid_support: false,
-        password: "ohea".to_owned(),
-        file_size_padding: None,
-        readonly: false,
-        idmapped_root: vec![],
-    })
-    .unwrap();
-    let path = ctrl.resolve_inode_path(crate::inode::Inode(stale_inode));
-    assert!(path.exists(), "expected stale inode file at {:?}", path);
-    fs::remove_file(&path).unwrap();
+    // Simulate an unclean shutdown where the parent's dir entry was saved
+    // but the child inode is gone: tombstone the child in the log directly,
+    // leaving the parent still referencing it.
+    let ctrl = crate::ctrl::Controller::new(opts(data.path(), "ohea")).unwrap();
+    ctrl.log_tombstone(crate::inode::Inode(stale_inode), true).unwrap();
     drop(ctrl);
 
     // Now remount and try to clean up the stale entry.
@@ -1231,21 +1192,11 @@ fn rename_over_stale_parent_reference_recovers() {
     };
 
     // Simulate the post-crash state: the parent's dir entry still
-    // references os-backup.json → stale_inode, but stale_inode's
-    // backing file is gone (as if gc_inode ran but parent's new
-    // state was lost to lazy unmount).
-    let ctrl = crate::ctrl::Controller::new(BackupFSOptions {
-        data_dir: data.path().to_owned(),
-        setuid_support: false,
-        password: "ohea".to_owned(),
-        file_size_padding: None,
-        readonly: false,
-        idmapped_root: vec![],
-    })
-    .unwrap();
-    let path = ctrl.resolve_inode_path(crate::inode::Inode(stale_inode));
-    assert!(path.exists(), "expected stale inode file at {path:?}");
-    fs::remove_file(&path).unwrap();
+    // references os-backup.json → stale_inode, but stale_inode is gone from
+    // the log (as if gc_inode ran but the parent's new state was lost to a
+    // lazy unmount). Tombstone it directly.
+    let ctrl = crate::ctrl::Controller::new(opts(data.path(), "ohea")).unwrap();
+    ctrl.log_tombstone(crate::inode::Inode(stale_inode), true).unwrap();
     drop(ctrl);
 
     // Now do the backup pattern: write .tmp, rename over the ghost.

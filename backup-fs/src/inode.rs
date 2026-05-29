@@ -35,6 +35,10 @@ pub enum FileData {
     /// inode record (so a tiny file needs no separate content block file).
     /// Files larger than the inline threshold use `File` + block storage.
     Inline(Vec<u8>),
+    /// A small/medium regular file (≤ one chunk) whose content is a single
+    /// extent packed into the shared content log, addressed by this id. The
+    /// bytes live in the log, not here — only the pointer does.
+    Packed(ContentId),
     Directory(DirectoryContents),
     Symlink(PathBuf),
     /// Character special file; payload is the device number (`rdev`).
@@ -56,7 +60,7 @@ impl FileData {
         matches!(self, Self::Directory(_))
     }
     pub fn is_file(&self) -> bool {
-        matches!(self, Self::File(_) | Self::Inline(_))
+        matches!(self, Self::File(_) | Self::Inline(_) | Self::Packed(_))
     }
     /// Device number for special files, `0` otherwise.
     pub fn rdev(&self) -> u32 {
@@ -70,7 +74,9 @@ impl FileData {
 impl From<&FileData> for fuser::FileType {
     fn from(kind: &FileData) -> Self {
         match kind {
-            FileData::File(_) | FileData::Inline(_) => fuser::FileType::RegularFile,
+            FileData::File(_) | FileData::Inline(_) | FileData::Packed(_) => {
+                fuser::FileType::RegularFile
+            }
             FileData::Directory(_) => fuser::FileType::Directory,
             FileData::Symlink(_) => fuser::FileType::Symlink,
             FileData::CharDevice(_) => fuser::FileType::CharDevice,

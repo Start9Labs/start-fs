@@ -89,13 +89,27 @@ fn segment_size() -> u64 {
 pub enum Record {
     Inode { inode: u64, attrs: Attributes },
     Tombstone { inode: u64 },
+    /// Packed content for a small/medium file (≤ one chunk). Shares the
+    /// segments with inode records but lives in a separate `content` index,
+    /// so a content id may equal its file's inode number without colliding.
+    Content { id: u64, bytes: Vec<u8> },
+    ContentTombstone { id: u64 },
+}
+
+/// Which index a record belongs to. Inode numbers and content ids occupy
+/// independent key spaces (a file's content id equals its inode number).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Space {
+    Inode,
+    Content,
 }
 
 /// A record already serialized + vault-sealed, ready to append. Produced
-/// outside the log lock by [`seal_inode`]/[`seal_tombstone`].
+/// outside the log lock so the global append section never serializes crypto.
 pub struct SealedRecord {
-    inode: u64,
+    key: u64,
     bytes: Vec<u8>,
+    space: Space,
     tombstone: bool,
 }
 
@@ -105,13 +119,28 @@ pub fn seal_inode(key: &Key, inode: Inode, attrs: &Attributes) -> BkfsResult<Sea
         &bincode::serialize(&Record::Inode { inode: inode.0, attrs: attrs.clone() })?,
         key,
     );
-    Ok(SealedRecord { inode: inode.0, bytes, tombstone: false })
+    Ok(SealedRecord { key: inode.0, bytes, space: Space::Inode, tombstone: false })
 }
 
-/// Seal a tombstone record without touching the log.
+/// Seal an inode tombstone record without touching the log.
 pub fn seal_tombstone(key: &Key, inode: Inode) -> BkfsResult<SealedRecord> {
     let bytes = vault::seal(&bincode::serialize(&Record::Tombstone { inode: inode.0 })?, key);
-    Ok(SealedRecord { inode: inode.0, bytes, tombstone: true })
+    Ok(SealedRecord { key: inode.0, bytes, space: Space::Inode, tombstone: true })
+}
+
+/// Seal a packed-content record without touching the log.
+pub fn seal_content(key: &Key, id: u64, bytes: &[u8]) -> BkfsResult<SealedRecord> {
+    let sealed = vault::seal(
+        &bincode::serialize(&Record::Content { id, bytes: bytes.to_vec() })?,
+        key,
+    );
+    Ok(SealedRecord { key: id, bytes: sealed, space: Space::Content, tombstone: false })
+}
+
+/// Seal a content tombstone record without touching the log.
+pub fn seal_content_tombstone(key: &Key, id: u64) -> BkfsResult<SealedRecord> {
+    let bytes = vault::seal(&bincode::serialize(&Record::ContentTombstone { id })?, key);
+    Ok(SealedRecord { key: id, bytes, space: Space::Content, tombstone: true })
 }
 
 /// Physical location of a record's frame within the log.
@@ -171,7 +200,10 @@ pub struct SegmentLog {
     active_id: u64,
     active_offset: u64,
     next_seq: u64,
+    /// inode number → latest inode-record location.
     index: HashMap<u64, Location>,
+    /// content id → latest content-record location.
+    content: HashMap<u64, Location>,
     seg_meta: HashMap<u64, SegMeta>,
     /// Highest inode number ever observed in any frame (incl. tombstoned),
     /// so a recovered allocator never re-hands a number that was used.
@@ -201,9 +233,11 @@ impl SegmentLog {
         segment_ids.sort_unstable();
 
         let mut index: HashMap<u64, Location> = HashMap::new();
-        // Track the winning seq per inode so later-seq records win even if
-        // physically earlier (post-compaction relocation).
-        let mut winning_seq: HashMap<u64, u64> = HashMap::new();
+        let mut content: HashMap<u64, Location> = HashMap::new();
+        // Winning seq per key per space, so a later-seq record wins even if
+        // physically earlier (after a compaction relocation).
+        let mut winning_inode: HashMap<u64, u64> = HashMap::new();
+        let mut winning_content: HashMap<u64, u64> = HashMap::new();
         let mut seg_meta: HashMap<u64, SegMeta> = HashMap::new();
         let mut next_seq = 1u64;
         let mut max_inode = 0u64;
@@ -234,18 +268,28 @@ impl SegmentLog {
                 }) {
                     Ok(record) => {
                         next_seq = next_seq.max(seq + 1);
-                        let inode = record.inode();
-                        max_inode = max_inode.max(inode);
+                        let key = record.key();
                         let loc = Location { segment: id, offset: pos as u64, len: frame_len as u32 };
-                        let better = winning_seq.get(&inode).map_or(true, |&w| seq >= w);
-                        if better {
-                            winning_seq.insert(inode, seq);
-                            match record {
-                                Record::Inode { .. } => {
-                                    index.insert(inode, loc);
+                        match record {
+                            Record::Inode { .. } | Record::Tombstone { .. } => {
+                                max_inode = max_inode.max(key);
+                                if winning_inode.get(&key).map_or(true, |&w| seq >= w) {
+                                    winning_inode.insert(key, seq);
+                                    if matches!(record, Record::Inode { .. }) {
+                                        index.insert(key, loc);
+                                    } else {
+                                        index.remove(&key);
+                                    }
                                 }
-                                Record::Tombstone { .. } => {
-                                    index.remove(&inode);
+                            }
+                            Record::Content { .. } | Record::ContentTombstone { .. } => {
+                                if winning_content.get(&key).map_or(true, |&w| seq >= w) {
+                                    winning_content.insert(key, seq);
+                                    if matches!(record, Record::Content { .. }) {
+                                        content.insert(key, loc);
+                                    } else {
+                                        content.remove(&key);
+                                    }
                                 }
                             }
                         }
@@ -289,6 +333,7 @@ impl SegmentLog {
             active_offset,
             next_seq,
             index,
+            content,
             seg_meta,
             max_inode,
         })
@@ -327,8 +372,25 @@ impl SegmentLog {
         };
         match self.read_at(loc)? {
             Record::Inode { attrs, .. } => Ok(Some(attrs)),
-            Record::Tombstone { .. } => Ok(None),
+            _ => Ok(None),
         }
+    }
+
+    /// Load a packed content extent by id, or None if absent.
+    pub fn load_content(&self, id: u64) -> BkfsResult<Option<Vec<u8>>> {
+        let Some(&loc) = self.content.get(&id) else {
+            return Ok(None);
+        };
+        match self.read_at(loc)? {
+            Record::Content { bytes, .. } => Ok(Some(bytes)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Number of live packed-content extents (content index entries).
+    #[cfg(test)]
+    pub fn content_count(&self) -> usize {
+        self.content.len()
     }
 
     /// Append a pre-sealed record (see [`seal_inode`]/[`seal_tombstone`]).
@@ -348,25 +410,31 @@ impl SegmentLog {
         self.active_offset += frame.len() as u64;
         let loc = Location { segment: self.active_id, offset, len: frame.len() as u32 };
 
-        self.max_inode = self.max_inode.max(rec.inode);
         let seg = self.seg_meta.entry(self.active_id).or_default();
         seg.total += frame.len() as u64;
         seg.live += frame.len() as u64;
-        // Supersede any prior live frame for this inode.
-        if let Some(prev) = self.index.get(&rec.inode).copied() {
+
+        let dst = match rec.space {
+            Space::Inode => {
+                self.max_inode = self.max_inode.max(rec.key);
+                &mut self.index
+            }
+            Space::Content => &mut self.content,
+        };
+        // Supersede any prior live frame for this key in its space.
+        if let Some(prev) = dst.get(&rec.key).copied() {
             if let Some(m) = self.seg_meta.get_mut(&prev.segment) {
                 m.live = m.live.saturating_sub(prev.len as u64);
             }
         }
         if rec.tombstone {
-            // The tombstone frame is dead weight once written (nothing
-            // references it via the index); account it as non-live.
+            // The tombstone frame is itself dead weight once written.
+            dst.remove(&rec.key);
             if let Some(m) = self.seg_meta.get_mut(&loc.segment) {
                 m.live = m.live.saturating_sub(loc.len as u64);
             }
-            self.index.remove(&rec.inode);
         } else {
-            self.index.insert(rec.inode, loc);
+            dst.insert(rec.key, loc);
         }
         Ok(())
     }
@@ -423,9 +491,10 @@ impl SegmentLog {
 }
 
 impl Record {
-    fn inode(&self) -> u64 {
+    fn key(&self) -> u64 {
         match self {
             Record::Inode { inode, .. } | Record::Tombstone { inode } => *inode,
+            Record::Content { id, .. } | Record::ContentTombstone { id } => *id,
         }
     }
 }

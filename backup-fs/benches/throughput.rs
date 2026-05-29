@@ -208,6 +208,29 @@ fn bench_random_write(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_medium_files(c: &mut Criterion) {
+    // Many medium (64 KiB) files: with content packing on (default) each is a
+    // single extent appended to a shared content segment; with
+    // BACKUPFS_PACK_MAX=4096 each instead gets its own block file (the A/B).
+    let h = Harness::mount();
+    let dir = h.mnt().join("medium");
+    std::fs::create_dir_all(&dir).unwrap();
+    let payload = vec![0x6Du8; 64 * 1024];
+    let n = 500usize;
+    let mut group = c.benchmark_group("medium_files");
+    group.throughput(Throughput::Elements(n as u64));
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.bench_function("500x64KiB", |b| {
+        b.iter(|| {
+            for i in 0..n {
+                write_durable(&dir.join(format!("m{i:04}")), &payload);
+            }
+        });
+    });
+    group.finish();
+}
+
 fn bench_large_dir_create(c: &mut Criterion) {
     // Creating many files in ONE directory. With directory spilling on
     // (default), each create rewrites a single bucket — O(1). With
@@ -276,6 +299,7 @@ criterion_group!(
     bench_sequential_write,
     bench_sequential_read,
     bench_small_files,
+    bench_medium_files,
     bench_random_write,
     bench_large_dir_create,
     bench_incremental_edit,

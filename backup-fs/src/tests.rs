@@ -381,7 +381,7 @@ fn rmrf_leaves_no_orphans() {
                 // block-reaping assertion below is meaningful.
                 fs::write(
                     mnt.join(format!("backup/volumes/main/f{i:02}")),
-                    vec![i as u8; 8192],
+                    vec![i as u8; 2 * 1024 * 1024], // > 1 MiB → block-backed
                 )
                 .unwrap();
             }
@@ -435,12 +435,11 @@ fn rmrf_leaves_no_orphans() {
         ctrl.live_inode_count()
     );
     drop(ctrl);
+    let _ = content_files_after_create;
     let contents_now = content_files(data.path());
-    let expected_contents = content_files_after_create - 10;
     assert_eq!(
-        contents_now,
-        expected_contents,
-        "orphan content files left after rm-rf: expected {expected_contents}, got {}",
+        contents_now, 0,
+        "orphan content blocks left after rm-rf: expected 0, got {}",
         contents_now
     );
 }
@@ -599,8 +598,8 @@ fn unlink_file_after_remount() {
             fs::create_dir(mnt.join("d")).unwrap();
             // > inline threshold → block-backed, so there's a content blob
             // to reap on unlink.
-            fs::write(mnt.join("d/keep"), vec![1u8; 8192]).unwrap();
-            fs::write(mnt.join("d/kill"), vec![2u8; 8192]).unwrap();
+            fs::write(mnt.join("d/keep"), vec![1u8; 2 * 1024 * 1024]).unwrap();
+            fs::write(mnt.join("d/kill"), vec![2u8; 2 * 1024 * 1024]).unwrap();
         },
         None,
     );
@@ -628,8 +627,8 @@ fn unlink_file_after_remount() {
 
     assert_eq!(
         content_files(data.path()),
-        content_before - 1,
-        "unlinked file's content blob wasn't reaped"
+        content_before - 2,
+        "unlinked file's content blocks weren't reaped"
     );
 }
 
@@ -1491,7 +1490,7 @@ fn char_device_rdev_roundtrip() {
 #[test_log::test]
 fn ecc_recovers_corrupted_block() {
     let data = TempDir::new("backupfs_data").unwrap();
-    let size = 60_000usize; // single block, multi-shard payload
+    let size = 2 * 1024 * 1024usize; // > 1 MiB → block-backed (has block files)
     let mut payload = vec![0u8; size];
     pattern_fill(0, &mut payload);
     let payload2 = payload.clone();
@@ -1917,13 +1916,13 @@ fn inline_small_file_survives_fsync_and_remount() {
     );
 }
 
-/// A file that grows past the inline threshold migrates to block storage
-/// transparently, preserving the bytes already written inline, and reads
-/// back correctly live and across a remount.
+/// A file that grows straight past one chunk migrates inline→blocks (the
+/// jump skips the packed tier), preserving the bytes already written inline,
+/// and reads back correctly live and across a remount.
 #[test_log::test]
 fn file_grows_from_inline_to_blocks() {
     let data = TempDir::new("backupfs_data").unwrap();
-    let total = 10_000usize; // > 4 KiB inline threshold → block-backed
+    let total = 3 * 1024 * 1024usize; // > 1 MiB → block-backed
     let mut buf = vec![0u8; total];
     pattern_fill(0, &mut buf);
 
@@ -1939,7 +1938,7 @@ fn file_grows_from_inline_to_blocks() {
                 .open(&p)
                 .unwrap();
             // First a sub-threshold write (stored inline), then extend past
-            // the threshold (forces the inline→blocks migration).
+            // one chunk (forces the inline→blocks migration).
             f.write_all(&buf[..3000]).unwrap();
             f.write_all(&buf[3000..]).unwrap();
             f.sync_all().unwrap();
@@ -1957,6 +1956,100 @@ fn file_grows_from_inline_to_blocks() {
         "ohea".to_owned(),
         |mnt| {
             let got = fs::read(mnt.join("grower")).unwrap();
+            assert_eq!(got.len(), total);
+            pattern_check(0, &got);
+        },
+        None,
+    );
+}
+
+/// A medium file (between the inline threshold and one chunk) is stored as a
+/// single packed extent in the shared content log — no per-file content
+/// block — yet reads back correctly, survives a remount, and its extent is
+/// reaped on delete.
+#[test_log::test]
+fn medium_file_is_packed_not_blocked() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    let size = 64 * 1024usize; // 64 KiB ∈ (4 KiB, 1 MiB] → packed
+    let mut buf = vec![0u8; size];
+    pattern_fill(0, &mut buf);
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            fs::write(mnt.join("m"), &buf).unwrap();
+            let got = fs::read(mnt.join("m")).unwrap();
+            assert_eq!(got.len(), size);
+            pattern_check(0, &got);
+        },
+        None,
+    );
+    // Packed → no content block files; the extent lives in the log.
+    assert_eq!(content_files(data.path()), 0, "packed file must not create a content block");
+    {
+        let ctrl = crate::ctrl::Controller::new(opts(data.path(), "ohea")).unwrap();
+        assert_eq!(ctrl.live_content_count(), 1, "expected one packed extent");
+    }
+
+    // Survives remount, then delete reaps the extent.
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let got = fs::read(mnt.join("m")).unwrap();
+            assert_eq!(got.len(), size);
+            pattern_check(0, &got);
+            fs::remove_file(mnt.join("m")).unwrap();
+        },
+        None,
+    );
+    {
+        let ctrl = crate::ctrl::Controller::new(opts(data.path(), "ohea")).unwrap();
+        assert_eq!(ctrl.live_content_count(), 0, "packed extent not reaped on delete");
+        assert_eq!(ctrl.live_inode_count(), 1, "only root should remain");
+    }
+}
+
+/// A packed file that grows past one chunk migrates to block storage and its
+/// stale packed extent is dropped.
+#[test_log::test]
+fn packed_grows_to_blocks() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    let total = 3 * 1024 * 1024usize; // > 1 MiB → must end up block-backed
+    let mut buf = vec![0u8; total];
+    pattern_fill(0, &mut buf);
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let p = mnt.join("g");
+            let mut f = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&p)
+                .unwrap();
+            f.write_all(&buf[..64 * 1024]).unwrap(); // packed
+            f.write_all(&buf[64 * 1024..]).unwrap(); // grows → blocks
+            f.sync_all().unwrap();
+            drop(f);
+            let got = fs::read(&p).unwrap();
+            assert_eq!(got.len(), total);
+            pattern_check(0, &got);
+        },
+        None,
+    );
+    assert!(content_files(data.path()) >= 1, "expected block files after growth");
+    {
+        let ctrl = crate::ctrl::Controller::new(opts(data.path(), "ohea")).unwrap();
+        assert_eq!(ctrl.live_content_count(), 0, "stale packed extent should be tombstoned");
+    }
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let got = fs::read(mnt.join("g")).unwrap();
             assert_eq!(got.len(), total);
             pattern_check(0, &got);
         },

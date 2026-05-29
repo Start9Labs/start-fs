@@ -43,6 +43,22 @@ pub fn inline_threshold() -> u64 {
     })
 }
 
+/// Upper bound (inclusive) on a file packed as a single extent in the shared
+/// content log. Files in `(inline_threshold, pack_max]` are packed; larger
+/// files use per-file block storage. Defaults to one chunk; set
+/// `BACKUPFS_PACK_MAX` to the inline threshold (4096) to disable packing
+/// (medium files then fall back to one block file each — useful for A/B).
+pub fn pack_max() -> u64 {
+    static M: OnceLock<u64> = OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("BACKUPFS_PACK_MAX")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|n| n.min(CHUNK_SIZE))
+            .unwrap_or(CHUNK_SIZE)
+    })
+}
+
 /// Soft cap on per-file in-memory dirty *block* data. With `FOPEN_DIRECT_IO`
 /// the kernel streams writes straight to us and never triggers a writeback,
 /// so without a cap a large sequential write would buffer the entire file in
@@ -63,6 +79,16 @@ enum Body {
     /// Whole file content, mirrored into `inode.attrs.contents` as
     /// `FileData::Inline` on flush.
     Inline(Vec<u8>),
+    /// Whole content of a small/medium file (≤ one chunk) held in memory and
+    /// written as a single extent to the shared content log on flush. The
+    /// inode holds only `FileData::Packed(content_id)`.
+    Packed {
+        content_id: ContentId,
+        buf: Vec<u8>,
+        /// Whether `buf` has changed since the last content-log write (so a
+        /// second flush doesn't needlessly re-append unchanged content).
+        dirty: bool,
+    },
     Blocks {
         content_id: ContentId,
         /// Block index → logical bytes (≤ `CHUNK_SIZE`), loaded lazily for RMW.
@@ -112,6 +138,11 @@ impl Contents {
                 b.truncate(inode.attrs.size as usize);
                 Body::Inline(b)
             }
+            FileData::Packed(cid) => {
+                let mut buf = ctrl.cpack_load(*cid)?.unwrap_or_default();
+                buf.truncate(inode.attrs.size as usize);
+                Body::Packed { content_id: *cid, buf, dirty: false }
+            }
             FileData::File(cid) => Body::Blocks {
                 content_id: *cid,
                 dirty: BTreeMap::new(),
@@ -136,7 +167,8 @@ impl Contents {
             return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
         }
         match &self.body {
-            Body::Inline(data) => {
+            // Inline and Packed both serve from an in-memory buffer.
+            Body::Inline(data) | Body::Packed { buf: data, .. } => {
                 // `off` is clamped to the stored length: bytes in
                 // [data.len(), size) are holes (e.g. after a truncate-grow)
                 // and read back as zeros. Clamping also avoids slicing past
@@ -204,40 +236,89 @@ impl Contents {
     pub fn write_all_at(&mut self, buf: &[u8], offset: u64) -> BkfsResult<()> {
         self.ctrl.check_rw()?;
         let end = offset + buf.len() as u64;
+        // Promote the body to the smallest tier that can hold `end`:
+        // inline (≤ inline_threshold) → packed (≤ one chunk) → blocks.
+        self.promote_for(end)?;
 
-        if let Body::Inline(_) = &self.body {
-            if end <= inline_threshold() {
-                let Body::Inline(data) = &mut self.body else { unreachable!() };
-                if (data.len() as u64) < end {
-                    data.resize(end as usize, 0);
+        if matches!(self.body, Body::Blocks { .. }) {
+            self.write_blocks_at(buf, offset)?;
+        } else {
+            match &mut self.body {
+                Body::Inline(data) => {
+                    if (data.len() as u64) < end {
+                        data.resize(end as usize, 0);
+                    }
+                    data[offset as usize..end as usize].copy_from_slice(buf);
                 }
-                data[offset as usize..end as usize].copy_from_slice(buf);
-                self.inode.attrs.modified();
-                if end > self.inode.attrs.size {
-                    self.inode.attrs.size = end;
+                Body::Packed { buf: data, dirty, .. } => {
+                    if (data.len() as u64) < end {
+                        data.resize(end as usize, 0);
+                    }
+                    data[offset as usize..end as usize].copy_from_slice(buf);
+                    *dirty = true;
                 }
-                self.changed = true;
-                return Ok(());
+                Body::Blocks { .. } => unreachable!(),
             }
-            // Grows past the inline threshold → migrate to block storage,
-            // then fall through to the block write path below.
-            self.inline_to_blocks()?;
         }
-
-        self.write_blocks_at(buf, offset)?;
         self.inode.attrs.modified();
         if end > self.inode.attrs.size {
             self.inode.attrs.size = end;
         }
         self.changed = true;
-        self.spill_to_budget()?;
+        self.spill_to_budget()?; // no-op unless Blocks
+        Ok(())
+    }
+
+    /// Migrate the body up to the tier that can hold a file of `end` bytes.
+    fn promote_for(&mut self, end: u64) -> BkfsResult<()> {
+        match &self.body {
+            Body::Inline(_) if end > inline_threshold() => {
+                if end <= pack_max() {
+                    self.inline_to_packed();
+                } else {
+                    self.inline_to_blocks()?;
+                }
+            }
+            Body::Packed { .. } if end > pack_max() => self.packed_to_blocks()?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Inline → Packed: the in-memory bytes become a packed extent (written
+    /// to the content log on flush). Content id = the (never-reused) inode #.
+    fn inline_to_packed(&mut self) {
+        let Body::Inline(data) = &mut self.body else { return };
+        let buf = std::mem::take(data);
+        let content_id = ContentId(self.inode.inode.0);
+        self.body = Body::Packed { content_id, buf, dirty: true };
+        self.inode.attrs.contents = FileData::Packed(content_id);
+    }
+
+    /// Packed → Blocks: the extent becomes block 0+, and the now-superseded
+    /// packed content record is tombstoned (its content moved to block files).
+    fn packed_to_blocks(&mut self) -> BkfsResult<()> {
+        let Body::Packed { content_id, buf, .. } = &mut self.body else {
+            return Ok(());
+        };
+        let content_id = *content_id;
+        let data = std::mem::take(buf);
+        self.ctrl.cpack_tombstone(content_id, false)?;
+        let mut dirty = BTreeMap::new();
+        let mut dirty_bytes = 0usize;
+        for (i, chunk) in data.chunks(CHUNK_SIZE as usize).enumerate() {
+            dirty_bytes += chunk.len();
+            dirty.insert(i as u64, chunk.to_vec());
+        }
+        self.body = Body::Blocks { content_id, dirty, dirty_bytes, disk_blocks: 0 };
+        self.inode.attrs.contents = FileData::File(content_id);
         Ok(())
     }
 
     fn write_blocks_at(&mut self, buf: &[u8], offset: u64) -> BkfsResult<()> {
         let content_id = match &self.body {
             Body::Blocks { content_id, .. } => *content_id,
-            Body::Inline(_) => unreachable!("inline must be migrated before block write"),
+            _ => unreachable!("must be migrated to Blocks before a block write"),
         };
         let mut written = 0usize;
         while written < buf.len() {
@@ -291,7 +372,7 @@ impl Contents {
         let budget = write_buffer_budget();
         let content_id = match &self.body {
             Body::Blocks { content_id, .. } => *content_id,
-            Body::Inline(_) => return Ok(()),
+            _ => return Ok(()), // only block bodies spill
         };
         loop {
             let idx = {
@@ -363,24 +444,60 @@ impl Contents {
     /// Reconcile the body to disk and into `inode.attrs.contents`, but don't
     /// persist the inode record itself — the caller routes that.
     fn flush_content_only(&mut self) -> BkfsResult<()> {
-        // A setattr/truncate may have changed size out from under an inline
-        // body; reconcile, migrating to blocks if it grew past the threshold.
-        if let Body::Inline(data) = &mut self.body {
-            if self.inode.attrs.size > inline_threshold() {
-                // Grew past the threshold (e.g. a truncate-grow): migrate the
-                // *existing* bytes to block 0 and fall through to the block
-                // flush. Bytes beyond `data` stay holes (sparse) — never
-                // materialized, so a huge set_len can't OOM us.
-                self.inline_to_blocks()?;
-            } else {
-                // size ≤ threshold, so this resize is bounded and cheap.
-                // CLONE (don't drain): the inline buffer is the file's only
-                // copy of its content, so a later flush (fsync then close)
-                // must still find it. Draining it would persist empty bytes.
-                data.resize(self.inode.attrs.size as usize, 0);
+        let size = self.inode.attrs.size;
+        // A setattr/truncate may have grown size past the current tier;
+        // promote so the flush below stores it correctly. Bytes beyond the
+        // in-memory buffer stay holes (sparse) — never materialized, so a
+        // huge set_len can't OOM us.
+        match &self.body {
+            Body::Inline(_) if size > inline_threshold() => {
+                if size <= pack_max() {
+                    self.inline_to_packed();
+                } else {
+                    self.inline_to_blocks()?;
+                }
+            }
+            Body::Packed { .. } if size > pack_max() => self.packed_to_blocks()?,
+            _ => {}
+        }
+
+        // Memory-backed tiers (inline / packed): CLONE the buffer (it is the
+        // file's only copy until persisted) rather than draining it, so a
+        // later flush — fsync then close, the atomic-save pattern — still
+        // finds the content.
+        enum Plan {
+            Done,
+            Packed(ContentId, Option<Vec<u8>>),
+            Blocks,
+        }
+        let plan = match &mut self.body {
+            Body::Inline(data) => {
+                data.resize(size as usize, 0);
+                Plan::Done
+            }
+            Body::Packed { content_id, buf, dirty } => {
+                buf.resize(size as usize, 0);
+                let bytes = if *dirty { Some(buf.clone()) } else { None };
+                *dirty = false;
+                Plan::Packed(*content_id, bytes)
+            }
+            Body::Blocks { .. } => Plan::Blocks,
+        };
+        match plan {
+            Plan::Done => {
+                let Body::Inline(data) = &self.body else { unreachable!() };
                 self.inode.attrs.contents = FileData::Inline(data.clone());
                 return Ok(());
             }
+            Plan::Packed(cid, bytes) => {
+                if let Some(b) = bytes {
+                    self.ctrl.cpack_put(cid, &b, false)?;
+                    self.ctrl.tick_save()?;
+                }
+                self.inode.attrs.contents = FileData::Packed(cid);
+                return Ok(());
+            }
+            Plan::Blocks => {}
         }
 
         let required = blockstore::block_count(self.inode.attrs.size);
@@ -389,7 +506,7 @@ impl Contents {
                 *dirty_bytes = 0;
                 (*content_id, std::mem::take(dirty), *disk_blocks)
             }
-            Body::Inline(_) => return Ok(()),
+            _ => return Ok(()),
         };
         let last = required.saturating_sub(1);
         for (idx, mut block) in dirty {

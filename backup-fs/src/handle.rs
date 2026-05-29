@@ -760,6 +760,12 @@ impl Handler {
             FileData::File(contents) => {
                 crate::blockstore::remove_all_blocks(self.ctrl(), *contents, inode.attrs.size)?;
             }
+            FileData::Packed(content) => {
+                // Drop the packed extent from the content log (dead space,
+                // reclaimed by compaction). Content in the inline/inode
+                // record needs no separate removal.
+                self.ctrl().cpack_tombstone(*content, false)?;
+            }
             FileData::Directory(dir) => {
                 // Reap any spilled-directory bucket files.
                 dir.gc(self.ctrl(), inode.inode)?;

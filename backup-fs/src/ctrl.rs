@@ -124,10 +124,43 @@ impl Controller {
         self.0.log.lock().unwrap().contains(inode)
     }
 
+    /// Append/replace a packed-content extent (small/medium file content
+    /// stored in shared segments rather than its own block file). Sealing is
+    /// done outside the log lock.
+    pub fn cpack_put(&self, id: ContentId, bytes: &[u8], durable: bool) -> BkfsResult<()> {
+        let rec = seglog::seal_content(&self.key(), id.0, bytes)?;
+        let mut log = self.0.log.lock().unwrap();
+        log.append(&rec)?;
+        if durable {
+            log.sync()?;
+        }
+        Ok(())
+    }
+
+    pub fn cpack_load(&self, id: ContentId) -> BkfsResult<Option<Vec<u8>>> {
+        self.0.log.lock().unwrap().load_content(id.0)
+    }
+
+    pub fn cpack_tombstone(&self, id: ContentId, durable: bool) -> BkfsResult<()> {
+        let rec = seglog::seal_content_tombstone(&self.key(), id.0)?;
+        let mut log = self.0.log.lock().unwrap();
+        log.append(&rec)?;
+        if durable {
+            log.sync()?;
+        }
+        Ok(())
+    }
+
     /// Number of live inodes in the log index (used by tests to detect
     /// orphan/zombie inodes the old layout would have left as files).
     pub fn live_inode_count(&self) -> usize {
         self.0.log.lock().unwrap().live_count()
+    }
+
+    /// Number of live packed-content extents (tests check packed reaping).
+    #[cfg(test)]
+    pub fn live_content_count(&self) -> usize {
+        self.0.log.lock().unwrap().content_count()
     }
 
     /// No-op kept for the mount path: the log's replay (in `new`) already

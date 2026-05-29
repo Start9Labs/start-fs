@@ -493,6 +493,14 @@ impl Handler {
         if let Err(e) = self.flush_all_dirty() {
             errs.push(e);
         }
+        // Reclaim dead log space now that everything is durable. Best-effort:
+        // the data is already safe, so a compaction error must not fail the
+        // unmount — just log it.
+        match self.ctrl().compact() {
+            Ok(n) if n > 0 => debug!("compacted {n} dead log segment(s) on unmount"),
+            Ok(_) => {}
+            Err(e) => warn!("log compaction on unmount failed (non-fatal): {e}"),
+        }
         BkfsResult::multiple((), errs)
     }
 

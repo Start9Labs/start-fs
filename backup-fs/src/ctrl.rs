@@ -58,6 +58,20 @@ pub struct ControllerSeed {
     data_dir_fd: OnceLock<File>,
 }
 
+/// Dead-byte ratio above which a sealed segment is compacted on the next
+/// reclamation pass. Overridable via `BACKUPFS_COMPACT_RATIO`; ≥1.0 disables.
+fn compact_ratio() -> f64 {
+    use std::sync::OnceLock;
+    static R: OnceLock<f64> = OnceLock::new();
+    *R.get_or_init(|| {
+        std::env::var("BACKUPFS_COMPACT_RATIO")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|r| *r > 0.0)
+            .unwrap_or(0.6)
+    })
+}
+
 impl Controller {
     pub fn new(config: BackupFSOptions) -> BkfsResult<Self> {
         let cryptinfo_path = config.data_dir.join("cryptinfo");
@@ -167,6 +181,23 @@ impl Controller {
     /// rebuilt the index and the inode-number high-water mark.
     pub fn load_inode_pool(&self) -> BkfsResult<()> {
         Ok(())
+    }
+
+    /// Reclaim dead space in the log by compacting heavily-dead sealed
+    /// segments (live frames relocated verbatim, then the segment deleted).
+    /// Gated on `BACKUPFS_COMPACT_RATIO` (default 0.6; ≥1.0 disables): only a
+    /// segment more than that fraction dead is rewritten, so mostly-live
+    /// segments aren't needlessly re-transferred by the next rsync/rclone.
+    /// "Speed over footprint" — run as a larger pass (on unmount), not inline.
+    pub fn compact(&self) -> BkfsResult<usize> {
+        if self.0.config.readonly {
+            return Ok(0);
+        }
+        let ratio = compact_ratio();
+        if ratio >= 1.0 {
+            return Ok(0);
+        }
+        self.0.log.lock().unwrap().compact(ratio)
     }
 
     pub fn fsck(&self, find_orphans: bool) -> BkfsResult<()> {

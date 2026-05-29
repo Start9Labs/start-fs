@@ -2056,3 +2056,75 @@ fn packed_grows_to_blocks() {
         None,
     );
 }
+
+/// Total bytes across the log segment files.
+fn segment_bytes(data: &Path) -> u64 {
+    let dir = data.join("segments");
+    let Ok(rd) = fs::read_dir(&dir) else { return 0 };
+    rd.flatten().map(|e| e.metadata().map(|m| m.len()).unwrap_or(0)).sum()
+}
+
+/// Deleting most files leaves dead extents in the log; the unmount
+/// compaction pass reclaims the heavily-dead sealed segments while the
+/// surviving files relocate intact (verbatim) and still read correctly.
+#[test_log::test]
+fn compaction_reclaims_dead_space() {
+    let data = TempDir::new("backupfs_data").unwrap();
+    let n = 220usize; // ~14 MiB of 64 KiB files → spans multiple 8 MiB segments
+    let payload = |i: usize| {
+        let mut b = vec![0u8; 64 * 1024];
+        pattern_fill(i as u64, &mut b);
+        b
+    };
+
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            for i in 0..n {
+                fs::write(mnt.join(format!("f{i:04}")), payload(i)).unwrap();
+            }
+        },
+        None,
+    );
+    let before = segment_bytes(data.path());
+    assert!(before > 8 * 1024 * 1024, "expected multiple segments, got {before} bytes");
+
+    // Delete all but 10 files, then unmount → compaction runs.
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            for i in 0..n {
+                if i % 22 != 0 {
+                    fs::remove_file(mnt.join(format!("f{i:04}"))).unwrap();
+                }
+            }
+        },
+        None,
+    );
+    let after = segment_bytes(data.path());
+    assert!(
+        after * 2 < before,
+        "compaction did not reclaim space: before={before} after={after}"
+    );
+
+    // Survivors relocated by compaction must still read back correctly.
+    with_backupfs(
+        data.path(),
+        "ohea".to_owned(),
+        |mnt| {
+            let mut survivors = 0;
+            for i in (0..n).step_by(22) {
+                let got = fs::read(mnt.join(format!("f{i:04}"))).unwrap();
+                assert_eq!(got.len(), 64 * 1024);
+                pattern_check(i as u64, &got);
+                survivors += 1;
+            }
+            assert_eq!(survivors, 10);
+            // Deleted files are gone.
+            assert!(!mnt.join("f0001").exists());
+        },
+        None,
+    );
+}

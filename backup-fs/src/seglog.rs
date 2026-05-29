@@ -479,6 +479,99 @@ impl SegmentLog {
         Ok(())
     }
 
+    /// fsync the segments directory so a create/rename/unlink of a segment
+    /// file is itself durable (a lost segment dir-entry is catastrophic,
+    /// unlike a per-inode file the heal could prune).
+    fn fsync_dir(&self) -> BkfsResult<()> {
+        File::open(&self.dir)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Read a frame's raw on-disk bytes (header + sealed payload + padding).
+    fn read_raw_frame(&self, loc: Location) -> BkfsResult<Vec<u8>> {
+        let mut frame = vec![0u8; loc.len as usize];
+        let file;
+        let f: &File = if loc.segment == self.active_id {
+            &self.active
+        } else {
+            file = File::open(segment_path(&self.dir, loc.segment))?;
+            &file
+        };
+        f.read_exact_at(&mut frame, loc.offset)?;
+        Ok(frame)
+    }
+
+    /// Append an existing frame VERBATIM (preserving its seq), repointing the
+    /// index. Used by compaction to relocate a live frame without re-sealing
+    /// — re-sealing would change every byte (fresh nonce) and break rsync
+    /// delta-matching of the relocated bytes.
+    fn append_verbatim(&mut self, frame: &[u8], space: Space, key: u64) -> BkfsResult<()> {
+        if self.active_offset > 0 && self.active_offset + frame.len() as u64 > segment_size() {
+            self.roll()?;
+        }
+        let offset = self.active_offset;
+        self.active.write_all_at(frame, offset)?;
+        self.active_offset += frame.len() as u64;
+        let loc = Location { segment: self.active_id, offset, len: frame.len() as u32 };
+        let seg = self.seg_meta.entry(self.active_id).or_default();
+        seg.total += frame.len() as u64;
+        seg.live += frame.len() as u64;
+        match space {
+            Space::Inode => self.index.insert(key, loc),
+            Space::Content => self.content.insert(key, loc),
+        };
+        Ok(())
+    }
+
+    /// Reclaim dead space: rewrite every sealed segment whose dead-byte ratio
+    /// exceeds `dead_threshold` by copying its still-live frames verbatim into
+    /// the active segment, then deleting it. Crash-safe: the relocated copies
+    /// are made durable (and the dir fsynced) BEFORE the old segment is
+    /// removed, so a crash can only leave reclaimable dead duplicates, never
+    /// lose a live frame. Returns the number of segments compacted.
+    pub fn compact(&mut self, dead_threshold: f64) -> BkfsResult<usize> {
+        let candidates: Vec<u64> = self
+            .seg_meta
+            .iter()
+            .filter(|(&id, m)| {
+                id != self.active_id
+                    && m.total > 0
+                    && (m.total - m.live) as f64 / m.total as f64 > dead_threshold
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for seg_id in &candidates {
+            self.compact_segment(*seg_id)?;
+        }
+        Ok(candidates.len())
+    }
+
+    fn compact_segment(&mut self, seg_id: u64) -> BkfsResult<()> {
+        // Live frames in this segment = index entries pointing into it.
+        let mut live: Vec<(Space, u64, Location)> = Vec::new();
+        for (&k, &l) in &self.index {
+            if l.segment == seg_id {
+                live.push((Space::Inode, k, l));
+            }
+        }
+        for (&k, &l) in &self.content {
+            if l.segment == seg_id {
+                live.push((Space::Content, k, l));
+            }
+        }
+        for (space, key, loc) in live {
+            let frame = self.read_raw_frame(loc)?;
+            self.append_verbatim(&frame, space, key)?;
+        }
+        // Relocated copies durable before the source is deleted.
+        self.sync()?;
+        self.fsync_dir()?;
+        std::fs::remove_file(segment_path(&self.dir, seg_id))?;
+        self.fsync_dir()?;
+        self.seg_meta.remove(&seg_id);
+        Ok(())
+    }
+
     /// Number of live inodes (index entries).
     pub fn live_count(&self) -> usize {
         self.index.len()

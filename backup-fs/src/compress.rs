@@ -79,12 +79,18 @@ pub fn compress(plain: &[u8], codec: Codec) -> Vec<u8> {
     out
 }
 
-/// Inverse of [`compress`].
-pub fn decompress(stored: &[u8]) -> BkfsResult<Vec<u8>> {
+/// Inverse of [`compress`]. `max_len` bounds the decompressed size: every
+/// stored chunk has a known logical ceiling (a content block is ≤ one chunk
+/// plus any size-padding; a packed extent is ≤ the pack limit), so a frame
+/// that expands past it is rejected as `InvalidData` rather than allowed to
+/// allocate without bound. This is defense-in-depth — the integrity tag in
+/// [`crate::vault`] already rejects any frame not produced by this key — but
+/// it cheaply turns a hypothetical future logic/key bug into a clean error
+/// instead of an OOM-abort.
+pub fn decompress(stored: &[u8], max_len: usize) -> BkfsResult<Vec<u8>> {
     match stored.split_first() {
         Some((&TAG_RAW, rest)) => Ok(rest.to_vec()),
-        Some((&TAG_ZSTD, rest)) => zstd::stream::decode_all(rest)
-            .map_err(|e| BkfsError::wrap(std::io::Error::new(std::io::ErrorKind::InvalidData, e))),
+        Some((&TAG_ZSTD, rest)) => decode_bounded(rest, max_len),
         _ => Err(BkfsError::wrap(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "missing/unknown compression tag",
@@ -92,20 +98,43 @@ pub fn decompress(stored: &[u8]) -> BkfsResult<Vec<u8>> {
     }
 }
 
+/// Decode a zstd frame, refusing to produce more than `max_len` bytes. Reads
+/// up to `max_len + 1`; a legitimate frame (≤ `max_len`) decodes fully while
+/// an over-large one trips the ceiling and errors.
+fn decode_bounded(frame: &[u8], max_len: usize) -> BkfsResult<Vec<u8>> {
+    use std::io::Read;
+    let wrap = |e| BkfsError::wrap(std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+    let decoder = zstd::stream::read::Decoder::new(frame).map_err(wrap)?;
+    let mut out = Vec::new();
+    decoder
+        .take(max_len as u64 + 1)
+        .read_to_end(&mut out)
+        .map_err(wrap)?;
+    if out.len() > max_len {
+        return Err(BkfsError::wrap(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "decompressed frame exceeds chunk bound",
+        )));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CAP: usize = 1 << 21; // generous test ceiling
 
     #[test]
     fn roundtrip_raw_and_zstd() {
         let text = vec![b'a'; 10_000]; // very compressible
         let zc = compress(&text, Codec::Zstd(9));
         assert!(zc.len() < text.len(), "compressible data should shrink");
-        assert_eq!(decompress(&zc).unwrap(), text);
+        assert_eq!(decompress(&zc, CAP).unwrap(), text);
 
         let none = compress(&text, Codec::None);
         assert_eq!(none[0], TAG_RAW);
-        assert_eq!(decompress(&none).unwrap(), text);
+        assert_eq!(decompress(&none, CAP).unwrap(), text);
     }
 
     #[test]
@@ -115,15 +144,34 @@ mod tests {
         rand::rng().fill_bytes(&mut data); // genuinely incompressible
         let c = compress(&data, Codec::Zstd(9));
         assert_eq!(c[0], TAG_RAW, "incompressible data must fall back to raw");
-        assert_eq!(decompress(&c).unwrap(), data);
+        assert_eq!(decompress(&c, CAP).unwrap(), data);
     }
 
     #[test]
     fn empty_roundtrips() {
         for codec in [Codec::None, Codec::Zstd(2)] {
             let c = compress(&[], codec);
-            assert_eq!(decompress(&c).unwrap(), Vec::<u8>::new());
+            assert_eq!(decompress(&c, CAP).unwrap(), Vec::<u8>::new());
         }
+    }
+
+    #[test]
+    fn malformed_stored_is_error_not_panic() {
+        assert!(decompress(&[], CAP).is_err()); // no tag byte
+        assert!(decompress(&[42], CAP).is_err()); // unknown tag
+    }
+
+    #[test]
+    fn over_cap_frame_rejected() {
+        // A frame that legitimately decodes to more than the cap must error
+        // rather than allocate it. Compress 1 MiB of zeros (tiny frame, huge
+        // expansion) and decode it with a deliberately small ceiling.
+        let big = vec![0u8; 1 << 20];
+        let c = compress(&big, Codec::Zstd(9));
+        assert_eq!(c[0], TAG_ZSTD);
+        assert!(decompress(&c, 4096).is_err(), "expansion past cap must error");
+        // The same frame decodes fine under an adequate ceiling.
+        assert_eq!(decompress(&c, 1 << 20).unwrap(), big);
     }
 
     #[test]

@@ -2260,3 +2260,60 @@ fn compression_shrinks_compressible_content() {
         "incompressible .jpg unexpectedly smaller than raw: {jpg_on_disk}"
     );
 }
+
+/// Regression for the close()-path packed→blocks crash-consistency blocker.
+///
+/// When the last fd closes a file that just grew packed→blocks, `close()`
+/// must get the replacement `File` inode record into the log *before* the
+/// superseded packed extent's tombstone — relying on the batched syncfs,
+/// which flushes the log prefix and the block files together. The original
+/// code parked the `File` record only in the in-RAM dirty cache while
+/// appending the tombstone to the log, so a crash before the clean-unmount
+/// flush left the durable inode still `Packed` pointing at a tombstoned (and
+/// compactable) extent — the file read back as zeros.
+///
+/// We reproduce the crash faithfully by driving the migration at the Handler
+/// level and dropping the Handler WITHOUT flush_all_dirty: log appends and
+/// block renames are real syscalls (survive in the page cache), but the dirty
+/// cache is pure Handler RAM and is lost — exactly what a crash discards.
+#[test_log::test]
+fn packed_to_blocks_on_close_survives_crash_before_flush() {
+    let data = TempDir::new("backupfs_data").unwrap();
+
+    // Session 1: create a packed file (> inline_threshold, <= pack_max) and
+    // clean-unmount, so a durable `Packed` inode + extent exist. Grab its ino.
+    let small = vec![0xABu8; 200 * 1024];
+    let ino = {
+        let small = small.clone();
+        capture(data.path(), "ohea", move |mnt| {
+            fs::write(mnt.join("m.bin"), &small).unwrap();
+            fs::metadata(mnt.join("m.bin")).unwrap().ino()
+        })
+    };
+
+    // Session 2 (unclean): open, overwrite with 2 MiB so it migrates
+    // packed→blocks, close the fd (commits the migration + tombstones the old
+    // extent), then drop the Handler without flush_all_dirty — the "crash".
+    let big: Vec<u8> = (0..2 * 1024 * 1024u64).map(pattern_byte).collect();
+    {
+        let ctrl = Controller::new(opts(data.path(), "ohea")).unwrap();
+        let mut handler = crate::handle::Handler::new(ctrl);
+        let fh = handler.fopen(Inode(ino), true, true, |_, _| Ok(())).unwrap();
+        {
+            // Scoped clone so it is dropped before fclose — otherwise
+            // Arc::try_unwrap in close() would fail and take the fsync path.
+            let c = handler.handle(fh).unwrap().contents.clone();
+            c.lock().unwrap().write_all_at(&big, 0).unwrap();
+        }
+        handler.fclose(fh).unwrap();
+        drop(handler); // crash: discards the in-RAM dirty cache
+    }
+
+    // Session 3: remount and read back. With the fix the file is the full
+    // 2 MiB; the bug surfaced as a zero-filled / truncated read.
+    let got = capture(data.path(), "ohea", move |mnt| {
+        fs::read(mnt.join("m.bin")).unwrap()
+    });
+    assert_eq!(got.len(), big.len(), "file truncated/lost after crash");
+    pattern_check(0, &got);
+}

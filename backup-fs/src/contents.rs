@@ -161,9 +161,15 @@ impl Contents {
             FileData::Directory(_) => return BkfsResult::errno(libc::EISDIR),
             _ => return BkfsResult::errno(libc::EINVAL),
         };
-        // Compression codec from the file's name (first parent's). A file
-        // with no name (shouldn't happen for an open regular file) gets the
-        // unknown-extension default.
+        // Compression codec from the file's name — the lexicographically
+        // smallest (parent_inode, name) of its links, not necessarily the
+        // path it was opened through. For a hard-linked file with differing
+        // extensions this is effectively arbitrary and can shift as links are
+        // added/removed, so it only affects the compression *ratio*, never
+        // correctness: every stored chunk self-describes via its tag, so
+        // `decompress` is codec-independent and a mix of codecs across one
+        // file's blocks reads back fine. A file with no name (shouldn't happen
+        // for an open regular file) gets the unknown-extension default.
         let codec = inode
             .attrs
             .parents
@@ -592,10 +598,29 @@ impl Contents {
         drop(self);
         let gced = handler.gc_inode(&attrs)?;
         if !gced && changed {
-            handler.save_inode(&attrs)?;
+            if pending.is_some() {
+                // A packed→blocks migration happened this session. The
+                // replacement `File` inode record must reach the log at a
+                // lower offset than the superseded extent's tombstone, so the
+                // batched `syncfs` (which flushes the log prefix *and* the
+                // block files together) can never make the tombstone durable
+                // without also making this record — and the blocks it now
+                // points at — durable. Otherwise a crash could leave the
+                // inode still `Packed` while the extent is tombstoned (and
+                // compactable), reading back as zeros. `save_inode` parks a
+                // closed inode only in the in-memory dirty cache (never the
+                // log), so route through the log here, mirroring `flush()`'s
+                // record-before-tombstone ordering. (A targeted durable save
+                // would be wrong: it fsyncs only the log segment, leaving the
+                // not-yet-synced blocks loseable.)
+                handler.save_inode_logged(&attrs)?;
+            } else {
+                handler.save_inode(&attrs)?;
+            }
         }
         // If the inode was gc'd, gc_inode already tombstoned its current
-        // content; only a leftover superseded extent (from a packed→blocks
+        // content (and the whole inode), so there's no Packed-points-at-hole
+        // risk; only a leftover superseded extent (from a packed→blocks
         // migration this session) still needs dropping.
         if let Some(cid) = pending {
             ctrl.cpack_tombstone(cid, false)?;

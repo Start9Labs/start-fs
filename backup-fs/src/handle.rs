@@ -217,6 +217,28 @@ impl Handler {
         Ok(())
     }
 
+    /// Append an inode record to the log *now* (closed-inode safe), via the
+    /// batched (non-durable) path. Used where ordering against a following
+    /// content tombstone matters: the record must land in the log at a lower
+    /// offset than the tombstone so the batched `syncfs` — which flushes the
+    /// log prefix and the block files together — can never make the tombstone
+    /// durable without also making this record and its blocks durable.
+    ///
+    /// Unlike `save_inode`, this never parks the record in the dirty cache
+    /// (which is invisible to the log-offset ordering the tombstone relies
+    /// on); unlike `save_inode_durable`, it does not fsync the log segment in
+    /// isolation (which would risk a durable record outliving its not-yet-
+    /// synced block files across a crash).
+    pub fn save_inode_logged(&mut self, attrs: &InodeAttributes) -> BkfsResult<()> {
+        self.read_cache.borrow_mut().remove(attrs.inode);
+        // Drop any stale dirty clone so a later flush_all_dirty can't overwrite
+        // the log record we're about to append with an older copy.
+        self.dirty.remove(&attrs.inode);
+        self.ctrl.save_fast(attrs)?;
+        self.ctrl.tick_save()?;
+        Ok(())
+    }
+
     /// Drop a dirty entry without saving — used when an inode is about
     /// to be removed (unlink+gc path).
     pub fn forget_dirty(&mut self, inode: Inode) {

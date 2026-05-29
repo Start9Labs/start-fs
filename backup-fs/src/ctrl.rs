@@ -162,7 +162,12 @@ impl Controller {
 
     pub fn cpack_load(&self, id: ContentId) -> BkfsResult<Option<Vec<u8>>> {
         match self.0.log.lock().unwrap().load_content(id.0)? {
-            Some(stored) => Ok(Some(crate::compress::decompress(&stored)?)),
+            // A packed extent is never size-padded and is ≤ pack_max ≤ one
+            // chunk, so cap the decompressed size at a chunk.
+            Some(stored) => Ok(Some(crate::compress::decompress(
+                &stored,
+                crate::blockstore::CHUNK_SIZE as usize,
+            )?)),
             None => Ok(None),
         }
     }

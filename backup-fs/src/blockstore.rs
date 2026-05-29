@@ -66,9 +66,19 @@ pub fn read_block(
     };
     let mut blob = Vec::new();
     file.read_to_end(&mut blob)?;
-    // open (decrypt + ECC) → decompress back to the logical block bytes.
+    // open (decrypt + ECC) → decompress back to the logical block bytes. A
+    // block is at most one chunk, plus any size-padding applied to the final
+    // block; cap the decompressed size accordingly so a malformed frame can't
+    // allocate without bound.
     let stored = vault::open(&blob, ctrl.key())?;
-    Ok(Some(crate::compress::decompress(&stored)?))
+    Ok(Some(crate::compress::decompress(&stored, max_block_len(ctrl))?))
+}
+
+/// Upper bound on a decompressed block: one chunk, grown by the configured
+/// size-padding factor (the final block may be padded up to `len * (1+pad)`).
+fn max_block_len(ctrl: &Controller) -> usize {
+    let pad = ctrl.config().file_size_padding.unwrap_or(0.0).max(0.0);
+    ((CHUNK_SIZE as f64) * (1.0 + pad)).ceil() as usize + 16
 }
 
 /// Compress (per `codec`), seal, and write one block whole. `durable`

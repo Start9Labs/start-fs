@@ -34,38 +34,22 @@ use crate::inode::Inode;
 /// Inline directories with at most this many entries; spill beyond it.
 /// Default chosen comfortably above the sizes any test or small directory
 /// hits, so typical directories never leave the inline (legacy) path.
-/// Overridable via `BACKUPFS_DIR_SPILL` (used to A/B the inline-vs-spilled
-/// cost in benchmarks).
-fn spill_count() -> usize {
-    use std::sync::OnceLock;
-    static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("BACKUPFS_DIR_SPILL")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(1024)
-    })
-}
-/// Target entries per bucket when (re)sharding a spilled directory.
+///
+/// The inline→spill threshold (`dir_spill`) and the per-bucket reshard trigger
+/// (`dir_max_bucket`) are recorded in the superblock at creation and adopted on
+/// every mount (`Controller::dir_spill` / `Controller::dir_max_bucket`), so
+/// they stay consistent regardless of environment drift. They only affect new
+/// layout decisions — an existing spilled directory reads its own persisted
+/// bucket count from its `Spilled` marker.
+///
+/// The bucketing-math constants below are *frozen* for this format version:
+/// `bucket_of` does `hash % buckets`, so the per-directory bucket count (chosen
+/// by `choose_buckets`) is persisted and reads are self-describing; these
+/// bounds only shape new/resharded directories. Do not change them without a
+/// format-version bump.
 const TARGET_PER_BUCKET: u64 = 64;
 const MIN_BUCKETS: u32 = 16;
 const MAX_BUCKETS: u32 = 8192;
-
-/// Re-shard a spilled directory once any bucket exceeds this many entries.
-/// Overridable via `BACKUPFS_DIR_MAX_BUCKET` (used to exercise the reshard
-/// path in tests without creating millions of entries).
-fn max_per_bucket() -> usize {
-    use std::sync::OnceLock;
-    static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("BACKUPFS_DIR_MAX_BUCKET")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(4096)
-    })
-}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DirectoryEntry {
@@ -82,6 +66,9 @@ impl DirectoryEntry {
 /// The serialized contents of one bucket (or of an inline directory).
 pub type Bucket = OrdMap<OsString, DirectoryEntry>;
 
+/// **Append-only: never reorder or remove variants** (the serialized form is a
+/// bincode variant index; a reorder would misread every stored directory). Any
+/// reorder requires a `superblock::FORMAT_VERSION` bump.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 enum DirEntries {
     Inline(Bucket),
@@ -110,6 +97,11 @@ fn choose_buckets(entries: u64) -> u32 {
 }
 
 /// Stable, key-dependent bucket index for `name` given a bucket count.
+///
+/// FROZEN as superblock `dirent_hash_scheme == 1`: the domain tag, the
+/// `[..8]` little-endian truncation, and the `% buckets` mapping decide which
+/// bucket holds an entry on *read*. Changing it strands every spilled-directory
+/// entry, so it must be gated by a `FORMAT_VERSION` / `dirent_hash_scheme` bump.
 fn bucket_of(ctrl: &Controller, name: &OsStr, buckets: u32) -> u32 {
     use std::os::unix::ffi::OsStrExt;
     let mut hasher = Sha256::new();
@@ -188,7 +180,7 @@ impl DirectoryContents {
         // blob until the marker is saved — so a torn spill only orphans the
         // new buckets; no durable-ordering dance is needed here.)
         if let DirEntries::Inline(m) = &self.0 {
-            if !m.contains_key(&name) && m.len() >= spill_count() {
+            if !m.contains_key(&name) && m.len() >= ctrl.dir_spill() {
                 self.spill(ctrl, dir, choose_buckets(m.len() as u64 + 1))?;
             }
         }
@@ -212,7 +204,7 @@ impl DirectoryContents {
                     *len += 1;
                 }
                 *subdirs = (*subdirs + was_dir as u64).saturating_sub(prev_dir as u64);
-                let needs_reshard = bucket.len() > max_per_bucket() && *buckets < MAX_BUCKETS;
+                let needs_reshard = bucket.len() > ctrl.dir_max_bucket() && *buckets < MAX_BUCKETS;
                 ctrl.save_dir_bucket(dir, *gen, idx, &bucket, durable)?;
                 if needs_reshard {
                     return self.reshard(ctrl, dir);

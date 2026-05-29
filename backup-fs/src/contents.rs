@@ -27,38 +27,13 @@ use crate::error::{BkfsResult, BkfsResultExt};
 use crate::handle::Handler;
 use crate::inode::{time_now, ContentId, FileData, Inode, InodeAttributes};
 
-/// Files at or below this size are stored inline in their inode record;
-/// larger files use block storage. Default 4 KiB (one filesystem block) —
-/// large enough to absorb the long tail of tiny files (dotfiles, configs,
-/// symlink-ish data) where the per-object cost dominates, small enough that
-/// re-appending the inode record on a metadata change stays cheap.
-/// Overridable via `BACKUPFS_INLINE_MAX`; capped at `CHUNK_SIZE`.
-pub fn inline_threshold() -> u64 {
-    static T: OnceLock<u64> = OnceLock::new();
-    *T.get_or_init(|| {
-        std::env::var("BACKUPFS_INLINE_MAX")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(4096)
-            .min(CHUNK_SIZE)
-    })
-}
-
-/// Upper bound (inclusive) on a file packed as a single extent in the shared
-/// content log. Files in `(inline_threshold, pack_max]` are packed; larger
-/// files use per-file block storage. Defaults to one chunk; set
-/// `BACKUPFS_PACK_MAX` to the inline threshold (4096) to disable packing
-/// (medium files then fall back to one block file each — useful for A/B).
-pub fn pack_max() -> u64 {
-    static M: OnceLock<u64> = OnceLock::new();
-    *M.get_or_init(|| {
-        std::env::var("BACKUPFS_PACK_MAX")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|n| n.min(CHUNK_SIZE))
-            .unwrap_or(CHUNK_SIZE)
-    })
-}
+// The inline-tier and packed-tier size thresholds are recorded in the
+// superblock at filesystem creation and adopted on every mount, so they stay
+// consistent regardless of environment drift. They are read at runtime via
+// `Controller::inline_threshold` / `Controller::pack_max`. (Files in
+// `(inline_threshold, pack_max]` are packed as a single shared-log extent;
+// larger files use per-file block storage. Setting `BACKUPFS_PACK_MAX` to the
+// inline threshold at creation disables packing — useful for A/B.)
 
 /// Soft cap on per-file in-memory dirty *block* data. With `FOPEN_DIRECT_IO`
 /// the kernel streams writes straight to us and never triggers a writeback,
@@ -302,15 +277,17 @@ impl Contents {
 
     /// Migrate the body up to the tier that can hold a file of `end` bytes.
     fn promote_for(&mut self, end: u64) -> BkfsResult<()> {
+        let inline_threshold = self.ctrl.inline_threshold();
+        let pack_max = self.ctrl.pack_max();
         match &self.body {
-            Body::Inline(_) if end > inline_threshold() => {
-                if end <= pack_max() {
+            Body::Inline(_) if end > inline_threshold => {
+                if end <= pack_max {
                     self.inline_to_packed();
                 } else {
                     self.inline_to_blocks()?;
                 }
             }
-            Body::Packed { .. } if end > pack_max() => self.packed_to_blocks()?,
+            Body::Packed { .. } if end > pack_max => self.packed_to_blocks()?,
             _ => {}
         }
         Ok(())
@@ -490,15 +467,17 @@ impl Contents {
         // promote so the flush below stores it correctly. Bytes beyond the
         // in-memory buffer stay holes (sparse) — never materialized, so a
         // huge set_len can't OOM us.
+        let inline_threshold = self.ctrl.inline_threshold();
+        let pack_max = self.ctrl.pack_max();
         match &self.body {
-            Body::Inline(_) if size > inline_threshold() => {
-                if size <= pack_max() {
+            Body::Inline(_) if size > inline_threshold => {
+                if size <= pack_max {
                     self.inline_to_packed();
                 } else {
                     self.inline_to_blocks()?;
                 }
             }
-            Body::Packed { .. } if size > pack_max() => self.packed_to_blocks()?,
+            Body::Packed { .. } if size > pack_max => self.packed_to_blocks()?,
             _ => {}
         }
 

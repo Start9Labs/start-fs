@@ -97,7 +97,7 @@ pub fn write_block(
     // Compress BEFORE sealing — ciphertext is incompressible. Each block is
     // compressed independently, so a one-block edit recompresses only it.
     let stored = crate::compress::compress(plaintext, codec);
-    let blob = vault::seal(&stored, ctrl.key());
+    let blob = vault::seal(&stored, ctrl.key(), ctrl.ecc());
     let mut file = BufferedDirectFile::new(AtomicFile::create(ctrl.block_path(content, idx))?)?;
     file.write_all(&blob)?;
     if durable {

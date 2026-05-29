@@ -34,7 +34,6 @@
 //! rejects a wrong key/password (surfaced as [`BkfsErrorKind::BadChecksum`]).
 
 use std::backtrace::Backtrace;
-use std::sync::OnceLock;
 
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::{ChaCha20, Key, Nonce};
@@ -47,37 +46,87 @@ use zeroize::Zeroizing;
 use crate::ecc;
 use crate::error::{BkfsError, BkfsErrorKind, BkfsResult};
 
+// The vault blob framing ("BKV1" + self-describing ECC params) is frozen and
+// self-contained — it is NOT recorded in the superblock because every blob
+// header carries its own version/ecc/lengths and reads never depend on
+// external state. The bincode encoding of a blob's *plaintext* (for the data
+// structures) is governed by the superblock's `bincode_encoding` constant.
 const MAGIC: [u8; 4] = *b"BKV1";
 const VERSION: u8 = 1;
 const HEADER_LEN: usize = 4 + 1 + 1 + 1 + 1 + 4 + 4 + 12; // = 28
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 32; // SHA-256
-const PBKDF2_SALT_LEN: usize = 16;
-const PBKDF2_ROUNDS: u32 = 600_000;
+pub const PBKDF2_SALT_LEN: usize = 16;
+/// The PBKDF2 work factor this build writes and accepts. Recorded in the
+/// superblock envelope for forward-compat/diagnostics, but validated for
+/// equality on open (and hard-bounded) — it is never taken as an
+/// attacker-tunable input, since an unauthenticated huge value would be a DoS
+/// and a tiny value would weaken the KDF.
+pub const PBKDF2_ROUNDS: u32 = 600_000;
 
-/// Reed-Solomon parameters for newly-written blobs. Overridable via
-/// `BACKUPFS_ECC_DATA` / `BACKUPFS_ECC_PARITY`; defaults to 10 data + 2
-/// parity (≈20% space overhead, tolerates any 2 corrupt shards). The
-/// values are recorded in each blob's header, so reads never depend on the
-/// current environment — only new writes do.
-pub fn ecc_params() -> (usize, usize) {
-    static PARAMS: OnceLock<(usize, usize)> = OnceLock::new();
-    *PARAMS.get_or_init(|| {
-        let env = |k: &str, d: usize| {
+/// Default Reed-Solomon parameters: 10 data + 2 parity (≈20% space overhead,
+/// tolerates any 2 corrupt shards). The actual params for a filesystem are
+/// chosen once at creation, recorded in the superblock, and threaded
+/// explicitly into every [`seal`]; reads never depend on them (each blob
+/// header self-describes its own params).
+pub const DEFAULT_ECC_DATA: u8 = 10;
+pub const DEFAULT_ECC_PARITY: u8 = 2;
+
+/// Reed-Solomon parameters threaded explicitly into [`seal`]. Constructible
+/// only through validated paths, so [`seal`]'s internal `encode` can never be
+/// handed out-of-range params.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EccParams {
+    pub data: u8,
+    pub parity: u8,
+}
+
+impl Default for EccParams {
+    fn default() -> Self {
+        EccParams { data: DEFAULT_ECC_DATA, parity: DEFAULT_ECC_PARITY }
+    }
+}
+
+impl EccParams {
+    /// Validate that the params are usable by [`ecc::encode`]/[`ecc::decode`].
+    /// `data > 0`, `parity > 0`, and `data + parity ≤ MAX_SHARDS`.
+    pub fn validate(self) -> BkfsResult<()> {
+        if self.data == 0
+            || self.parity == 0
+            || self.data as usize + self.parity as usize > ecc::MAX_SHARDS
+        {
+            return Err(BkfsError::unsupported(format!(
+                "invalid ECC params {}+{} (need data>0, parity>0, sum≤{})",
+                self.data,
+                self.parity,
+                ecc::MAX_SHARDS
+            )));
+        }
+        Ok(())
+    }
+
+    /// Read params from `BACKUPFS_ECC_DATA`/`BACKUPFS_ECC_PARITY`, falling back
+    /// to the default for any missing/out-of-range value. Used ONLY at
+    /// filesystem creation to choose the params recorded in the superblock;
+    /// existing stores source their params from the superblock, never env.
+    pub fn from_env_or_default() -> EccParams {
+        let env = |k: &str, d: u8| {
             std::env::var(k)
                 .ok()
-                .and_then(|s| s.parse::<usize>().ok())
+                .and_then(|s| s.parse::<u8>().ok())
                 .filter(|&n| n > 0)
                 .unwrap_or(d)
         };
-        let data = env("BACKUPFS_ECC_DATA", 10);
-        let parity = env("BACKUPFS_ECC_PARITY", 2);
-        if data + parity > ecc::MAX_SHARDS {
-            (10, 2)
+        let p = EccParams {
+            data: env("BACKUPFS_ECC_DATA", DEFAULT_ECC_DATA),
+            parity: env("BACKUPFS_ECC_PARITY", DEFAULT_ECC_PARITY),
+        };
+        if p.validate().is_ok() {
+            p
         } else {
-            (data, parity)
+            EccParams::default()
         }
-    })
+    }
 }
 
 fn bad_checksum() -> BkfsError {
@@ -95,10 +144,11 @@ fn corrupt() -> BkfsError {
 }
 
 /// Encrypt + integrity-tag + erasure-code `plaintext` into a self-contained
-/// blob using the given symmetric key and the configured ECC parameters.
-pub fn seal(plaintext: &[u8], key: &Key) -> Vec<u8> {
-    let (data, parity) = ecc_params();
-    seal_with(plaintext, key, data, parity)
+/// blob using the given symmetric key and ECC parameters. `ecc` must have been
+/// validated (it can only be constructed through validated paths), so the
+/// internal `ecc::encode` cannot fail on out-of-range params.
+pub fn seal(plaintext: &[u8], key: &Key, ecc: EccParams) -> Vec<u8> {
+    seal_with(plaintext, key, ecc.data as usize, ecc.parity as usize)
 }
 
 fn seal_with(plaintext: &[u8], key: &Key, data: usize, parity: usize) -> Vec<u8> {
@@ -191,33 +241,17 @@ pub fn open(blob: &[u8], key: &Key) -> BkfsResult<Vec<u8>> {
     Ok(secret)
 }
 
-/// Seal `plaintext` under a key derived from `password` via PBKDF2. The
-/// random salt is prepended to the returned blob. Used only for the crypt
-/// header, which must be readable before the master key is available.
-pub fn seal_pbkdf2(plaintext: &[u8], password: &str) -> BkfsResult<Vec<u8>> {
-    let mut salt = [0u8; PBKDF2_SALT_LEN];
-    rng().fill_bytes(&mut salt);
-    let key = derive_key(password, &salt)?;
-    let mut out = Vec::with_capacity(PBKDF2_SALT_LEN + plaintext.len() + 128);
-    out.extend_from_slice(&salt);
-    let (data, parity) = ecc_params();
-    out.extend_from_slice(&seal_with(plaintext, Key::from_slice(&*key), data, parity));
-    Ok(out)
-}
-
-/// Open a blob produced by [`seal_pbkdf2`].
-pub fn open_pbkdf2(blob: &[u8], password: &str) -> BkfsResult<Vec<u8>> {
-    if blob.len() < PBKDF2_SALT_LEN {
-        return Err(corrupt());
-    }
-    let (salt, rest) = blob.split_at(PBKDF2_SALT_LEN);
-    let key = derive_key(password, salt)?;
-    open(rest, Key::from_slice(&*key))
-}
-
-fn derive_key(password: &str, salt: &[u8]) -> BkfsResult<Zeroizing<[u8; 32]>> {
+/// Derive a 32-byte key from `password` and `salt` via PBKDF2-HMAC-SHA256 with
+/// `rounds` iterations. The superblock composes this with [`seal`]/[`open`] to
+/// protect its body; `rounds` is validated/bounded by the caller before this
+/// runs (see [`crate::superblock`]), never taken raw from untrusted input.
+pub(crate) fn derive_key(
+    password: &str,
+    salt: &[u8],
+    rounds: u32,
+) -> BkfsResult<Zeroizing<[u8; 32]>> {
     let mut key = Zeroizing::new([0u8; 32]);
-    pbkdf2::<Hmac<Sha256>>(password.as_bytes(), salt, PBKDF2_ROUNDS, key.as_mut_slice())
+    pbkdf2::<Hmac<Sha256>>(password.as_bytes(), salt, rounds, key.as_mut_slice())
         .map_err(|_| BkfsError {
             kind: BkfsErrorKind::BadCrypt,
             backtrace: Some(Box::new(Backtrace::capture())),
@@ -238,14 +272,14 @@ mod tests {
         let key = test_key();
         for len in [0usize, 1, 31, 32, 33, 4096, 100_000] {
             let pt: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
-            let blob = seal(&pt, &key);
+            let blob = seal(&pt, &key, EccParams::default());
             assert_eq!(open(&blob, &key).unwrap(), pt);
         }
     }
 
     #[test]
     fn wrong_key_is_bad_checksum() {
-        let blob = seal(b"secret data", &test_key());
+        let blob = seal(b"secret data", &test_key(), EccParams::default());
         let other = *Key::from_slice(&[9u8; 32]);
         match open(&blob, &other) {
             Err(e) => assert!(matches!(e.kind, BkfsErrorKind::BadChecksum)),
@@ -274,12 +308,25 @@ mod tests {
     }
 
     #[test]
-    fn pbkdf2_roundtrip() {
-        let blob = seal_pbkdf2(b"header bytes", "hunter2").unwrap();
-        assert_eq!(open_pbkdf2(&blob, "hunter2").unwrap(), b"header bytes");
+    fn pbkdf2_derive_seal_roundtrip() {
+        // The superblock composes derive_key + seal/open; mirror that here.
+        let salt = [0x5au8; PBKDF2_SALT_LEN];
+        let key = derive_key("hunter2", &salt, PBKDF2_ROUNDS).unwrap();
+        let blob = seal(b"header bytes", Key::from_slice(&*key), EccParams::default());
+        assert_eq!(open(&blob, Key::from_slice(&*key)).unwrap(), b"header bytes");
+
+        let wrong = derive_key("wrong", &salt, PBKDF2_ROUNDS).unwrap();
         assert!(matches!(
-            open_pbkdf2(&blob, "wrong").unwrap_err().kind,
+            open(&blob, Key::from_slice(&*wrong)).unwrap_err().kind,
             BkfsErrorKind::BadChecksum
         ));
+    }
+
+    #[test]
+    fn ecc_params_validate() {
+        assert!(EccParams { data: 10, parity: 2 }.validate().is_ok());
+        assert!(EccParams { data: 0, parity: 2 }.validate().is_err());
+        assert!(EccParams { data: 10, parity: 0 }.validate().is_err());
+        assert!(EccParams { data: 254, parity: 2 }.validate().is_err()); // sum > 255
     }
 }

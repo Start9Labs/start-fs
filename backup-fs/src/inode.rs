@@ -28,6 +28,13 @@ impl From<Inode> for ContentId {
     }
 }
 
+/// On-disk file-content descriptor.
+///
+/// **Append-only: never reorder or remove variants.** The serialized form is a
+/// bincode variant index (declaration order); reordering would silently
+/// reinterpret every existing inode (a stored `Packed` would decode as
+/// `Directory`, etc.). New variants must be appended, and any unavoidable
+/// reorder requires a `superblock::FORMAT_VERSION` bump.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum FileData {
     File(ContentId),

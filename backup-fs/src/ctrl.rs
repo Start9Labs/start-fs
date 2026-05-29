@@ -20,7 +20,9 @@ use crate::error::{BkfsResult, BkfsResultExt};
 use crate::inode::{Attributes, ContentId, FileData, Inode, InodeAttributes};
 use crate::seglog::{self, SegmentLog};
 use crate::serde;
-use crate::{BackupFSOptions, CryptInfo};
+use crate::superblock::{Constants, Superblock};
+use crate::vault::EccParams;
+use crate::BackupFSOptions;
 
 #[derive(Clone)]
 pub struct Controller(Arc<ControllerSeed>);
@@ -35,8 +37,17 @@ const _: fn() = || {
 
 pub struct ControllerSeed {
     config: BackupFSOptions,
-    cryptinfo_path: PathBuf,
-    cryptinfo: CryptInfo,
+    /// Path to the canonical superblock replica (`data_dir/superblock`).
+    superblock_path: PathBuf,
+    /// Format constants adopted from the superblock at mount — the
+    /// authoritative source for ECC params, tier thresholds, etc. (the
+    /// environment is consulted only at filesystem creation).
+    constants: Constants,
+    /// Superblock creation time, carried through password changes.
+    created_unix: u64,
+    /// Live superblock write generation; bumped on every password change so a
+    /// crash mid-rewrite converges to the newest replica on the next mount.
+    sb_generation: AtomicU64,
     key: Key,
     contents_dir: PathBuf,
     dirents_dir: PathBuf,
@@ -74,21 +85,20 @@ fn compact_ratio() -> f64 {
 
 impl Controller {
     pub fn new(config: BackupFSOptions) -> BkfsResult<Self> {
-        let cryptinfo_path = config.data_dir.join("cryptinfo");
-        let cryptinfo = if CryptInfo::any_exists(&cryptinfo_path) {
-            CryptInfo::load(&cryptinfo_path, &config.password)?
-        } else {
-            if config.readonly {
-                return BkfsResult::errno_notrace(libc::EROFS);
-            }
-            let cryptinfo = CryptInfo::new();
-            cryptinfo.save(&cryptinfo_path, &config.password)?;
-            cryptinfo
-        };
-        let key = Key::clone_from_slice(&*cryptinfo.key);
+        // The superblock is the anchor: it yields the master key and the
+        // authoritative format constants (validated/version-gated on open).
+        let superblock_path = config.data_dir.join("superblock");
+        let sb = Superblock::open_or_create(&superblock_path, &config.password, config.readonly)?;
+        let key = sb.key;
+        let constants = sb.constants;
         // Opening the log replays existing segments, rebuilding the in-RAM
-        // index and the max-inode high-water mark.
-        let log = SegmentLog::open(config.data_dir.join("segments"), key)?;
+        // index and the max-inode high-water mark. The segment size is pinned
+        // by the superblock, not the environment.
+        let log = SegmentLog::open_sized(
+            config.data_dir.join("segments"),
+            key,
+            constants.segment_size,
+        )?;
         let next_inode = (log.max_inode() + 1).max(FUSE_ROOT_ID + 1);
         Ok(Self(Arc::new(ControllerSeed {
             key,
@@ -99,16 +109,48 @@ impl Controller {
             pending_saves: AtomicUsize::new(0),
             data_dir_fd: OnceLock::new(),
             config,
-            cryptinfo_path,
-            cryptinfo,
+            superblock_path,
+            constants,
+            created_unix: sb.created_unix,
+            sb_generation: AtomicU64::new(sb.generation),
         })))
+    }
+
+    /// ECC parameters for new writes, adopted from the superblock.
+    pub fn ecc(&self) -> EccParams {
+        self.0.constants.ecc()
+    }
+
+    /// The format constants adopted from the superblock.
+    pub fn constants(&self) -> &Constants {
+        &self.0.constants
+    }
+
+    /// Inline-tier upper bound (bytes), from the superblock.
+    pub fn inline_threshold(&self) -> u64 {
+        self.0.constants.inline_threshold
+    }
+
+    /// Packed-tier upper bound (bytes), from the superblock.
+    pub fn pack_max(&self) -> u64 {
+        self.0.constants.pack_max
+    }
+
+    /// Directory inline→spill entry threshold, from the superblock.
+    pub fn dir_spill(&self) -> usize {
+        self.0.constants.dir_spill as usize
+    }
+
+    /// Directory per-bucket reshard trigger, from the superblock.
+    pub fn dir_max_bucket(&self) -> usize {
+        self.0.constants.dir_max_bucket as usize
     }
 
     /// Append/replace an inode record in the log. `durable` fdatasyncs the
     /// active segment before returning; otherwise durability rides the
     /// batched syncfs. Sealing is done before taking the log lock.
     pub fn log_put(&self, inode: Inode, attrs: &Attributes, durable: bool) -> BkfsResult<()> {
-        let rec = seglog::seal_inode(&self.key(), inode, attrs)?;
+        let rec = seglog::seal_inode(&self.key(), self.ecc(), inode, attrs)?;
         let mut log = self.0.log.lock().unwrap();
         log.append(&rec)?;
         if durable {
@@ -121,7 +163,7 @@ impl Controller {
     /// before removing the inode's content (block files / dir buckets) pass
     /// `durable = true`.
     pub fn log_tombstone(&self, inode: Inode, durable: bool) -> BkfsResult<()> {
-        let rec = seglog::seal_tombstone(&self.key(), inode)?;
+        let rec = seglog::seal_tombstone(&self.key(), self.ecc(), inode)?;
         let mut log = self.0.log.lock().unwrap();
         log.append(&rec)?;
         if durable {
@@ -151,7 +193,7 @@ impl Controller {
         // Compress before sealing (ciphertext is incompressible); the
         // extent's stored payload carries the compression tag.
         let stored = crate::compress::compress(bytes, codec);
-        let rec = seglog::seal_content(&self.key(), id.0, &stored)?;
+        let rec = seglog::seal_content(&self.key(), self.ecc(), id.0, &stored)?;
         let mut log = self.0.log.lock().unwrap();
         log.append(&rec)?;
         if durable {
@@ -173,7 +215,7 @@ impl Controller {
     }
 
     pub fn cpack_tombstone(&self, id: ContentId, durable: bool) -> BkfsResult<()> {
-        let rec = seglog::seal_content_tombstone(&self.key(), id.0)?;
+        let rec = seglog::seal_content_tombstone(&self.key(), self.ecc(), id.0)?;
         let mut log = self.0.log.lock().unwrap();
         log.append(&rec)?;
         if durable {
@@ -306,7 +348,17 @@ impl Controller {
 
     pub fn change_password(&self, password: &str) -> BkfsResult<()> {
         self.check_rw()?;
-        self.0.cryptinfo.save(&self.0.cryptinfo_path, password)
+        // Re-seal the superblock under the new password with a bumped
+        // generation, so a crash mid-rewrite converges to the new password
+        // (highest generation wins on load), never rolling back to the old.
+        let generation = self.0.sb_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let sb = Superblock {
+            key: self.0.key,
+            constants: self.0.constants,
+            generation,
+            created_unix: self.0.created_unix,
+        };
+        sb.persist(&self.0.superblock_path, password)
     }
 
     pub fn check_rw(&self) -> BkfsResult<()> {
@@ -324,6 +376,12 @@ impl Controller {
     /// every other block keeps its name (the property that makes
     /// rsync/rclone incremental copies cheap).
     pub fn block_path(&self, content: ContentId, idx: u64) -> PathBuf {
+        // FROZEN as superblock `path_hash_scheme == 1`: the domain tag, the
+        // little-endian id encoding, and the 16-bit-dir / 120-bit-name split
+        // below all determine where bytes physically live and how reads find
+        // them. Changing any of it makes every existing block file
+        // unresolvable, so it must be gated by a FORMAT_VERSION /
+        // path_hash_scheme bump (validate-equality refuses a foreign scheme).
         let mut hasher = Sha256::new();
         hasher.update(self.0.key.as_slice());
         hasher.update(b"block");
@@ -346,6 +404,7 @@ impl Controller {
     }
 
     /// Path of a spilled-directory bucket file, keyed by `(dir, gen, idx)`.
+    /// Part of FROZEN superblock `path_hash_scheme == 1` (see [`Self::block_path`]).
     fn dir_bucket_path(&self, dir: Inode, gen: u64, idx: u32) -> PathBuf {
         let mut hasher = Sha256::new();
         hasher.update(self.0.key.as_slice());
@@ -390,7 +449,7 @@ impl Controller {
         if bucket.is_empty() {
             return self.remove_dir_bucket(dir, gen, idx);
         }
-        let blob = serde::serialize_sealed(bucket, self.key())?;
+        let blob = serde::serialize_sealed(bucket, self.key(), self.ecc())?;
         let mut file = AtomicFile::create_buffered(self.dir_bucket_path(dir, gen, idx))?;
         file.write_all(&blob)?;
         if durable {

@@ -17,7 +17,7 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [dependencies]
-bincode = "1"
+bincode = { version = "2", features = ["serde"] }
 chacha20 = { version = "0.9.1", features = ["zeroize"] }
 fd-lock-rs = "0.1.4"
 fuser = { git = "https://github.com/Start9Labs/fuser.git", rev = "b6f91ac", features = [

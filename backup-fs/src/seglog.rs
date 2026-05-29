@@ -60,16 +60,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{BkfsError, BkfsResult};
 use crate::inode::{Attributes, Inode};
-use crate::vault;
+use crate::serde::{data_config, decode, encode};
+use crate::vault::{self, EccParams};
 
 const MAGIC: [u8; 4] = *b"BKL1";
 const HEADER_LEN: usize = 24; // magic(4) + crc(4) + seq(8) + payload_len(4) + reserved(4)
 const ALIGN: u64 = 8;
 
-/// Default rolled-segment size. Small enough that the active (perpetually
-/// appended) segment stays a modest object for rsync/rclone to re-scan, and
-/// that replay/compaction work in bounded chunks; large enough to amortize
-/// per-segment overhead. Overridable via `BACKUPFS_SEGMENT_SIZE`.
+/// Default rolled-segment size, used only by the test-facing [`SegmentLog::open`]
+/// convenience. Production opens via [`SegmentLog::open_sized`] with the size
+/// pinned by the superblock (see `Constants::segment_size`). Small enough that
+/// the active segment stays a modest object for rsync/rclone to re-scan;
+/// large enough to amortize per-segment overhead.
+#[cfg(test)]
 fn segment_size() -> u64 {
     use std::sync::OnceLock;
     static N: OnceLock<u64> = OnceLock::new();
@@ -85,6 +88,11 @@ fn segment_size() -> u64 {
 /// One persisted record. Single-key by design: directory entries live in
 /// their own bucket files (see `directory`) and large content in block files
 /// (see `blockstore`), so the log never needs multi-key atomic records.
+///
+/// **Append-only: never reorder or remove variants.** The serialized form is a
+/// bincode variant index (declaration order), so a reorder would silently
+/// misread every existing log frame. Any unavoidable reorder requires a
+/// `superblock::FORMAT_VERSION` bump.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Record {
     Inode { inode: u64, attrs: Attributes },
@@ -114,32 +122,35 @@ pub struct SealedRecord {
 }
 
 /// Seal an inode record (encryption + ECC) without touching the log.
-pub fn seal_inode(key: &Key, inode: Inode, attrs: &Attributes) -> BkfsResult<SealedRecord> {
-    let bytes = vault::seal(
-        &bincode::serialize(&Record::Inode { inode: inode.0, attrs: attrs.clone() })?,
-        key,
-    );
+pub fn seal_inode(
+    key: &Key,
+    ecc: EccParams,
+    inode: Inode,
+    attrs: &Attributes,
+) -> BkfsResult<SealedRecord> {
+    let plain = encode(&Record::Inode { inode: inode.0, attrs: attrs.clone() }, data_config())?;
+    let bytes = vault::seal(&plain, key, ecc);
     Ok(SealedRecord { key: inode.0, bytes, space: Space::Inode, tombstone: false })
 }
 
 /// Seal an inode tombstone record without touching the log.
-pub fn seal_tombstone(key: &Key, inode: Inode) -> BkfsResult<SealedRecord> {
-    let bytes = vault::seal(&bincode::serialize(&Record::Tombstone { inode: inode.0 })?, key);
+pub fn seal_tombstone(key: &Key, ecc: EccParams, inode: Inode) -> BkfsResult<SealedRecord> {
+    let plain = encode(&Record::Tombstone { inode: inode.0 }, data_config())?;
+    let bytes = vault::seal(&plain, key, ecc);
     Ok(SealedRecord { key: inode.0, bytes, space: Space::Inode, tombstone: true })
 }
 
 /// Seal a packed-content record without touching the log.
-pub fn seal_content(key: &Key, id: u64, bytes: &[u8]) -> BkfsResult<SealedRecord> {
-    let sealed = vault::seal(
-        &bincode::serialize(&Record::Content { id, bytes: bytes.to_vec() })?,
-        key,
-    );
+pub fn seal_content(key: &Key, ecc: EccParams, id: u64, bytes: &[u8]) -> BkfsResult<SealedRecord> {
+    let plain = encode(&Record::Content { id, bytes: bytes.to_vec() }, data_config())?;
+    let sealed = vault::seal(&plain, key, ecc);
     Ok(SealedRecord { key: id, bytes: sealed, space: Space::Content, tombstone: false })
 }
 
 /// Seal a content tombstone record without touching the log.
-pub fn seal_content_tombstone(key: &Key, id: u64) -> BkfsResult<SealedRecord> {
-    let bytes = vault::seal(&bincode::serialize(&Record::ContentTombstone { id })?, key);
+pub fn seal_content_tombstone(key: &Key, ecc: EccParams, id: u64) -> BkfsResult<SealedRecord> {
+    let plain = encode(&Record::ContentTombstone { id }, data_config())?;
+    let bytes = vault::seal(&plain, key, ecc);
     Ok(SealedRecord { key: id, bytes, space: Space::Content, tombstone: true })
 }
 
@@ -219,15 +230,18 @@ fn segment_path(dir: &std::path::Path, id: u64) -> PathBuf {
 }
 
 impl SegmentLog {
-    /// Open (creating if absent) the log under `dir`, replaying existing
-    /// segments to rebuild the in-RAM index.
+    /// Open (creating if absent) the log under `dir` with the default segment
+    /// size, replaying existing segments to rebuild the in-RAM index. Test
+    /// convenience; production uses [`SegmentLog::open_sized`] with the
+    /// superblock-pinned size.
+    #[cfg(test)]
     pub fn open(dir: PathBuf, key: Key) -> BkfsResult<Self> {
         Self::open_sized(dir, key, segment_size())
     }
 
-    /// As [`open`], with an explicit segment size. Lets tests pin the rotation
-    /// threshold deterministically instead of relying on the cached env var.
-    fn open_sized(dir: PathBuf, key: Key, segment_size: u64) -> BkfsResult<Self> {
+    /// As [`open`], with an explicit segment size (from the superblock at
+    /// mount; pinned per-test elsewhere) instead of the env-cached default.
+    pub(crate) fn open_sized(dir: PathBuf, key: Key, segment_size: u64) -> BkfsResult<Self> {
         std::fs::create_dir_all(&dir)?;
         let mut segment_ids = Vec::new();
         for entry in std::fs::read_dir(&dir)? {
@@ -274,7 +288,7 @@ impl SegmentLog {
                 }
                 let payload = &bytes[pos + HEADER_LEN..end];
                 match vault::open(payload, &key).and_then(|p| {
-                    bincode::deserialize::<Record>(&p).map_err(BkfsError::from)
+                    decode::<Record>(&p, data_config())
                 }) {
                     Ok(record) => {
                         next_seq = next_seq.max(seq + 1);
@@ -373,7 +387,7 @@ impl SegmentLog {
             .ok_or_else(|| BkfsError::wrap(std::io::Error::other("corrupt log frame header")))?;
         let payload = &frame[HEADER_LEN..HEADER_LEN + payload_len];
         let plain = vault::open(payload, &self.key)?;
-        Ok(bincode::deserialize(&plain)?)
+        decode(&plain, data_config())
     }
 
     /// Load an inode's attributes, or None if it isn't in the index.
@@ -453,14 +467,14 @@ impl SegmentLog {
     /// Append/replace an inode record (seals inline; convenience for tests).
     #[cfg(test)]
     pub fn put(&mut self, inode: Inode, attrs: &Attributes) -> BkfsResult<()> {
-        let rec = seal_inode(&self.key, inode, attrs)?;
+        let rec = seal_inode(&self.key, EccParams::default(), inode, attrs)?;
         self.append(&rec)
     }
 
     /// Append a tombstone (seals inline; convenience for tests).
     #[cfg(test)]
     pub fn tombstone(&mut self, inode: Inode) -> BkfsResult<()> {
-        let rec = seal_tombstone(&self.key, inode)?;
+        let rec = seal_tombstone(&self.key, EccParams::default(), inode)?;
         self.append(&rec)
     }
 

@@ -1646,7 +1646,7 @@ fn sparse_file_omits_hole_blocks() {
 /// redundant copies, so losing or corrupting the primary must not brick the
 /// backup, and the damaged copy should self-heal on the next mount.
 #[test_log::test]
-fn cryptinfo_survives_primary_loss_and_self_heals() {
+fn superblock_survives_primary_loss_and_self_heals() {
     let data = TempDir::new("backupfs_data").unwrap();
     with_backupfs(
         data.path(),
@@ -1657,10 +1657,10 @@ fn cryptinfo_survives_primary_loss_and_self_heals() {
         None,
     );
 
-    let primary = data.path().join("cryptinfo");
-    let backup = data.path().join("cryptinfo.bak1");
-    assert!(primary.exists(), "primary cryptinfo missing");
-    assert!(backup.exists(), "redundant cryptinfo copy was not written");
+    let primary = data.path().join("superblock");
+    let backup = data.path().join("superblock.bak1");
+    assert!(primary.exists(), "primary superblock missing");
+    assert!(backup.exists(), "redundant superblock copy was not written");
 
     // Simulate total loss of the primary (deleted / lost dir entry).
     fs::remove_file(&primary).unwrap();
@@ -1678,7 +1678,7 @@ fn cryptinfo_survives_primary_loss_and_self_heals() {
         },
         None,
     );
-    assert!(primary.exists(), "primary cryptinfo was not self-healed");
+    assert!(primary.exists(), "primary superblock was not self-healed");
 
     // Now corrupt the backup instead (zero it out) and confirm recovery
     // from the (healed) primary.
@@ -2404,4 +2404,94 @@ fn measure_compression_ratio() {
         logical as f64 / on_disk as f64
     );
     eprintln!("──────────────────────────────────────────────────────────────────");
+}
+
+/// The version gate refuses a store written by a newer format than this build
+/// supports — and does so with an actionable `UnsupportedFormat`, read from the
+/// plaintext envelope without needing to decode the (newer-shaped) body.
+#[test_log::test]
+fn superblock_rejects_newer_format_version() {
+    use crate::error::BkfsErrorKind;
+    let data = TempDir::new("backupfs_data").unwrap();
+    // Create a fresh, valid store.
+    crate::ctrl::Controller::new(opts(data.path(), "ohea")).unwrap();
+
+    // Bump the plaintext envelope's format_version (offset 5..9, u32 LE) far
+    // past SUPPORTED in BOTH replicas, simulating a store written by a newer
+    // build. The sealed body is untouched, so this exercises the pre-decode
+    // version gate specifically.
+    for name in ["superblock", "superblock.bak1"] {
+        let path = data.path().join(name);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[5..9].copy_from_slice(&9999u32.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+    }
+
+    let err = open_ctrl_err(data.path(), "ohea");
+    assert!(
+        matches!(err.kind, BkfsErrorKind::UnsupportedFormat(_)),
+        "newer format_version must be refused with UnsupportedFormat, got {err:?}"
+    );
+}
+
+/// Open a controller expecting failure, returning the error (Controller isn't
+/// Debug, so `unwrap_err` can't be used directly).
+fn open_ctrl_err(data: &Path, password: &str) -> crate::error::BkfsError {
+    match crate::ctrl::Controller::new(opts(data, password)) {
+        Ok(_) => panic!("expected Controller::new to fail"),
+        Err(e) => e,
+    }
+}
+
+/// A wrong password surfaces as `BadChecksum` (the vault integrity tag fails
+/// before any decode runs), not a confusing decode error.
+#[test_log::test]
+fn superblock_wrong_password_is_bad_checksum() {
+    use crate::error::BkfsErrorKind;
+    let data = TempDir::new("backupfs_data").unwrap();
+    crate::ctrl::Controller::new(opts(data.path(), "correct horse")).unwrap();
+
+    let err = open_ctrl_err(data.path(), "wrong");
+    assert!(
+        matches!(err.kind, BkfsErrorKind::BadChecksum),
+        "wrong password must be BadChecksum, got {err:?}"
+    );
+}
+
+/// A pre-versioning store (a `cryptinfo` file, no superblock) is refused with a
+/// clear error rather than silently overwritten with a fresh, empty superblock.
+#[test_log::test]
+fn legacy_cryptinfo_store_is_refused() {
+    use crate::error::BkfsErrorKind;
+    let data = TempDir::new("backupfs_data").unwrap();
+    fs::write(data.path().join("cryptinfo"), b"legacy unversioned header").unwrap();
+
+    let err = open_ctrl_err(data.path(), "ohea");
+    assert!(
+        matches!(err.kind, BkfsErrorKind::UnsupportedFormat(_)),
+        "legacy cryptinfo store must be refused, got {err:?}"
+    );
+    // And the fresh superblock must NOT have been created over it.
+    assert!(!data.path().join("superblock").exists());
+}
+
+/// A password change is durable across a remount: the new password opens the
+/// store and the old one no longer does (generation-based replica selection
+/// converges to the rewritten superblock).
+#[test_log::test]
+fn superblock_change_password_persists() {
+    use crate::error::BkfsErrorKind;
+    let data = TempDir::new("backupfs_data").unwrap();
+    {
+        let ctrl = crate::ctrl::Controller::new(opts(data.path(), "old-pass")).unwrap();
+        ctrl.change_password("new-pass").unwrap();
+    }
+    // New password opens.
+    crate::ctrl::Controller::new(opts(data.path(), "new-pass")).unwrap();
+    // Old password is rejected.
+    let err = open_ctrl_err(data.path(), "old-pass");
+    assert!(
+        matches!(err.kind, BkfsErrorKind::BadChecksum),
+        "old password must no longer open after change, got {err:?}"
+    );
 }

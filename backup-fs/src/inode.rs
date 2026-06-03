@@ -1,5 +1,4 @@
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,13 +8,10 @@ use imbl::{OrdMap, OrdSet};
 use log::debug;
 use serde::{Deserialize, Serialize};
 
-use crate::atomic_file::AtomicFile;
-use crate::contents::EncryptedFile;
 use crate::ctrl::{Controller, Exists, Load, Save};
 use crate::directory::DirectoryContents;
 use crate::error::{BkfsResult, BkfsResultExt};
 use crate::handle::{FileHandleId, Handler};
-use crate::serde::{load, save, save_fast};
 use crate::{get_groups, IdMappedRoot};
 
 pub const BLOCK_SIZE: u64 = 4096;
@@ -32,11 +28,32 @@ impl From<Inode> for ContentId {
     }
 }
 
+/// On-disk file-content descriptor.
+///
+/// **Append-only: never reorder or remove variants.** The serialized form is a
+/// bincode variant index (declaration order); reordering would silently
+/// reinterpret every existing inode (a stored `Packed` would decode as
+/// `Directory`, etc.). New variants must be appended, and any unavoidable
+/// reorder requires a `superblock::FORMAT_VERSION` bump.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum FileData {
     File(ContentId),
+    /// A small regular file whose entire content is stored inline in this
+    /// inode record (so a tiny file needs no separate content block file).
+    /// Files larger than the inline threshold use `File` + block storage.
+    Inline(Vec<u8>),
+    /// A small/medium regular file (≤ one chunk) whose content is a single
+    /// extent packed into the shared content log, addressed by this id. The
+    /// bytes live in the log, not here — only the pointer does.
+    Packed(ContentId),
     Directory(DirectoryContents),
     Symlink(PathBuf),
+    /// Character special file; payload is the device number (`rdev`).
+    CharDevice(u32),
+    /// Block special file; payload is the device number (`rdev`).
+    BlockDevice(u32),
+    Fifo,
+    Socket,
 }
 impl FileData {
     fn nlink(&self) -> usize {
@@ -50,16 +67,29 @@ impl FileData {
         matches!(self, Self::Directory(_))
     }
     pub fn is_file(&self) -> bool {
-        matches!(self, Self::File(_))
+        matches!(self, Self::File(_) | Self::Inline(_) | Self::Packed(_))
+    }
+    /// Device number for special files, `0` otherwise.
+    pub fn rdev(&self) -> u32 {
+        match self {
+            Self::CharDevice(rdev) | Self::BlockDevice(rdev) => *rdev,
+            _ => 0,
+        }
     }
 }
 
 impl From<&FileData> for fuser::FileType {
     fn from(kind: &FileData) -> Self {
         match kind {
-            FileData::File(_) => fuser::FileType::RegularFile,
+            FileData::File(_) | FileData::Inline(_) | FileData::Packed(_) => {
+                fuser::FileType::RegularFile
+            }
             FileData::Directory(_) => fuser::FileType::Directory,
             FileData::Symlink(_) => fuser::FileType::Symlink,
+            FileData::CharDevice(_) => fuser::FileType::CharDevice,
+            FileData::BlockDevice(_) => fuser::FileType::BlockDevice,
+            FileData::Fifo => fuser::FileType::NamedPipe,
+            FileData::Socket => fuser::FileType::Socket,
         }
     }
 }
@@ -115,7 +145,7 @@ impl InodeAttributes {
         }
     }
 
-    pub fn lookup(&self, name: &OsStr) -> BkfsResult<Inode> {
+    pub fn lookup(&self, ctrl: &Controller, name: &OsStr) -> BkfsResult<Inode> {
         let FileData::Directory(dir) = &self.attrs.contents else {
             return BkfsResult::errno(libc::ENOTDIR);
         };
@@ -131,8 +161,8 @@ impl InodeAttributes {
                 .unwrap_or(self.inode));
         }
 
-        match dir.get(name) {
-            Some(inode) => Ok(inode.inode),
+        match dir.get(ctrl, self.inode, name)? {
+            Some(entry) => Ok(entry.inode),
             None => BkfsResult::errno_notrace(libc::ENOENT),
         }
     }
@@ -181,7 +211,7 @@ impl From<&InodeAttributes> for fuser::FileAttr {
             },
             uid: attrs.uid,
             gid: attrs.gid,
-            rdev: 0,
+            rdev: attrs.contents.rdev(),
             blksize: BLOCK_SIZE as u32,
             flags: 0,
         }
@@ -226,41 +256,28 @@ fn parse_xattr_namespace(key: &[u8]) -> BkfsResult<XattrNamespace> {
 
 impl<'a> Save for &'a InodeAttributes {
     fn save(self, ctrl: &Controller) -> BkfsResult<()> {
-        save(
-            &self.attrs,
-            EncryptedFile::create(
-                AtomicFile::create_buffered(ctrl.inode_path(self.inode))?,
-                ctrl.key(),
-            )?,
-        )
+        ctrl.log_put(self.inode, &self.attrs, true)
     }
     fn save_fast(self, ctrl: &Controller) -> BkfsResult<()> {
-        save_fast(
-            &self.attrs,
-            EncryptedFile::create(
-                AtomicFile::create_buffered(ctrl.inode_path(self.inode))?,
-                ctrl.key(),
-            )?,
-        )
+        ctrl.log_put(self.inode, &self.attrs, false)
     }
 }
 
 impl Load for InodeAttributes {
     type Args<'a> = Inode;
     fn load(ctrl: &Controller, inode: Self::Args<'_>) -> BkfsResult<Self> {
-        Ok(InodeAttributes {
-            inode,
-            attrs: load(EncryptedFile::open(
-                File::open(ctrl.resolve_inode_path(inode))?,
-                ctrl.key(),
-            )?)?,
-        })
+        match ctrl.log_load(inode)? {
+            Some(attrs) => Ok(InodeAttributes { inode, attrs }),
+            // Absent from the index = never written or tombstoned. Surface
+            // as NotFound so the stale-parent self-heal paths fire.
+            None => BkfsResult::errno_notrace(libc::ENOENT),
+        }
     }
 }
 
 impl Exists for InodeAttributes {
     fn exists(ctrl: &Controller, inode: Self::Args<'_>) -> bool {
-        ctrl.resolve_inode_path(inode).exists()
+        ctrl.log_contains(inode)
     }
 }
 

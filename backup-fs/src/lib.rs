@@ -1,8 +1,6 @@
 #![allow(clippy::needless_return)]
 #![allow(clippy::unnecessary_cast)] // libc::S_* are u16 or u32 depending on the platform
 
-use chacha20::cipher::{IvSizeUser, KeySizeUser};
-use chacha20::ChaCha20;
 use fd_lock_rs::{FdLock, LockType};
 use fuser::consts::{FOPEN_DIRECT_IO, FUSE_HANDLE_KILLPRIV};
 use fuser::{
@@ -11,7 +9,6 @@ use fuser::{
     Request, TimeOrNow, FUSE_ROOT_ID,
 };
 use log::{debug, error};
-use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -21,11 +18,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
-use typenum::ToInt;
-use zeroize::Zeroizing;
 
-use crate::atomic_file::AtomicFile;
-use crate::contents::EncryptedFile;
 use crate::ctrl::{Controller, StatFs};
 use crate::directory::DirectoryContents;
 use crate::error::{BkfsError, BkfsResult};
@@ -33,19 +26,23 @@ use crate::handle::{FileHandleId, Handler};
 use crate::inode::FileData;
 use crate::inode::BLOCK_SIZE;
 use crate::inode::{Inode, InodeAttributes};
-use crate::serde::load;
-use crate::serde::save;
 
 mod aligned_io;
 mod atomic_file;
+mod blockstore;
+mod compress;
 mod contents;
 mod ctrl;
 mod directory;
+mod ecc;
 pub mod error;
 mod handle;
 mod inode;
 mod pool;
+mod seglog;
 mod serde;
+mod superblock;
+mod vault;
 #[cfg(test)]
 mod tests;
 #[allow(dead_code)]
@@ -123,39 +120,8 @@ pub struct BackupFS {
     handler: Handler,
 }
 
-const CHACHA_KEY_SIZE: usize = <<ChaCha20 as KeySizeUser>::KeySize as ToInt<usize>>::INT;
-const CHACHA_IV_SIZE: usize = <<ChaCha20 as IvSizeUser>::IvSize as ToInt<usize>>::INT;
-
-#[derive(Deserialize, Serialize)]
-pub struct CryptInfo {
-    pub key: Zeroizing<[u8; CHACHA_KEY_SIZE]>,
-    pub inode_iv: [u8; CHACHA_IV_SIZE],
-    pub contents_iv: [u8; CHACHA_IV_SIZE],
-}
-impl CryptInfo {
-    pub fn new() -> Self {
-        Self {
-            key: Zeroizing::new(rand::random()),
-            inode_iv: rand::random(),
-            contents_iv: rand::random(),
-        }
-    }
-    pub fn load(path: &Path, password: &str) -> BkfsResult<Self> {
-        load(EncryptedFile::open_pbkdf2(
-            aligned_io::BufferedDirectFile::new(File::open(path)?)?,
-            password,
-        )?)
-    }
-    pub fn save(&self, path: PathBuf, password: &str) -> BkfsResult<()> {
-        save(
-            self,
-            EncryptedFile::create_pbkdf2(
-                aligned_io::BufferedDirectFile::new(AtomicFile::create(path)?)?,
-                password,
-            )?,
-        )
-    }
-}
+// The master key and all format-affecting constants live in the versioned
+// superblock (`data_dir/superblock`); see [`crate::superblock`].
 
 impl BackupFS {
     pub fn new(config: BackupFSOptions) -> BkfsResult<BackupFS> {
@@ -598,7 +564,7 @@ impl Filesystem for BackupFS {
             FileHandleId(fh),
             offset,
             |handler, name, entry, offset| {
-                handler.mutate_inode(entry.inode, |_, inode| {
+                match handler.mutate_inode(entry.inode, |_, inode| {
                     Ok(reply.add(
                         inode.inode.0,
                         offset,
@@ -607,7 +573,14 @@ impl Filesystem for BackupFS {
                         &(&*inode).into(),
                         0,
                     ))
-                })
+                }) {
+                    Ok(full) => Ok(full),
+                    // The opendir snapshot can name a child that was unlinked
+                    // (and gc'd) since: skip the stale entry rather than
+                    // failing the whole listing with EIO.
+                    Err(e) if e.to_errno() == libc::ENOENT => Ok(false),
+                    Err(e) => Err(e),
+                }
             },
         ) {
             Ok(done) => {

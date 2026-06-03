@@ -16,7 +16,13 @@ pub enum BkfsErrorKind {
     Io(io::Error),
     BadChecksum,
     BadCrypt,
-    Bincode(bincode::Error),
+    Encode(bincode::error::EncodeError),
+    Decode(bincode::error::DecodeError),
+    /// The on-disk format is not one this build can read (superblock written
+    /// by a newer version, an unrecognized/older unversioned store, or a
+    /// recorded format constant this build cannot honor). Carries an
+    /// operator-facing message that must survive conversion to `io::Error`.
+    UnsupportedFormat(String),
     Multiple(Vec<BkfsErrorKind>),
 }
 
@@ -26,7 +32,9 @@ impl Display for BkfsErrorKind {
             BkfsErrorKind::Io(err) => <io::Error as Display>::fmt(err, f),
             BkfsErrorKind::BadChecksum => write!(f, "bad checksum"),
             BkfsErrorKind::BadCrypt => write!(f, "bad crypt"),
-            BkfsErrorKind::Bincode(err) => <bincode::Error as Display>::fmt(err, f),
+            BkfsErrorKind::Encode(err) => write!(f, "encode error: {err}"),
+            BkfsErrorKind::Decode(err) => write!(f, "decode error: {err}"),
+            BkfsErrorKind::UnsupportedFormat(msg) => write!(f, "unsupported format: {msg}"),
             BkfsErrorKind::Multiple(errs) => {
                 for err in errs {
                     <BkfsErrorKind as Display>::fmt(err, f)?;
@@ -115,7 +123,9 @@ impl std::error::Error for BkfsError {
             BkfsErrorKind::Io(err) => Some(err),
             BkfsErrorKind::BadChecksum => None,
             BkfsErrorKind::BadCrypt => None,
-            BkfsErrorKind::Bincode(err) => Some(err),
+            BkfsErrorKind::Encode(err) => Some(err),
+            BkfsErrorKind::Decode(err) => Some(err),
+            BkfsErrorKind::UnsupportedFormat(_) => None,
             BkfsErrorKind::Multiple(_) => None,
         }
     }
@@ -128,11 +138,31 @@ impl From<io::Error> for BkfsError {
     }
 }
 
-impl From<bincode::Error> for BkfsError {
+impl From<bincode::error::EncodeError> for BkfsError {
     #[track_caller]
-    fn from(inner: bincode::Error) -> Self {
+    fn from(inner: bincode::error::EncodeError) -> Self {
         BkfsError {
-            kind: BkfsErrorKind::Bincode(inner),
+            kind: BkfsErrorKind::Encode(inner),
+            backtrace: None,
+        }
+    }
+}
+
+impl From<bincode::error::DecodeError> for BkfsError {
+    #[track_caller]
+    fn from(inner: bincode::error::DecodeError) -> Self {
+        BkfsError {
+            kind: BkfsErrorKind::Decode(inner),
+            backtrace: None,
+        }
+    }
+}
+
+impl BkfsError {
+    /// Construct a [`BkfsErrorKind::UnsupportedFormat`] error from a message.
+    pub fn unsupported(msg: impl Into<String>) -> Self {
+        BkfsError {
+            kind: BkfsErrorKind::UnsupportedFormat(msg.into()),
             backtrace: None,
         }
     }

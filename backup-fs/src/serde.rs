@@ -1,91 +1,92 @@
-use std::io::{Read, Seek, Write};
-use std::os::unix::fs::FileExt;
+//! bincode (de)serialization wrapped in the [`crate::vault`] seal/open
+//! pipeline. Every persistent structure — inode attributes, seglog records,
+//! directory buckets, the superblock body — is serialized to bytes, then
+//! (for the data structures) sealed (encrypted + integrity-tagged +
+//! erasure-coded) before it touches the backing store.
+//!
+//! ## Encoding contract (part of the on-disk format version)
+//!
+//! Everything uses **bincode v2 in `standard` configuration** (little-endian,
+//! varint integers). Two distinct, *hardcoded* configurations exist:
+//!
+//! * [`superblock_config`] — used only for the superblock body. It is pinned
+//!   forever for a given envelope version (see [`crate::superblock`]); the
+//!   superblock must be decodable without first knowing any recorded
+//!   constant, so its codec can never be routed through
+//!   `Constants::bincode_encoding`.
+//! * [`data_config`] — used for every other (data) structure. The active
+//!   encoding is recorded in the superblock as `bincode_encoding` and
+//!   validated for equality on mount.
+//!
+//! Both carry an explicit size limit so a corrupted-but-integrity-recovered
+//! length prefix can't trigger an unbounded allocation during decode.
+//!
+//! Because a sealed payload is *exactly* the bytes that were encoded (the
+//! vault tag covers the whole plaintext), [`decode`] hard-errors on any
+//! trailing/unconsumed bytes: leftover bytes always indicate a struct-shape
+//! skew or corruption, never legitimate data.
 
+use bincode::config::Config;
+use chacha20::Key;
 use serde::de::DeserializeOwned;
 pub use serde::{Deserialize, Serialize};
-use sha2::digest::Output;
-use sha2::Sha256;
 
-use crate::aligned_io::BufferedDirectFile;
-use crate::atomic_file::AtomicFile;
-use crate::contents::EncryptedFile;
 use crate::error::{BkfsError, BkfsErrorKind, BkfsResult};
-use crate::util::HashIO;
+use crate::vault::{self, EccParams};
 
-pub fn load<T: DeserializeOwned, F: Read + Write + Seek + FileExt>(
-    mut from: EncryptedFile<F>,
-) -> BkfsResult<T> {
-    let mut r = HashIO::<Sha256, _>::new(&mut from);
-    let res = bincode::deserialize_from(&mut r)?;
-    let actual = r.finalize();
-    let mut expected = Output::<Sha256>::default();
-    from.read_exact(expected.as_mut_slice())?;
-    if actual != expected {
-        Err(BkfsError {
-            kind: BkfsErrorKind::BadChecksum,
+/// Decode limit for data structures. Comfortably above the largest legitimate
+/// bincode payload (a packed content extent is ≤ one chunk ≈ 1 MiB; inode
+/// records and directory buckets are far smaller), while still bounding a
+/// pathological length prefix.
+const DATA_LIMIT: usize = 64 * 1024 * 1024;
+/// Decode limit for the superblock body — tiny and fixed-shape.
+const SUPERBLOCK_LIMIT: usize = 64 * 1024;
+
+/// Encoding for ordinary data structures (inodes, seglog records, dir
+/// buckets). Recorded in the superblock as `bincode_encoding`.
+pub fn data_config() -> impl Config {
+    bincode::config::standard().with_limit::<DATA_LIMIT>()
+}
+
+/// Encoding for the superblock body. HARDCODED — never derived from a
+/// recorded constant, so the superblock is always decodable.
+pub fn superblock_config() -> impl Config {
+    bincode::config::standard().with_limit::<SUPERBLOCK_LIMIT>()
+}
+
+/// Serialize `value` with `config` (bincode v2 serde-compat).
+pub fn encode<T: Serialize>(value: &T, config: impl Config) -> BkfsResult<Vec<u8>> {
+    Ok(bincode::serde::encode_to_vec(value, config)?)
+}
+
+/// Deserialize a value from the *exact* `bytes` with `config`, erroring if any
+/// trailing bytes remain unconsumed (always a bug for a sealed payload).
+pub fn decode<T: DeserializeOwned>(bytes: &[u8], config: impl Config) -> BkfsResult<T> {
+    let (value, consumed): (T, usize) = bincode::serde::decode_from_slice(bytes, config)?;
+    if consumed != bytes.len() {
+        return Err(BkfsError {
+            kind: BkfsErrorKind::Decode(bincode::error::DecodeError::Other(
+                "trailing bytes after decode (struct-shape skew or corruption)",
+            )),
             backtrace: None,
-        })
-    } else {
-        Ok(res)
+        });
     }
+    Ok(value)
 }
 
-/// File targets that serialize a Serialize payload with a trailing hash and
-/// atomically replace their destination.
-pub trait Saveable {
-    fn save_durable(self) -> BkfsResult<()>;
-    fn save_fast(self) -> BkfsResult<()>;
+/// Serialize `value` (data config) and seal it into a self-contained
+/// encrypted, error-correcting blob ready to write whole to disk.
+pub fn serialize_sealed<T: Serialize>(value: &T, key: &Key, ecc: EccParams) -> BkfsResult<Vec<u8>> {
+    let plain = encode(value, data_config())?;
+    Ok(vault::seal(&plain, key, ecc))
 }
 
-impl Saveable for EncryptedFile<BufferedDirectFile<AtomicFile>> {
-    fn save_durable(self) -> BkfsResult<()> {
-        self.save()
-    }
-    fn save_fast(self) -> BkfsResult<()> {
-        self.save_fast()
-    }
-}
-
-impl Saveable for EncryptedFile<AtomicFile> {
-    fn save_durable(self) -> BkfsResult<()> {
-        self.save()
-    }
-    fn save_fast(self) -> BkfsResult<()> {
-        self.save_fast()
-    }
-}
-
-fn write_hashed<T: Serialize, F: Read + Write + Seek + FileExt>(
-    value: &T,
-    to: &mut EncryptedFile<F>,
-) -> BkfsResult<()> {
-    let mut w = HashIO::<Sha256, _>::new(&mut *to);
-    bincode::serialize_into(&mut w, value)?;
-    let hash = w.finalize();
-    to.write_all(hash.as_slice())?;
-    Ok(())
-}
-
-pub fn save<T: Serialize, F: Read + Write + Seek + FileExt>(
-    value: &T,
-    mut to: EncryptedFile<F>,
-) -> BkfsResult<()>
-where
-    EncryptedFile<F>: Saveable,
-{
-    write_hashed(value, &mut to)?;
-    to.save_durable()
-}
-
-/// As `save`, but without sync_all. Caller must ensure a later syncfs
-/// for durability.
-pub fn save_fast<T: Serialize, F: Read + Write + Seek + FileExt>(
-    value: &T,
-    mut to: EncryptedFile<F>,
-) -> BkfsResult<()>
-where
-    EncryptedFile<F>: Saveable,
-{
-    write_hashed(value, &mut to)?;
-    Saveable::save_fast(to)
+/// Open a blob produced by [`serialize_sealed`] (error-correcting and
+/// decrypting it) and deserialize the contained value (data config).
+pub fn deserialize_sealed<T: DeserializeOwned>(blob: &[u8], key: &Key) -> BkfsResult<T> {
+    // open()-then-decode order is load-bearing: a wrong key fails the vault
+    // integrity tag (BadChecksum) before any decode runs, so a wrong password
+    // never surfaces as a confusing decode error.
+    let plain = vault::open(blob, key)?;
+    decode(&plain, data_config())
 }
